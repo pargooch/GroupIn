@@ -17,6 +17,10 @@ protocol CloudKitServicing {
 
     func joinGroup(inviteCode: String) async throws -> GroupSession
 
+    /// Re-fetches the latest group state including member list. Returns nil
+    /// if the group has been deleted server-side.
+    func fetchGroup(groupID: UUID) async throws -> GroupSession?
+
     func publish(user: User, in group: GroupSession) async throws
 
     /// Owner proposes a new expiry. Members must accept by the *original*

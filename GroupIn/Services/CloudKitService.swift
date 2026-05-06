@@ -108,6 +108,18 @@ final class CloudKitService: CloudKitServicing {
         }
     }
 
+    func fetchGroup(groupID: UUID) async throws -> GroupSession? {
+        let recordID = CKRecord.ID(recordName: groupID.uuidString)
+        do {
+            let record = try await database.record(for: recordID)
+            return try await groupSession(from: record)
+        } catch let ckError as CKError where ckError.code == .unknownItem {
+            return nil
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
     func publish(user: User, in group: GroupSession) async throws {
         let recordID = CKRecord.ID(recordName: user.id.uuidString)
         let groupRecordID = CKRecord.ID(recordName: group.id.uuidString)

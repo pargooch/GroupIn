@@ -58,6 +58,9 @@ final class AppState {
     private var authTask: Task<Void, Never>?
     private var expiryMonitorTask: Task<Void, Never>?
     private var notificationTapTask: Task<Void, Never>?
+    private var groupRefreshTask: Task<Void, Never>?
+    private var lastLocationPublishAt: Date?
+    private static let publishInterval: TimeInterval = 10
 
     private static let localProfileKey = "GroupIn.AppState.localProfile"
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
@@ -214,6 +217,8 @@ final class AppState {
                         group.members[idx] = me
                         self.currentGroup = group
                         self.addOrUpdate(group: group)
+
+                        self.publishLocationIfNeeded(member: me, in: group)
                     }
                 }
             }
@@ -231,6 +236,62 @@ final class AppState {
 
     func stopLocationTracking() {
         locationService.stopUpdating()
+    }
+
+    /// Throttled CloudKit publish: at most once every `publishInterval`
+    /// seconds. Uses fire-and-forget so location updates never block.
+    private func publishLocationIfNeeded(member: User, in group: GroupSession) {
+        let now = Date()
+        if let last = lastLocationPublishAt,
+           now.timeIntervalSince(last) < Self.publishInterval {
+            return
+        }
+        lastLocationPublishAt = now
+        Task { [groupService, member, group] in
+            try? await groupService.publish(user: member, in: group)
+        }
+    }
+
+    // MARK: - Group refresh
+    //
+    // While a group is open, poll its server-side state every 10s so new
+    // members and updated coordinates appear without manual refresh. This
+    // is a stand-in for CKQuerySubscription (next CloudKit step).
+
+    func startGroupRefresh() {
+        guard groupRefreshTask == nil else { return }
+        groupRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { break }
+                await self.refreshCurrentGroup()
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
+    }
+
+    func stopGroupRefresh() {
+        groupRefreshTask?.cancel()
+        groupRefreshTask = nil
+    }
+
+    private func refreshCurrentGroup() async {
+        guard let active = currentGroup else { return }
+        do {
+            guard var updated = try await groupService.fetchGroup(groupID: active.id) else {
+                // Server-side gone — let the expiry monitor handle removal.
+                return
+            }
+            // Preserve our local "self" entry so a stale server fetch doesn't
+            // clobber a fresh local fix that's still in-flight to CloudKit.
+            if let myID = membershipByGroupID[updated.id],
+               let myIdx = updated.members.firstIndex(where: { $0.id == myID }) {
+                updated.members[myIdx] = currentUser
+            }
+            currentGroup = updated
+            addOrUpdate(group: updated)
+        } catch {
+            // Silent fail — keep last known good state, retry next tick.
+        }
     }
 
     // MARK: - Notifications

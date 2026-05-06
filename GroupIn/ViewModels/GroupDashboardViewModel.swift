@@ -18,7 +18,10 @@ final class GroupDashboardViewModel {
     var cameraPosition: MapCameraPosition = .automatic
     var showExtendSheet: Bool = false
     var actionError: String?
-    private var hasCenteredOnUser = false
+    /// Member whose map pin is currently emphasized. Cleared after a few seconds.
+    var focusedMemberID: UUID?
+    private var hasFitInitialMap = false
+    private var focusClearTask: Task<Void, Never>?
 
     let appState: AppState
     let groupID: UUID
@@ -56,21 +59,71 @@ final class GroupDashboardViewModel {
 
     func start() {
         appState.startLocationTracking()
+        appState.startGroupRefresh()
     }
 
     func stop() {
         appState.stopLocationTracking()
+        appState.stopGroupRefresh()
     }
 
-    func centerCameraIfNeeded(_ coordinate: Coordinate) {
-        guard !hasCenteredOnUser else { return }
-        hasCenteredOnUser = true
+    /// First time we have any member coordinates, frame all of them.
+    func fitInitialIfNeeded() {
+        guard !hasFitInitialMap else { return }
+        guard let group = group else { return }
+        let coords = group.members.compactMap { $0.coordinate }
+        guard !coords.isEmpty else { return }
+        hasFitInitialMap = true
+        fitAllMembers()
+    }
+
+    /// Frame the camera so every member with a coordinate is visible.
+    /// Called by the "Fit all" button and on first appearance.
+    func fitAllMembers() {
+        guard let group = group else { return }
+        let coords = group.members.compactMap { $0.coordinate?.clLocation }
+        guard !coords.isEmpty else { return }
+
+        if coords.count == 1 {
+            cameraPosition = .region(
+                MKCoordinateRegion(
+                    center: coords[0],
+                    span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+                )
+            )
+            return
+        }
+
+        let lats = coords.map(\.latitude)
+        let lons = coords.map(\.longitude)
+        let center = CLLocationCoordinate2D(
+            latitude: (lats.min()! + lats.max()!) / 2,
+            longitude: (lons.min()! + lons.max()!) / 2
+        )
+        let span = MKCoordinateSpan(
+            latitudeDelta: max(0.005, (lats.max()! - lats.min()!) * 1.6),
+            longitudeDelta: max(0.005, (lons.max()! - lons.min()!) * 1.6)
+        )
+        cameraPosition = .region(MKCoordinateRegion(center: center, span: span))
+    }
+
+    /// Tapping a member row centers the map on them and emphasizes their
+    /// pin briefly. No-op if the member has no coordinate yet.
+    func focus(on member: User) {
+        guard let coord = member.coordinate else { return }
+        focusedMemberID = member.id
         cameraPosition = .region(
             MKCoordinateRegion(
-                center: coordinate.clLocation,
-                span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+                center: coord.clLocation,
+                span: MKCoordinateSpan(latitudeDelta: 0.004, longitudeDelta: 0.004)
             )
         )
+        focusClearTask?.cancel()
+        focusClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, let self else { return }
+            self.focusedMemberID = nil
+        }
     }
 
     func proposeExtension(newExpiresAt: Date) async {

@@ -61,6 +61,10 @@ final class LocalGroupService: CloudKitServicing {
         return group
     }
 
+    func fetchGroup(groupID: UUID) async throws -> GroupSession? {
+        groupsByCode.values.first { $0.id == groupID }
+    }
+
     func joinGroup(inviteCode: String) async throws -> GroupSession {
         let normalized = inviteCode
             .trimmingCharacters(in: .whitespacesAndNewlines)

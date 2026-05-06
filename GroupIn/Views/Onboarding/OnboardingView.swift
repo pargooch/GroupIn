@@ -17,6 +17,7 @@ struct OnboardingView: View {
     @State private var avatarData: Data?
     @State private var photoSelection: PhotosPickerItem?
     @State private var loadingPhoto = false
+    @State private var cropperSource: CropperSource?
 
     var body: some View {
         NavigationStack {
@@ -86,9 +87,19 @@ struct OnboardingView: View {
                 loadingPhoto = true
                 Task {
                     defer { loadingPhoto = false }
-                    if let raw = try? await newItem.loadTransferable(type: Data.self) {
-                        avatarData = ProfileEditorView.compressForAvatar(raw)
+                    if let raw = try? await newItem.loadTransferable(type: Data.self),
+                       let img = UIImage(data: raw) {
+                        cropperSource = CropperSource(image: img)
                     }
+                }
+            }
+            .fullScreenCover(item: $cropperSource) { src in
+                AvatarCropperView(sourceImage: src.image) { cropped in
+                    if let cropped {
+                        avatarData = cropped
+                    }
+                    cropperSource = nil
+                    photoSelection = nil
                 }
             }
         }
