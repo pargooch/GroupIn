@@ -2,15 +2,26 @@
 //  RootView.swift
 //  GroupIn
 //
-//  Top-level NavigationStack. Routes are driven by AppState.path.
-//  ViewModels are constructed here at navigation time and injected
-//  into their views — keeps the AppState environment clean and makes
-//  testing each VM in isolation straightforward.
+//  Top-level switch: onboarding gate vs. main NavigationStack. Routes
+//  inside the main stack are driven by AppState.path. ViewModels are
+//  constructed at navigation time and injected into their views.
 //
 
 import SwiftUI
 
 struct RootView: View {
+    @Environment(AppState.self) private var appState
+
+    var body: some View {
+        if appState.localProfile.needsOnboarding {
+            OnboardingView()
+        } else {
+            MainStack()
+        }
+    }
+}
+
+private struct MainStack: View {
     @Environment(AppState.self) private var appState
 
     var body: some View {
@@ -35,6 +46,8 @@ struct RootView: View {
                                 groupID: groupID
                             )
                         )
+                    case .profileEditor:
+                        ProfileEditorView()
                     }
                 }
         }

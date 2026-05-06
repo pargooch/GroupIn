@@ -3,8 +3,8 @@
 //  GroupIn
 //
 //  Concrete Core Location implementation. Publishes coordinate updates
-//  via an AsyncStream so consumers (AppState) can iterate them as a
-//  pure async sequence — no closure plumbing or KVO.
+//  AND authorization changes via async streams so consumers (AppState)
+//  can iterate them as pure async sequences — no closure plumbing.
 //
 
 import Foundation
@@ -14,6 +14,7 @@ import CoreLocation
 protocol LocationServicing: AnyObject {
     var authorizationStatus: CLAuthorizationStatus { get }
     var locationUpdates: AsyncStream<Coordinate> { get }
+    var authorizationUpdates: AsyncStream<CLAuthorizationStatus> { get }
     func requestAuthorization()
     func startUpdating()
     func stopUpdating()
@@ -23,24 +24,30 @@ protocol LocationServicing: AnyObject {
 final class LocationService: NSObject, LocationServicing, CLLocationManagerDelegate {
     private let manager: CLLocationManager
 
-    /// Single shared stream — created once at init.
-    /// AsyncStream is single-consumer; AppState owns the only iterator.
     let locationUpdates: AsyncStream<Coordinate>
-    private nonisolated let continuation: AsyncStream<Coordinate>.Continuation
+    let authorizationUpdates: AsyncStream<CLAuthorizationStatus>
+
+    private nonisolated let locationContinuation: AsyncStream<Coordinate>.Continuation
+    private nonisolated let authContinuation: AsyncStream<CLAuthorizationStatus>.Continuation
 
     var authorizationStatus: CLAuthorizationStatus {
         manager.authorizationStatus
     }
 
     override init() {
-        let (stream, continuation) = AsyncStream.makeStream(of: Coordinate.self)
-        self.locationUpdates = stream
-        self.continuation = continuation
+        let (locStream, locCont) = AsyncStream.makeStream(of: Coordinate.self)
+        let (authStream, authCont) = AsyncStream.makeStream(of: CLAuthorizationStatus.self)
+        self.locationUpdates = locStream
+        self.authorizationUpdates = authStream
+        self.locationContinuation = locCont
+        self.authContinuation = authCont
         self.manager = CLLocationManager()
         super.init()
         manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
-        manager.distanceFilter = 25 // meters
+        // Best accuracy with no distance filter — every meaningful sample
+        // is delivered. Battery-heavy; revisit with adaptive throttling later.
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        manager.distanceFilter = kCLDistanceFilterNone
     }
 
     func requestAuthorization() {
@@ -56,18 +63,13 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
     }
 
     // MARK: - CLLocationManagerDelegate
-    //
-    // Marked `nonisolated` because CLLocationManagerDelegate isn't
-    // MainActor-isolated. Continuation is Sendable so we can yield from
-    // the delegate's queue safely; for anything that touches our own
-    // MainActor state we hop with a Task.
 
     nonisolated func locationManager(_ manager: CLLocationManager,
                                      didUpdateLocations locations: [CLLocation]) {
         guard let last = locations.last else { return }
         let coord = Coordinate(latitude: last.coordinate.latitude,
                                longitude: last.coordinate.longitude)
-        continuation.yield(coord)
+        locationContinuation.yield(coord)
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager,
@@ -77,6 +79,7 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = manager.authorizationStatus
+        authContinuation.yield(status)
         Task { @MainActor [weak self] in
             guard let self else { return }
             switch status {

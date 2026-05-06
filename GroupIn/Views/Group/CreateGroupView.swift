@@ -24,6 +24,31 @@ struct CreateGroupView: View {
                     .accessibilityLabel("Group name")
             }
 
+            Section {
+                Picker("Duration", selection: $viewModel.duration) {
+                    ForEach(GroupDuration.allCases) { option in
+                        Text(option.label).tag(option)
+                    }
+                }
+                .disabled(viewModel.useCustomDate)
+
+                Toggle("Custom expiry", isOn: $viewModel.useCustomDate)
+
+                if viewModel.useCustomDate {
+                    DatePicker(
+                        "Expires at",
+                        selection: $viewModel.customExpiresAt,
+                        in: .now...,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                }
+            } header: {
+                Text("Expires")
+            } footer: {
+                Text("The group hard-deletes when it expires. As owner, you'll be prompted 30 minutes before to extend it.")
+                    .font(.caption)
+            }
+
             if let message = viewModel.errorMessage {
                 Section {
                     Text(message)

@@ -11,6 +11,33 @@ struct HomeView: View {
     var body: some View {
         List {
             Section {
+                Button {
+                    appState.path.append(.profileEditor)
+                } label: {
+                    HStack(spacing: 12) {
+                        AvatarView(data: appState.localProfile.avatarData,
+                                   name: appState.localProfile.displayName,
+                                   size: 48)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(appState.localProfile.displayName)
+                                .font(.headline)
+                            Text("Edit profile")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.footnote)
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Opens your profile to edit name and photo")
+            }
+
+            Section {
                 if appState.myGroups.isEmpty {
                     Text("You haven't joined any groups yet. Create one or join with a code.")
                         .font(.body)
@@ -68,6 +95,7 @@ struct HomeView: View {
                 Text("Code \(group.inviteCode) · \(group.members.count) member\(group.members.count == 1 ? "" : "s")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                expiryLine(group: group)
             }
             Spacer()
             Image(systemName: "chevron.right")
@@ -78,6 +106,22 @@ struct HomeView: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
+
+    @ViewBuilder
+    private func expiryLine(group: GroupSession) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: group.hasPendingExtension ? "clock.arrow.circlepath" : "clock")
+                .font(.caption2)
+            Text("Expires \(group.expiresAt, style: .relative)")
+                .font(.caption2)
+            if group.hasPendingExtension {
+                Text("· extension pending")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+        }
+        .foregroundStyle(group.expiresAt.timeIntervalSinceNow < 30 * 60 ? .orange : .secondary)
+    }
 }
 
 #Preview("Empty") {
@@ -87,11 +131,16 @@ struct HomeView: View {
 
 #Preview("With groups") {
     let state = AppState()
+    let me = User(displayName: "Me")
     state.myGroups = [
         GroupSession(name: "Weekend Hike", inviteCode: "ABC234",
-                     members: [User(displayName: "Me")]),
+                     ownerID: me.id,
+                     expiresAt: .now.addingTimeInterval(3600 * 3),
+                     members: [me]),
         GroupSession(name: "Office", inviteCode: "ZX9KQM",
-                     members: [User(displayName: "Me"), User(displayName: "Alex")])
+                     ownerID: me.id,
+                     expiresAt: .now.addingTimeInterval(60 * 25),
+                     members: [me, User(displayName: "Alex")])
     ]
     return NavigationStack { HomeView() }
         .environment(state)

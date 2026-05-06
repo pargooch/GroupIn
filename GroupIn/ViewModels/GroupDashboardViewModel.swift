@@ -2,9 +2,9 @@
 //  GroupDashboardViewModel.swift
 //  GroupIn
 //
-//  Owns map camera state for the dashboard. Group / member / coordinate
-//  data is read directly from AppState — @Observable transitively tracks
-//  reads through the VM, so changes propagate without manual wiring.
+//  Owns map camera state and bridges extension/accept actions to AppState.
+//  Group / member / coordinate data is read directly from AppState —
+//  @Observable transitively tracks reads through the VM.
 //
 
 import Foundation
@@ -16,6 +16,8 @@ import Observation
 @Observable
 final class GroupDashboardViewModel {
     var cameraPosition: MapCameraPosition = .automatic
+    var showExtendSheet: Bool = false
+    var actionError: String?
     private var hasCenteredOnUser = false
 
     let appState: AppState
@@ -35,8 +37,21 @@ final class GroupDashboardViewModel {
 
     var currentUser: User { appState.currentUser }
 
-    var membersWithCoordinates: [User] {
-        (group?.members ?? []).filter { $0.coordinate != nil }
+    var isOwner: Bool {
+        group?.ownerID == currentUser.id
+    }
+
+    /// True when there's a pending extension AND I'm not the owner AND I haven't accepted yet.
+    var canAcceptExtension: Bool {
+        guard let group, !isOwner else { return false }
+        return group.pendingExtension != nil
+            && !group.hasAcceptedExtension(currentUser.id)
+    }
+
+    /// True when expiry is within 30 minutes and I'm the owner and there's no pending extension yet.
+    var shouldPromptOwnerToExtend: Bool {
+        guard let group, isOwner, group.pendingExtension == nil else { return false }
+        return group.expiresAt.timeIntervalSinceNow <= 30 * 60
     }
 
     func start() {
@@ -47,8 +62,6 @@ final class GroupDashboardViewModel {
         appState.stopLocationTracking()
     }
 
-    /// Centers the camera on the first real fix we receive.
-    /// Subsequent updates leave the camera alone so the user can pan freely.
     func centerCameraIfNeeded(_ coordinate: Coordinate) {
         guard !hasCenteredOnUser else { return }
         hasCenteredOnUser = true
@@ -58,5 +71,21 @@ final class GroupDashboardViewModel {
                 span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
             )
         )
+    }
+
+    func proposeExtension(newExpiresAt: Date) async {
+        do {
+            try await appState.proposeCurrentExtension(newExpiresAt: newExpiresAt)
+        } catch {
+            actionError = error.localizedDescription
+        }
+    }
+
+    func acceptExtension() async {
+        do {
+            try await appState.acceptCurrentExtension()
+        } catch {
+            actionError = error.localizedDescription
+        }
     }
 }

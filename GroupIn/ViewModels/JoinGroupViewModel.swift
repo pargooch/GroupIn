@@ -32,7 +32,8 @@ final class JoinGroupViewModel {
 
         do {
             let service = appState.groupService
-            let me = appState.currentUser
+            // Fresh per-group membership: new UUID every time.
+            let me = appState.makeMembership()
 
             let group = try await service.joinGroup(inviteCode: inviteCode)
             try await service.publish(user: me, in: group)
@@ -42,7 +43,9 @@ final class JoinGroupViewModel {
                 withMe.members.append(me)
             }
 
+            appState.registerMembership(groupID: withMe.id, memberID: me.id)
             appState.addOrUpdate(group: withMe)
+            appState.currentUser = me
             appState.currentGroup = withMe
             appState.path.append(.groupDashboard(groupID: withMe.id))
         } catch {

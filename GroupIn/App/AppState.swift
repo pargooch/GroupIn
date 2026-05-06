@@ -3,54 +3,90 @@
 //  GroupIn
 //
 //  Global app state shared across views via the SwiftUI environment.
-//  Persists active session, user identity, and the user's group list
-//  to UserDefaults so the app reopens where the user left off.
+//
+//  Identity model — anonymous-per-group:
+//    • `localProfile` (name + avatar) lives only on this device.
+//    • Each create/join mints a fresh UUID for the local membership;
+//      `membershipByGroupID` records that mapping.
+//    • Editing the profile propagates name/avatar into all existing
+//      memberships, but UUIDs stay stable per group.
 //
 
 import Foundation
+import CoreLocation
 import Observation
 
 enum AppRoute: Hashable {
     case createGroup
     case joinGroup
     case groupDashboard(groupID: UUID)
+    case profileEditor
 }
 
 @MainActor
 @Observable
 final class AppState {
-    var currentUser: User {
-        didSet { Self.persistUser(currentUser, defaults: defaults) }
+    var localProfile: LocalProfile {
+        didSet {
+            persistLocalProfile()
+            propagateProfileToMemberships()
+        }
     }
+    /// Active membership. Reconstructed at launch from `currentGroup +
+    /// membershipByGroupID`; not persisted directly since `currentGroup`
+    /// is already the canonical source of member data.
+    var currentUser: User
     var currentGroup: GroupSession? {
         didSet { persistCurrentGroup() }
     }
     var myGroups: [GroupSession] = [] {
         didSet { persistMyGroups() }
     }
+    private(set) var membershipByGroupID: [UUID: UUID] = [:] {
+        didSet { persistMembershipMap() }
+    }
     var path: [AppRoute] = []
+
+    var locationAuthorizationStatus: CLAuthorizationStatus = .notDetermined
 
     let groupService: CloudKitServicing
     let locationService: LocationServicing
+    let notificationService: NotificationServicing
 
     private let defaults: UserDefaults
     private var locationTask: Task<Void, Never>?
+    private var authTask: Task<Void, Never>?
+    private var expiryMonitorTask: Task<Void, Never>?
+    private var notificationTapTask: Task<Void, Never>?
 
-    private static let userIDKey = "GroupIn.AppState.userID"
-    private static let userNameKey = "GroupIn.AppState.userName"
+    private static let localProfileKey = "GroupIn.AppState.localProfile"
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
     private static let myGroupsKey = "GroupIn.AppState.myGroups"
+    private static let membershipMapKey = "GroupIn.AppState.membershipMap"
 
     var isInGroup: Bool { currentGroup != nil }
 
-    init(currentUser: User? = nil,
+    init(localProfile: LocalProfile? = nil,
          groupService: CloudKitServicing? = nil,
          locationService: LocationServicing? = nil,
+         notificationService: NotificationServicing? = nil,
          defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.currentUser = currentUser ?? Self.loadUser(defaults: defaults)
+        let resolvedProfile = localProfile ?? Self.loadLocalProfile(defaults: defaults)
+        self.localProfile = resolvedProfile
+
+        // Placeholder — overwritten when a group is opened or restored.
+        self.currentUser = User(displayName: resolvedProfile.displayName,
+                                avatarData: resolvedProfile.avatarData)
+
         self.groupService = groupService ?? LocalGroupService(defaults: defaults)
-        self.locationService = locationService ?? LocationService()
+        let resolvedLocation = locationService ?? LocationService()
+        self.locationService = resolvedLocation
+        self.locationAuthorizationStatus = resolvedLocation.authorizationStatus
+
+        self.notificationService = notificationService ?? NotificationService()
+
+        self.membershipByGroupID = Self.loadMembershipMap(defaults: defaults)
 
         if let data = defaults.data(forKey: Self.myGroupsKey),
            let decoded = try? JSONDecoder().decode([GroupSession].self, from: data) {
@@ -61,6 +97,61 @@ final class AppState {
            let restored = try? JSONDecoder().decode(GroupSession.self, from: data) {
             self.currentGroup = restored
             self.path = [.groupDashboard(groupID: restored.id)]
+            // Refresh currentUser to the right per-group membership.
+            if let myID = membershipByGroupID[restored.id],
+               let me = restored.members.first(where: { $0.id == myID }) {
+                self.currentUser = me
+            }
+        }
+
+        Self.persistLocalProfile(resolvedProfile, defaults: defaults)
+
+        startExpiryMonitor()
+        startNotificationTapMonitor()
+    }
+
+    // MARK: - Membership construction
+
+    /// Builds a fresh per-group `User` from the current local profile.
+    /// Caller is responsible for registering the membership ID via
+    /// `registerMembership(groupID:memberID:)` once the group exists.
+    func makeMembership() -> User {
+        User(id: UUID(),
+             displayName: localProfile.displayName,
+             avatarData: localProfile.avatarData)
+    }
+
+    func registerMembership(groupID: UUID, memberID: UUID) {
+        membershipByGroupID[groupID] = memberID
+    }
+
+    private func propagateProfileToMemberships() {
+        // Update myGroups in place.
+        var updated = myGroups
+        var didChange = false
+        for groupIdx in updated.indices {
+            guard let myID = membershipByGroupID[updated[groupIdx].id],
+                  let memberIdx = updated[groupIdx].members.firstIndex(where: { $0.id == myID })
+            else { continue }
+            updated[groupIdx].members[memberIdx].displayName = localProfile.displayName
+            updated[groupIdx].members[memberIdx].avatarData = localProfile.avatarData
+            didChange = true
+        }
+        if didChange { myGroups = updated }
+
+        // Mirror into the active group + currentUser.
+        if let group = currentGroup,
+           let myID = membershipByGroupID[group.id],
+           let memberIdx = group.members.firstIndex(where: { $0.id == myID }) {
+            var refreshed = group
+            refreshed.members[memberIdx].displayName = localProfile.displayName
+            refreshed.members[memberIdx].avatarData = localProfile.avatarData
+            currentGroup = refreshed
+            currentUser = refreshed.members[memberIdx]
+        } else {
+            // No active membership — keep currentUser's name/avatar in sync as a placeholder.
+            currentUser.displayName = localProfile.displayName
+            currentUser.avatarData = localProfile.avatarData
         }
     }
 
@@ -76,13 +167,21 @@ final class AppState {
 
     func remove(group: GroupSession) {
         myGroups.removeAll { $0.id == group.id }
+        membershipByGroupID.removeValue(forKey: group.id)
         if currentGroup?.id == group.id {
             currentGroup = nil
+        }
+        Task { [notificationService, groupID = group.id] in
+            await notificationService.cancelAll(for: groupID)
         }
     }
 
     func open(group: GroupSession) {
         addOrUpdate(group: group)
+        if let myID = membershipByGroupID[group.id],
+           let me = group.members.first(where: { $0.id == myID }) {
+            currentUser = me
+        }
         currentGroup = group
         let route = AppRoute.groupDashboard(groupID: group.id)
         if path.last != route {
@@ -96,26 +195,35 @@ final class AppState {
     }
 
     // MARK: - Location lifecycle
-    //
-    // The consuming Task is created lazily and lives for the rest of the
-    // app's lifetime. Stopping just halts CLLocationManager updates — the
-    // AsyncStream stays open so we can resume cleanly.
 
     func startLocationTracking() {
         locationService.requestAuthorization()
         locationService.startUpdating()
 
-        guard locationTask == nil else { return }
-        locationTask = Task { [weak self] in
-            guard let self else { return }
-            for await coordinate in self.locationService.locationUpdates {
-                self.currentUser.coordinate = coordinate
-                if var group = self.currentGroup,
-                   let idx = group.members.firstIndex(where: { $0.id == self.currentUser.id }) {
-                    group.members[idx].coordinate = coordinate
-                    group.members[idx].lastSeen = .now
-                    self.currentGroup = group
-                    self.addOrUpdate(group: group)
+        if locationTask == nil {
+            locationTask = Task { [weak self] in
+                guard let self else { return }
+                for await coordinate in self.locationService.locationUpdates {
+                    var me = self.currentUser
+                    me.coordinate = coordinate
+                    me.lastSeen = .now
+                    self.currentUser = me
+
+                    if var group = self.currentGroup,
+                       let idx = group.members.firstIndex(where: { $0.id == me.id }) {
+                        group.members[idx] = me
+                        self.currentGroup = group
+                        self.addOrUpdate(group: group)
+                    }
+                }
+            }
+        }
+
+        if authTask == nil {
+            authTask = Task { [weak self] in
+                guard let self else { return }
+                for await status in self.locationService.authorizationUpdates {
+                    self.locationAuthorizationStatus = status
                 }
             }
         }
@@ -123,6 +231,110 @@ final class AppState {
 
     func stopLocationTracking() {
         locationService.stopUpdating()
+    }
+
+    // MARK: - Notifications
+
+    /// Schedule the owner-only T-30 expiry reminder for a group. Requests
+    /// permission on first use; silently no-ops if denied or non-owner.
+    func registerNotifications(for group: GroupSession) async {
+        guard group.ownerID == currentUser.id else { return }
+        let granted = await notificationService.requestAuthorization()
+        guard granted else { return }
+        await notificationService.scheduleExpiryReminder(for: group)
+    }
+
+    private func startNotificationTapMonitor() {
+        guard notificationTapTask == nil else { return }
+        notificationTapTask = Task { [weak self] in
+            guard let self else { return }
+            for await tap in self.notificationService.notificationTaps {
+                self.handleNotificationTap(tap)
+            }
+        }
+    }
+
+    private func handleNotificationTap(_ tap: NotificationTap) {
+        if let group = myGroups.first(where: { $0.id == tap.groupID }) {
+            open(group: group)
+        }
+    }
+
+    // MARK: - Group expiry / extension
+
+    /// Owner-only. Proposes a new expiry; members must accept by the
+    /// original expiry to remain.
+    func proposeCurrentExtension(newExpiresAt: Date) async throws {
+        guard let group = currentGroup else { return }
+        let updated = try await groupService.proposeExtension(
+            groupID: group.id,
+            newExpiresAt: newExpiresAt
+        )
+        addOrUpdate(group: updated)
+        currentGroup = updated
+    }
+
+    /// Member accepts the active extension proposal on `currentGroup`.
+    func acceptCurrentExtension() async throws {
+        guard let group = currentGroup else { return }
+        let updated = try await groupService.acceptExtension(
+            groupID: group.id,
+            memberID: currentUser.id
+        )
+        addOrUpdate(group: updated)
+        currentGroup = updated
+    }
+
+    /// Returns whether the local user is the owner of the currently active group.
+    var isCurrentGroupOwner: Bool {
+        guard let group = currentGroup else { return false }
+        return group.ownerID == currentUser.id
+    }
+
+    // MARK: - Expiry monitor
+    //
+    // One long-lived Task wakes every 30s, pulls any expired groups
+    // through the service, and updates local state. Cheap (a single
+    // comparison per group per minute) and correct enough for v1.
+
+    private func startExpiryMonitor() {
+        guard expiryMonitorTask == nil else { return }
+        expiryMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { break }
+                await self.processExpiryTick()
+                try? await Task.sleep(for: .seconds(30))
+            }
+        }
+    }
+
+    private func processExpiryTick() async {
+        let now = Date()
+        let expired = myGroups.filter { $0.expiresAt <= now }
+        for group in expired {
+            do {
+                let resolved = try await groupService.resolveExpiry(groupID: group.id)
+                if let resolved {
+                    addOrUpdate(group: resolved)
+                    if currentGroup?.id == group.id {
+                        currentGroup = resolved
+                        if let myID = membershipByGroupID[group.id],
+                           let me = resolved.members.first(where: { $0.id == myID }) {
+                            currentUser = me
+                        } else {
+                            // I didn't accept — pop back to home.
+                            leaveGroup()
+                        }
+                    }
+                    // Reschedule reminder for the new expiry.
+                    await registerNotifications(for: resolved)
+                } else {
+                    remove(group: group)
+                }
+            } catch {
+                // Retry next tick.
+            }
+        }
     }
 
     // MARK: - Persistence
@@ -142,17 +354,44 @@ final class AppState {
         }
     }
 
-    private static func loadUser(defaults: UserDefaults) -> User {
-        let id = defaults.string(forKey: userIDKey)
-            .flatMap(UUID.init(uuidString:)) ?? UUID()
-        let name = defaults.string(forKey: userNameKey) ?? "Me"
-        let user = User(id: id, displayName: name)
-        persistUser(user, defaults: defaults)
-        return user
+    private func persistLocalProfile() {
+        Self.persistLocalProfile(localProfile, defaults: defaults)
     }
 
-    private static func persistUser(_ user: User, defaults: UserDefaults) {
-        defaults.set(user.id.uuidString, forKey: userIDKey)
-        defaults.set(user.displayName, forKey: userNameKey)
+    private func persistMembershipMap() {
+        let stringMap = membershipByGroupID.reduce(into: [String: String]()) { acc, pair in
+            acc[pair.key.uuidString] = pair.value.uuidString
+        }
+        if let data = try? JSONEncoder().encode(stringMap) {
+            defaults.set(data, forKey: Self.membershipMapKey)
+        }
+    }
+
+    private static func persistLocalProfile(_ profile: LocalProfile, defaults: UserDefaults) {
+        if let data = try? JSONEncoder().encode(profile) {
+            defaults.set(data, forKey: localProfileKey)
+        }
+    }
+
+    private static func loadLocalProfile(defaults: UserDefaults) -> LocalProfile {
+        if let data = defaults.data(forKey: localProfileKey),
+           let decoded = try? JSONDecoder().decode(LocalProfile.self, from: data) {
+            return decoded
+        }
+        return .default
+    }
+
+    private static func loadMembershipMap(defaults: UserDefaults) -> [UUID: UUID] {
+        guard let data = defaults.data(forKey: membershipMapKey),
+              let stringMap = try? JSONDecoder().decode([String: String].self, from: data)
+        else {
+            return [:]
+        }
+        return stringMap.reduce(into: [UUID: UUID]()) { acc, pair in
+            if let key = UUID(uuidString: pair.key),
+               let value = UUID(uuidString: pair.value) {
+                acc[key] = value
+            }
+        }
     }
 }
