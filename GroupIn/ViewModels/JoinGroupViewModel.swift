@@ -32,14 +32,28 @@ final class JoinGroupViewModel {
 
         do {
             let service = appState.groupService
-            // Fresh per-group membership: new UUID every time.
-            let me = appState.makeMembership()
-
             let group = try await service.joinGroup(inviteCode: inviteCode)
+
+            // Idempotent join: if this device already has a membership ID
+            // for this group, reuse it. Prevents duplicate member rows
+            // when someone leaves and rejoins, or taps Join more than once.
+            let me: User
+            if let existingID = appState.membershipByGroupID[group.id] {
+                me = User(
+                    id: existingID,
+                    displayName: appState.localProfile.displayName,
+                    avatarData: appState.localProfile.avatarData
+                )
+            } else {
+                me = appState.makeMembership()
+            }
+
             try await service.publish(user: me, in: group)
 
             var withMe = group
-            if !withMe.members.contains(where: { $0.id == me.id }) {
+            if let idx = withMe.members.firstIndex(where: { $0.id == me.id }) {
+                withMe.members[idx] = me
+            } else {
                 withMe.members.append(me)
             }
 

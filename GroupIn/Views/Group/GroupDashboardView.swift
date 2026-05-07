@@ -12,6 +12,7 @@ struct GroupDashboardView: View {
     @Environment(AppState.self) private var appState
     @State private var viewModel: GroupDashboardViewModel
     @State private var didCopyInviteCode = false
+    @State private var showsLocationHelp = false
 
     init(viewModel: GroupDashboardViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -21,6 +22,10 @@ struct GroupDashboardView: View {
         content
             .toolbar { dashboardToolbar }
             .modifier(DashboardModifiers(viewModel: viewModel))
+            .sheet(isPresented: $showsLocationHelp) {
+                LocationHelpSheet()
+                    .presentationDetents([.medium, .large])
+            }
     }
 
     @ViewBuilder
@@ -52,24 +57,36 @@ struct GroupDashboardView: View {
         }
     }
 
-    /// Only show the "Your location" section when the user needs to act on
-    /// permission (denied/restricted) or hasn't granted yet. Authorized +
-    /// having a fix is the silent happy path — the map shows it.
-    private var showsLocationStatus: Bool {
-        switch appState.locationAuthorizationStatus {
-        case .denied, .restricted, .notDetermined:
-            return true
-        case .authorizedWhenInUse, .authorizedAlways:
-            return viewModel.currentUser.coordinate == nil
-        @unknown default:
-            return true
-        }
-    }
+    /// We always show the location section now — either with a permission
+    /// prompt, an "acquiring…" spinner, or a small live freshness indicator.
+    /// Helps the user see at a glance whether GPS is actively producing
+    /// fixes, which matters most when offline.
+    private var showsLocationStatus: Bool { true }
 
     @ViewBuilder
     private func groupSection(group: GroupSession) -> some View {
         Section("Group") {
-            LabeledContent("Name", value: group.name)
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(group.category.tint.opacity(0.18))
+                    Image(systemName: group.category.systemImage)
+                        .foregroundStyle(group.category.tint)
+                }
+                .frame(width: 36, height: 36)
+                .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(group.name)
+                        .font(.body.weight(.medium))
+                    Text(group.category.label)
+                        .font(.caption)
+                        .foregroundStyle(group.category.tint)
+                }
+                Spacer()
+            }
+            .accessibilityElement(children: .combine)
+
             inviteCodeButton(code: group.inviteCode)
         }
     }
@@ -276,12 +293,18 @@ struct GroupDashboardView: View {
             .accessibilityElement(children: .combine)
 
         case .authorizedWhenInUse, .authorizedAlways:
-            HStack(spacing: 8) {
-                ProgressView()
-                Text("Acquiring location…")
-                    .foregroundStyle(.secondary)
+            if viewModel.currentUser.coordinate != nil {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    locationFreshnessRow(now: context.date)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Acquiring location…")
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
             }
-            .accessibilityElement(children: .combine)
 
         @unknown default:
             Text("Unknown location authorization state.")
@@ -290,6 +313,84 @@ struct GroupDashboardView: View {
     }
 
     // MARK: - Helpers
+
+    @ViewBuilder
+    private func locationFreshnessRow(now: Date) -> some View {
+        let state = LocationFreshness(
+            lastSeen: viewModel.currentUser.lastSeen,
+            now: now
+        )
+        Button {
+            if state != .live { showsLocationHelp = true }
+        } label: {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(state.color)
+                    .frame(width: 10, height: 10)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(state.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                    if let detail = state.detail(lastSeen: viewModel.currentUser.lastSeen) {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if state != .live {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(state == .live)
+        .accessibilityHint(state == .live ? "" : "Tap to learn why")
+    }
+
+    private enum LocationFreshness: Equatable {
+        case live
+        case slow
+        case stalled
+
+        init(lastSeen: Date, now: Date) {
+            let age = now.timeIntervalSince(lastSeen)
+            if age < 30 { self = .live }
+            else if age < 120 { self = .slow }
+            else { self = .stalled }
+        }
+
+        var color: Color {
+            switch self {
+            case .live:    return .green
+            case .slow:    return .orange
+            case .stalled: return .red
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .live:    return "Sharing live"
+            case .slow:    return "Slow connection"
+            case .stalled: return "Can't share location"
+            }
+        }
+
+        func detail(lastSeen: Date) -> String? {
+            switch self {
+            case .live:
+                return nil
+            case .slow:
+                return "Last update \(lastSeen.formatted(.relative(presentation: .named)))"
+            case .stalled:
+                return "Tap to learn why"
+            }
+        }
+    }
 
     private func copyInviteCode(_ code: String) {
         UIPasteboard.general.string = code

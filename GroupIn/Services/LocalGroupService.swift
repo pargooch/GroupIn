@@ -46,6 +46,7 @@ final class LocalGroupService: CloudKitServicing {
     // MARK: - Create / Join
 
     func createGroup(named name: String,
+                     category: GroupCategory,
                      ownerID: UUID,
                      expiresAt: Date) async throws -> GroupSession {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -54,6 +55,7 @@ final class LocalGroupService: CloudKitServicing {
         let code = Self.generateInviteCode()
         let group = GroupSession(name: trimmed,
                                  inviteCode: code,
+                                 category: category,
                                  ownerID: ownerID,
                                  expiresAt: expiresAt)
         groupsByCode[code] = group

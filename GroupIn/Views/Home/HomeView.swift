@@ -84,11 +84,16 @@ struct HomeView: View {
 
     @ViewBuilder
     private func groupRow(_ group: GroupSession) -> some View {
-        HStack {
-            Image(systemName: "person.3.fill")
-                .foregroundStyle(.tint)
-                .frame(width: 28)
-                .accessibilityHidden(true)
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(group.category.tint.opacity(0.18))
+                Image(systemName: group.category.systemImage)
+                    .foregroundStyle(group.category.tint)
+            }
+            .frame(width: 40, height: 40)
+            .accessibilityHidden(true)
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(group.name)
                     .font(.headline)
@@ -105,6 +110,7 @@ struct HomeView: View {
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(group.category.label) group \(group.name)")
     }
 
     @ViewBuilder
@@ -133,14 +139,21 @@ struct HomeView: View {
     let state = AppState()
     let me = User(displayName: "Me")
     state.myGroups = [
-        GroupSession(name: "Weekend Hike", inviteCode: "ABC234",
+        GroupSession(name: "Coachella", inviteCode: "ABC234",
+                     category: .festival,
                      ownerID: me.id,
-                     expiresAt: .now.addingTimeInterval(3600 * 3),
+                     expiresAt: .now.addingTimeInterval(3600 * 12),
                      members: [me]),
-        GroupSession(name: "Office", inviteCode: "ZX9KQM",
+        GroupSession(name: "Italy Trip", inviteCode: "ZX9KQM",
+                     category: .trip,
                      ownerID: me.id,
-                     expiresAt: .now.addingTimeInterval(60 * 25),
-                     members: [me, User(displayName: "Alex")])
+                     expiresAt: .now.addingTimeInterval(86400 * 5),
+                     members: [me, User(displayName: "Alex")]),
+        GroupSession(name: "Yosemite", inviteCode: "FAM345",
+                     category: .nature,
+                     ownerID: me.id,
+                     expiresAt: .now.addingTimeInterval(86400 * 2),
+                     members: [me])
     ]
     return NavigationStack { HomeView() }
         .environment(state)

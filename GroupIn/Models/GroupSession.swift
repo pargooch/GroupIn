@@ -18,6 +18,7 @@ struct GroupSession: Identifiable, Hashable, Codable {
     let id: UUID
     var name: String
     var inviteCode: String
+    var category: GroupCategory
     var createdAt: Date
     var members: [User]
     let ownerID: UUID
@@ -27,6 +28,7 @@ struct GroupSession: Identifiable, Hashable, Codable {
     init(id: UUID = UUID(),
          name: String,
          inviteCode: String,
+         category: GroupCategory = .other,
          ownerID: UUID,
          expiresAt: Date,
          createdAt: Date = .now,
@@ -35,11 +37,27 @@ struct GroupSession: Identifiable, Hashable, Codable {
         self.id = id
         self.name = name
         self.inviteCode = inviteCode
+        self.category = category
         self.ownerID = ownerID
         self.expiresAt = expiresAt
         self.createdAt = createdAt
         self.members = members
         self.pendingExtension = pendingExtension
+    }
+
+    /// Custom decoder so old persisted groups (no `category` field) decode
+    /// gracefully as `.other`.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.inviteCode = try c.decode(String.self, forKey: .inviteCode)
+        self.category = (try? c.decode(GroupCategory.self, forKey: .category)) ?? .other
+        self.createdAt = try c.decode(Date.self, forKey: .createdAt)
+        self.members = try c.decode([User].self, forKey: .members)
+        self.ownerID = try c.decode(UUID.self, forKey: .ownerID)
+        self.expiresAt = try c.decode(Date.self, forKey: .expiresAt)
+        self.pendingExtension = try? c.decode(PendingExtension.self, forKey: .pendingExtension)
     }
 
     var isExpired: Bool { expiresAt <= .now }

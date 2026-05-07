@@ -15,7 +15,7 @@ import Observation
 @MainActor
 @Observable
 final class GroupDashboardViewModel {
-    var cameraPosition: MapCameraPosition = .automatic
+    var cameraPosition: MapCameraPosition
     var showExtendSheet: Bool = false
     var actionError: String?
     /// Member whose map pin is currently emphasized. Cleared after a few seconds.
@@ -29,6 +29,31 @@ final class GroupDashboardViewModel {
     init(appState: AppState, groupID: UUID) {
         self.appState = appState
         self.groupID = groupID
+        self.cameraPosition = Self.initialCamera(appState: appState, groupID: groupID)
+    }
+
+    /// Seed the map at the most plausible nearby point so we don't flash a
+    /// world view (default `.automatic` falls back to 0,0 — the middle of
+    /// the Atlantic). Order of preference:
+    ///  1. The local user's last-known coordinate.
+    ///  2. Any cached group member's coordinate.
+    ///  3. iOS's current user location, falling back to automatic.
+    private static func initialCamera(appState: AppState,
+                                      groupID: UUID) -> MapCameraPosition {
+        let span = MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+
+        if let coord = appState.currentUser.coordinate {
+            return .region(MKCoordinateRegion(center: coord.clLocation, span: span))
+        }
+
+        let cached = appState.currentGroup?.id == groupID
+            ? appState.currentGroup
+            : appState.myGroups.first(where: { $0.id == groupID })
+        if let coord = cached?.members.compactMap(\.coordinate).first {
+            return .region(MKCoordinateRegion(center: coord.clLocation, span: span))
+        }
+
+        return .userLocation(fallback: .automatic)
     }
 
     var group: GroupSession? {
@@ -60,11 +85,13 @@ final class GroupDashboardViewModel {
     func start() {
         appState.startLocationTracking()
         appState.startGroupRefresh()
+        appState.startBLEPresence()
     }
 
     func stop() {
         appState.stopLocationTracking()
         appState.stopGroupRefresh()
+        appState.stopBLEPresence()
     }
 
     /// First time we have any member coordinates, frame all of them.

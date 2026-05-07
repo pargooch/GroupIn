@@ -54,6 +54,7 @@ final class CloudKitService: CloudKitServicing {
     // MARK: - Create / Join
 
     func createGroup(named name: String,
+                     category: GroupCategory,
                      ownerID: UUID,
                      expiresAt: Date) async throws -> GroupSession {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,6 +63,7 @@ final class CloudKitService: CloudKitServicing {
         let group = GroupSession(
             name: trimmed,
             inviteCode: Self.generateInviteCode(),
+            category: category,
             ownerID: ownerID,
             expiresAt: expiresAt
         )

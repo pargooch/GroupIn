@@ -36,9 +36,14 @@ extension GroupSession {
                                        acceptedMemberIDs: accepted)
         }
 
+        // Older records without `category` decode as `.other`.
+        let category = (record["category"] as? String)
+            .flatMap(GroupCategory.init(rawValue:)) ?? .other
+
         self.init(id: id,
                   name: name,
                   inviteCode: inviteCode,
+                  category: category,
                   ownerID: ownerID,
                   expiresAt: expiresAt,
                   createdAt: createdAt,
@@ -51,6 +56,7 @@ extension GroupSession {
         record["id"] = id.uuidString
         record["name"] = name
         record["inviteCode"] = inviteCode
+        record["category"] = category.rawValue
         record["createdAt"] = createdAt
         record["ownerID"] = ownerID.uuidString
         record["expiresAt"] = expiresAt

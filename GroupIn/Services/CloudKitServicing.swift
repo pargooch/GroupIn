@@ -12,6 +12,7 @@ import Foundation
 
 protocol CloudKitServicing {
     func createGroup(named name: String,
+                     category: GroupCategory,
                      ownerID: UUID,
                      expiresAt: Date) async throws -> GroupSession
 

@@ -52,6 +52,7 @@ final class AppState {
     let groupService: CloudKitServicing
     let locationService: LocationServicing
     let notificationService: NotificationServicing
+    let blePresenceService: BLEPresenceServicing
 
     private let defaults: UserDefaults
     private var locationTask: Task<Void, Never>?
@@ -61,6 +62,7 @@ final class AppState {
     private var groupRefreshTask: Task<Void, Never>?
     private var lastLocationPublishAt: Date?
     private static let publishInterval: TimeInterval = 10
+    private var bleConsumerTask: Task<Void, Never>?
 
     private static let localProfileKey = "GroupIn.AppState.localProfile"
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
@@ -73,6 +75,7 @@ final class AppState {
          groupService: CloudKitServicing? = nil,
          locationService: LocationServicing? = nil,
          notificationService: NotificationServicing? = nil,
+         blePresenceService: BLEPresenceServicing? = nil,
          defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let resolvedProfile = localProfile ?? Self.loadLocalProfile(defaults: defaults)
@@ -88,6 +91,7 @@ final class AppState {
         self.locationAuthorizationStatus = resolvedLocation.authorizationStatus
 
         self.notificationService = notificationService ?? NotificationService()
+        self.blePresenceService = blePresenceService ?? BLEAdvertisementService()
 
         self.membershipByGroupID = Self.loadMembershipMap(defaults: defaults)
 
@@ -219,6 +223,7 @@ final class AppState {
                         self.addOrUpdate(group: group)
 
                         self.publishLocationIfNeeded(member: me, in: group)
+                        self.broadcastBLEPresence()
                     }
                 }
             }
@@ -236,6 +241,69 @@ final class AppState {
 
     func stopLocationTracking() {
         locationService.stopUpdating()
+    }
+
+    // MARK: - BLE peer presence
+
+    /// Start broadcasting + scanning for nearby group members over BLE.
+    /// Pairs with `stopBLEPresence()` on dashboard disappear.
+    func startBLEPresence() {
+        guard let group = currentGroup else { return }
+        let presence = makeLocalPresence(for: group)
+        blePresenceService.start(
+            groupHash: presence.groupHash,
+            localPresence: presence
+        )
+
+        if bleConsumerTask == nil {
+            bleConsumerTask = Task { [weak self] in
+                guard let self else { return }
+                for await peer in self.blePresenceService.peerUpdates {
+                    self.mergeBLEPeer(peer)
+                }
+            }
+        }
+    }
+
+    func stopBLEPresence() {
+        blePresenceService.stop()
+    }
+
+    private func makeLocalPresence(for group: GroupSession) -> PeerPresence {
+        PeerPresence(
+            groupHash: PeerPresence.groupHash(forInviteCode: group.inviteCode),
+            memberID: currentUser.id,
+            latitude: currentUser.coordinate?.latitude,
+            longitude: currentUser.coordinate?.longitude,
+            lastSeen: currentUser.lastSeen
+        )
+    }
+
+    /// Re-broadcast the current presence over BLE. Called after every
+    /// fix while the dashboard is open.
+    private func broadcastBLEPresence() {
+        guard let group = currentGroup else { return }
+        blePresenceService.update(localPresence: makeLocalPresence(for: group))
+    }
+
+    /// Merge a freshly-read peer presence into `currentGroup.members`.
+    /// Only applies when the peer's lastSeen is newer than our cached
+    /// version — same "newest wins" rule we use for CloudKit refresh.
+    private func mergeBLEPeer(_ peer: PeerPresence) {
+        guard var group = currentGroup else { return }
+        guard let idx = group.members.firstIndex(where: { $0.id == peer.memberID }) else {
+            // Unknown member — they may not have synced via CloudKit yet.
+            // Skip; the next CloudKit refresh will surface them and the
+            // following BLE read will then merge.
+            return
+        }
+        guard peer.lastSeen > group.members[idx].lastSeen else { return }
+        group.members[idx].lastSeen = peer.lastSeen
+        if let lat = peer.latitude, let lon = peer.longitude {
+            group.members[idx].coordinate = Coordinate(latitude: lat, longitude: lon)
+        }
+        currentGroup = group
+        addOrUpdate(group: group)
     }
 
     /// Throttled CloudKit publish: at most once every `publishInterval`

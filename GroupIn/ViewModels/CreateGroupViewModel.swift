@@ -44,7 +44,16 @@ enum GroupDuration: Hashable, CaseIterable, Identifiable {
 @Observable
 final class CreateGroupViewModel {
     var groupName: String = ""
-    var duration: GroupDuration = .fourHours
+    var category: GroupCategory = .exploring {
+        didSet {
+            // Auto-suggest the category's default duration unless the user
+            // has gone custom, in which case we leave their pick alone.
+            if !useCustomDate {
+                duration = category.defaultDuration
+            }
+        }
+    }
+    var duration: GroupDuration = GroupCategory.exploring.defaultDuration
     var customExpiresAt: Date = .now.addingTimeInterval(60 * 60 * 4)
     var useCustomDate: Bool = false
     var isSubmitting: Bool = false
@@ -79,6 +88,7 @@ final class CreateGroupViewModel {
 
             let group = try await service.createGroup(
                 named: groupName,
+                category: category,
                 ownerID: me.id,
                 expiresAt: expiresAt
             )
