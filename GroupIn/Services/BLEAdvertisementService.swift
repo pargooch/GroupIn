@@ -2,14 +2,17 @@
 //  BLEAdvertisementService.swift
 //  GroupIn
 //
-//  Foreground BLE peer presence over CoreBluetooth. Each device runs
-//  *both* peripheral and central:
+//  Foreground BLE peer presence over CoreBluetooth. Each device runs both
+//  peripheral and central:
 //
 //    - As a peripheral: advertises a GroupIn service UUID and exposes one
-//      characteristic carrying the local PeerPresence JSON.
-//    - As a central: scans for the same service UUID, connects briefly to
-//      each discovered peripheral, reads its presence characteristic,
-//      disconnects.
+//      readable + notifiable characteristic carrying the local
+//      `PeerPresence` JSON.
+//    - As a central: scans for the same service UUID, connects to any
+//      discovered peer, reads the characteristic once for current state,
+//      then subscribes to notifications and stays connected. Updates to
+//      a peer's presence push instantly via BLE notify (sub-second) instead
+//      of being polled.
 //
 //  Phase 1 scope: foreground only. iOS heavily restricts background BLE
 //  for arbitrary apps; the strong-background story comes when paired to a
@@ -56,15 +59,13 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private var activeGroupHash: UInt32?
     private var lastPresenceData: Data?
 
-    /// Peripherals we're currently connected to (for one-shot reads).
-    /// Held as a strong reference so iOS doesn't drop them mid-read.
-    private var pendingReads: Set<CBPeripheral> = []
+    /// Peripherals we've called `connect()` on but haven't yet seen
+    /// `didConnect`. Keyed by `peripheral.identifier`.
+    private var connectingPeers: Set<UUID> = []
 
-    /// Cooldown so we don't re-read the same peer every scan tick.
-    /// Keyed by `peripheral.identifier` (CoreBluetooth's stable per-app
-    /// peripheral ID — different from our membership UUID).
-    private var lastReadAt: [UUID: Date] = [:]
-    private let readCooldown: TimeInterval = 8
+    /// Peripherals with established connections we're keeping open.
+    /// Strong reference holds them so iOS doesn't drop the link.
+    private var connectedPeers: [UUID: CBPeripheral] = [:]
 
     // MARK: - Init
 
@@ -90,8 +91,8 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         guard let data = localPresence.encoded() else { return }
         lastPresenceData = data
         if let char = presenceCharacteristic {
-            char.value = data
-            // Push to any subscribed centrals (none today, but harmless).
+            // Push to all subscribed centrals via BLE notify — fast path
+            // (sub-second to peers with a live connection).
             peripheralManager.updateValue(
                 data,
                 for: char,
@@ -107,11 +108,11 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         if peripheralManager.state == .poweredOn {
             peripheralManager.stopAdvertising()
         }
-        for peripheral in pendingReads {
+        for (_, peripheral) in connectedPeers {
             centralManager.cancelPeripheralConnection(peripheral)
         }
-        pendingReads.removeAll()
-        lastReadAt.removeAll()
+        connectedPeers.removeAll()
+        connectingPeers.removeAll()
         activeGroupHash = nil
     }
 
@@ -120,6 +121,11 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private func beginScanIfReady() {
         guard centralManager.state == .poweredOn,
               activeGroupHash != nil else { return }
+        // `allowDuplicates: true` is essential for reconnect after a peer
+        // drops out of range — without duplicate callbacks iOS won't notify
+        // us again once the peer reappears. The dedup checks in
+        // `considerConnect` handle the "already connected" case so the extra
+        // callbacks aren't wasted work.
         centralManager.scanForPeripherals(
             withServices: [Self.serviceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
@@ -150,29 +156,30 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         serviceAdded = true
     }
 
-    private func considerRead(of peripheral: CBPeripheral) {
-        // Already connecting / connected to this one — don't double-up.
-        guard !pendingReads.contains(peripheral) else { return }
+    private func considerConnect(to peripheral: CBPeripheral) {
+        guard activeGroupHash != nil else { return }
+        let id = peripheral.identifier
+        if connectingPeers.contains(id) || connectedPeers[id] != nil { return }
 
-        // Cooldown so a duplicate-allowed scan doesn't hammer the link.
-        if let last = lastReadAt[peripheral.identifier],
-           Date().timeIntervalSince(last) < readCooldown {
-            return
-        }
-
-        pendingReads.insert(peripheral)
+        connectingPeers.insert(id)
         peripheral.delegate = self
         centralManager.connect(peripheral, options: nil)
     }
 
+    private func cleanupPeer(_ peripheral: CBPeripheral) {
+        let id = peripheral.identifier
+        connectingPeers.remove(id)
+        connectedPeers.removeValue(forKey: id)
+    }
+
     private func handlePresenceData(_ data: Data, from peripheral: CBPeripheral) {
-        defer {
-            centralManager.cancelPeripheralConnection(peripheral)
-            pendingReads.remove(peripheral)
-            lastReadAt[peripheral.identifier] = .now
-        }
         guard let presence = PeerPresence.decoded(from: data) else { return }
-        guard presence.groupHash == activeGroupHash else { return }
+        guard presence.groupHash == activeGroupHash else {
+            // Different group — drop the connection so we don't keep a
+            // pointless link open.
+            centralManager.cancelPeripheralConnection(peripheral)
+            return
+        }
         peerContinuation.yield(presence)
     }
 }
@@ -192,13 +199,17 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
                                     advertisementData: [String: Any],
                                     rssi RSSI: NSNumber) {
         Task { @MainActor [weak self] in
-            self?.considerRead(of: peripheral)
+            self?.considerConnect(to: peripheral)
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager,
                                     didConnect peripheral: CBPeripheral) {
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let id = peripheral.identifier
+            self.connectingPeers.remove(id)
+            self.connectedPeers[id] = peripheral
             peripheral.discoverServices([Self.serviceUUID])
         }
     }
@@ -207,15 +218,17 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
                                     didFailToConnect peripheral: CBPeripheral,
                                     error: Error?) {
         Task { @MainActor [weak self] in
-            self?.pendingReads.remove(peripheral)
+            self?.cleanupPeer(peripheral)
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager,
                                     didDisconnectPeripheral peripheral: CBPeripheral,
                                     error: Error?) {
+        // On accidental disconnect (peer went out of range), the next scan
+        // hit will trigger a fresh connect.
         Task { @MainActor [weak self] in
-            self?.pendingReads.remove(peripheral)
+            self?.cleanupPeer(peripheral)
         }
     }
 }
@@ -243,7 +256,10 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
         Task { @MainActor in
             guard let chars = service.characteristics else { return }
             for char in chars where char.uuid == Self.presenceCharacteristicUUID {
+                // 1. Initial read so we get the peer's current state right away.
                 peripheral.readValue(for: char)
+                // 2. Subscribe for ongoing live updates pushed via notify.
+                peripheral.setNotifyValue(true, for: char)
             }
         }
     }

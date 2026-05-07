@@ -430,6 +430,20 @@ struct GroupDashboardView: View {
         let color = Color.memberColor(for: member.id)
 
         ZStack {
+            // Direction cone (Google Maps style) — only when we have a
+            // valid heading. Drawn behind the marker with a fading
+            // gradient so the avatar stays the focal point.
+            if let heading = member.heading {
+                DirectionCone()
+                    .fill(LinearGradient(
+                        colors: [color.opacity(0.55), color.opacity(0.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ))
+                    .frame(width: 82, height: 82)
+                    .rotationEffect(.degrees(heading))
+                    .animation(.smooth(duration: 0.3), value: heading)
+            }
             if isFocused {
                 Circle()
                     .stroke(Color.accentColor, lineWidth: 3)

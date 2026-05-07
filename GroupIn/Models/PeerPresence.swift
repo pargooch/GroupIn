@@ -21,6 +21,10 @@ struct PeerPresence: Codable, Equatable {
     let latitude: Double?
     let longitude: Double?
 
+    /// Compass heading in degrees from true north, when the peer's device
+    /// has a valid reading. Nil otherwise.
+    let heading: Double?
+
     /// When the peer's location was sampled (UTC).
     let lastSeen: Date
 

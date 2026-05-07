@@ -63,6 +63,7 @@ final class AppState {
     private var lastLocationPublishAt: Date?
     private static let publishInterval: TimeInterval = 10
     private var bleConsumerTask: Task<Void, Never>?
+    private var headingTask: Task<Void, Never>?
 
     private static let localProfileKey = "GroupIn.AppState.localProfile"
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
@@ -237,6 +238,27 @@ final class AppState {
                 }
             }
         }
+
+        if headingTask == nil {
+            headingTask = Task { [weak self] in
+                guard let self else { return }
+                for await heading in self.locationService.headingUpdates {
+                    var me = self.currentUser
+                    me.heading = heading
+                    self.currentUser = me
+
+                    // Mirror into the active group's local member entry so
+                    // the local pin's cone updates immediately. Heading is
+                    // also picked up by the next BLE/CloudKit broadcast
+                    // (which fires on location updates, not heading).
+                    if var group = self.currentGroup,
+                       let idx = group.members.firstIndex(where: { $0.id == me.id }) {
+                        group.members[idx].heading = heading
+                        self.currentGroup = group
+                    }
+                }
+            }
+        }
     }
 
     func stopLocationTracking() {
@@ -275,6 +297,7 @@ final class AppState {
             memberID: currentUser.id,
             latitude: currentUser.coordinate?.latitude,
             longitude: currentUser.coordinate?.longitude,
+            heading: currentUser.heading,
             lastSeen: currentUser.lastSeen
         )
     }
@@ -302,6 +325,7 @@ final class AppState {
         if let lat = peer.latitude, let lon = peer.longitude {
             group.members[idx].coordinate = Coordinate(latitude: lat, longitude: lon)
         }
+        group.members[idx].heading = peer.heading
         currentGroup = group
         addOrUpdate(group: group)
     }
@@ -349,10 +373,21 @@ final class AppState {
                 // Server-side gone — let the expiry monitor handle removal.
                 return
             }
-            // Preserve our local "self" entry so a stale server fetch doesn't
-            // clobber a fresh local fix that's still in-flight to CloudKit.
+            // Newest-wins merge per member. Without this, an offline peer's
+            // BLE-sourced fresh location gets clobbered every 10 s by the
+            // stale copy CloudKit still has from before they went offline.
+            for i in updated.members.indices {
+                let cloudMember = updated.members[i]
+                if let local = active.members.first(where: { $0.id == cloudMember.id }),
+                   local.lastSeen > cloudMember.lastSeen {
+                    updated.members[i] = local
+                }
+            }
+            // Self entry: prefer the live `currentUser` if it's newer than
+            // either cloud or the active cached copy.
             if let myID = membershipByGroupID[updated.id],
-               let myIdx = updated.members.firstIndex(where: { $0.id == myID }) {
+               let myIdx = updated.members.firstIndex(where: { $0.id == myID }),
+               currentUser.lastSeen >= updated.members[myIdx].lastSeen {
                 updated.members[myIdx] = currentUser
             }
             currentGroup = updated
