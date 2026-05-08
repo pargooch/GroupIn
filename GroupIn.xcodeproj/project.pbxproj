@@ -258,9 +258,11 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "GroupIn uses Bluetooth to find nearby group members when the internet isn't available.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "GroupIn alerts you when group members come nearby — even when the app is closed — and keeps sharing your location with the group while you're an active member.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "GroupIn shares your location with members of your group so you can keep an eye on each other.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIBackgroundModes = location;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -293,9 +295,11 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "GroupIn uses Bluetooth to find nearby group members when the internet isn't available.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "GroupIn alerts you when group members come nearby — even when the app is closed — and keeps sharing your location with the group while you're an active member.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "GroupIn shares your location with members of your group so you can keep an eye on each other.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIBackgroundModes = location;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";

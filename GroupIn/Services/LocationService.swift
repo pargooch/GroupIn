@@ -58,6 +58,29 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
         // ≥3°. Avoids flooding the stream while the device is held still
         // (where magnetometer noise causes constant micro-fluctuations).
         manager.headingFilter = 3
+
+        // Background sharing: with whenInUse + UIBackgroundModes=location,
+        // location keeps flowing while the app is backgrounded or the
+        // phone is locked. We guard `allowsBackgroundLocationUpdates`
+        // because setting it without the matching Info.plist entry is a
+        // hard assertion crash on Apple's side. Pause-disable + the
+        // visible indicator are safe to set unconditionally.
+        if Self.bundleSupportsBackgroundLocation() {
+            manager.allowsBackgroundLocationUpdates = true
+            manager.showsBackgroundLocationIndicator = true
+        }
+        manager.pausesLocationUpdatesAutomatically = false
+    }
+
+    /// Reads the running app bundle's `UIBackgroundModes` to verify
+    /// `"location"` is actually present before we try to opt into
+    /// `allowsBackgroundLocationUpdates`. Without this guard, a missing
+    /// or out-of-sync Info.plist key crashes the app on launch.
+    private static func bundleSupportsBackgroundLocation() -> Bool {
+        guard let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] else {
+            return false
+        }
+        return modes.contains("location")
     }
 
     func requestAuthorization() {
@@ -88,10 +111,11 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
 
     nonisolated func locationManager(_ manager: CLLocationManager,
                                      didUpdateHeading newHeading: CLHeading) {
-        // Negative accuracy = invalid (no calibration, nearby magnetic
-        // interference, etc.). Skip — better to show no cone than the
-        // wrong direction.
-        guard newHeading.headingAccuracy >= 0 else { return }
+        // Negative accuracy = totally invalid. Above ~35° = calibration
+        // poor or strong magnetic interference; the bearing is unreliable
+        // enough that no cone is better than a wrong cone.
+        guard newHeading.headingAccuracy >= 0,
+              newHeading.headingAccuracy < 35 else { return }
         headingContinuation.yield(newHeading.trueHeading)
     }
 

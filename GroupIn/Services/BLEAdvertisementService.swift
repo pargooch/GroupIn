@@ -21,6 +21,7 @@
 
 import Foundation
 import CoreBluetooth
+import CoreLocation
 
 @MainActor
 protocol BLEPresenceServicing: AnyObject {
@@ -42,6 +43,13 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// Characteristic UUID for the JSON-encoded PeerPresence payload.
     static let presenceCharacteristicUUID = CBUUID(string: "A5B7E1C1-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
 
+    /// iBeacon UUID for region monitoring. Different from the BLE service
+    /// UUID because iBeacon advertisements use a manufacturer-data format
+    /// while BLE service advertisements use the service-UUID list — iOS
+    /// only lets us advertise one mode at a time, so the peripheral
+    /// alternates between the two below.
+    static let iBeaconUUID = UUID(uuidString: "1A7B5F30-9E2C-4D3B-8A5F-2C9D7E1A4F5B")!
+
     // MARK: - Streams
 
     let peerUpdates: AsyncStream<PeerPresence>
@@ -58,6 +66,11 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
 
     private var activeGroupHash: UInt32?
     private var lastPresenceData: Data?
+
+    /// Toggles the peripheral's advertised packet between Phase-1 GATT
+    /// discovery (service UUID) and Phase-3 region wake (iBeacon).
+    private var advertisingTask: Task<Void, Never>?
+    private static let advertiseToggleInterval: TimeInterval = 4
 
     /// Peripherals we've called `connect()` on but haven't yet seen
     /// `didConnect`. Keyed by `peripheral.identifier`.
@@ -102,6 +115,8 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     }
 
     func stop() {
+        advertisingTask?.cancel()
+        advertisingTask = nil
         if centralManager.state == .poweredOn {
             centralManager.stopScan()
         }
@@ -136,9 +151,55 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         guard peripheralManager.state == .poweredOn,
               activeGroupHash != nil else { return }
         if !serviceAdded { setupService() }
+        startAlternatingAdvertisement()
+    }
+
+    /// Toggle the peripheral between the Phase-1 service-UUID packet and
+    /// an iBeacon packet every few seconds. Centrals discover us via
+    /// service-UUID scan; backgrounded peers' region monitors detect us
+    /// via the iBeacon. iOS only allows one active advertisement at a
+    /// time so we share the radio between the two purposes.
+    private func startAlternatingAdvertisement() {
+        advertisingTask?.cancel()
+        advertisingTask = Task { [weak self] in
+            var iBeaconPhase = false
+            while !Task.isCancelled {
+                guard let self else { break }
+                iBeaconPhase.toggle()
+                self.peripheralManager.stopAdvertising()
+                if iBeaconPhase {
+                    self.advertiseAsBeacon()
+                } else {
+                    self.advertiseAsService()
+                }
+                try? await Task.sleep(for: .seconds(Self.advertiseToggleInterval))
+            }
+        }
+    }
+
+    private func advertiseAsService() {
         peripheralManager.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [Self.serviceUUID]
         ])
+    }
+
+    private func advertiseAsBeacon() {
+        guard let groupHash = activeGroupHash else { return }
+        // Pack the group hash into the iBeacon major+minor so other
+        // GroupIn devices in the same group can theoretically tell each
+        // other apart at the iBeacon layer if we want richer dedup later.
+        let major = CLBeaconMajorValue((groupHash >> 16) & 0xFFFF)
+        let minor = CLBeaconMinorValue(groupHash & 0xFFFF)
+        let region = CLBeaconRegion(
+            uuid: Self.iBeaconUUID,
+            major: major,
+            minor: minor,
+            identifier: "com.NDE.GroupIn.peer"
+        )
+        let raw = region.peripheralData(withMeasuredPower: nil)
+        if let dict = raw as? [String: Any] {
+            peripheralManager.startAdvertising(dict)
+        }
     }
 
     private func setupService() {

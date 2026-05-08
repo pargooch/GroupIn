@@ -10,9 +10,11 @@ import UIKit
 
 struct GroupDashboardView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.openURL) private var openURL
     @State private var viewModel: GroupDashboardViewModel
     @State private var didCopyInviteCode = false
     @State private var showsLocationHelp = false
+    @State private var compassMember: User?
 
     init(viewModel: GroupDashboardViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -25,6 +27,10 @@ struct GroupDashboardView: View {
             .sheet(isPresented: $showsLocationHelp) {
                 LocationHelpSheet()
                     .presentationDetents([.medium, .large])
+            }
+            .fullScreenCover(item: $compassMember) { member in
+                CompassView(memberID: member.id)
+                    .environment(appState)
             }
     }
 
@@ -54,6 +60,7 @@ struct GroupDashboardView: View {
             expirySection(group: group)
             groupSection(group: group)
             membersSection(group: group)
+            safetySection
         }
     }
 
@@ -125,11 +132,34 @@ struct GroupDashboardView: View {
                 fitAllButton
                     .padding(10)
             }
+            .overlay(alignment: .topLeading) {
+                connectionModePill
+                    .padding(10)
+            }
             .frame(height: 420)
             .clipShape(RoundedRectangle(cornerRadius: 14))
             .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             .accessibilityLabel("Map showing your location and group members")
         }
+    }
+
+    @ViewBuilder
+    private var connectionModePill: some View {
+        let mode = appState.connectionMode
+        HStack(spacing: 6) {
+            Image(systemName: mode.icon)
+                .font(.caption2)
+            Text(mode.label)
+                .font(.caption.weight(.medium))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.thickMaterial, in: Capsule())
+        .overlay(
+            Capsule().strokeBorder(mode.tint.opacity(0.4), lineWidth: 1)
+        )
+        .foregroundStyle(mode.tint)
+        .accessibilityLabel(mode.accessibilityLabel)
     }
 
     @ViewBuilder
@@ -312,6 +342,65 @@ struct GroupDashboardView: View {
         }
     }
 
+    // MARK: - Safety / Find My handoff
+
+    @ViewBuilder
+    private var safetySection: some View {
+        Section {
+            Button {
+                openFindMy()
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.green.opacity(0.18))
+                        Image(systemName: "location.viewfinder")
+                            .foregroundStyle(.green)
+                    }
+                    .frame(width: 36, height: 36)
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Set up Find My backup")
+                            .foregroundStyle(.primary)
+                            .font(.body.weight(.medium))
+                        Text("Apple's separate network — works at longer range when GroupIn can't reach.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "arrow.up.forward")
+                        .font(.footnote)
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Opens the Find My app so you can share your location as a backup")
+        } header: {
+            Text("Safety")
+        } footer: {
+            Text("GroupIn handles real-time group awareness. Find My runs through Apple's network — useful as a long-range backup when our signal can't reach.")
+                .font(.caption)
+        }
+    }
+
+    private func openFindMy() {
+        // Try the native scheme first; fall back to the universal link
+        // (which iOS routes into the Find My app on devices that have it,
+        // and to the iCloud web UI otherwise).
+        guard let scheme = URL(string: "findmy://"),
+              let universal = URL(string: "https://www.icloud.com/findmy") else {
+            return
+        }
+        openURL(scheme) { accepted in
+            if !accepted {
+                openURL(universal)
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     @ViewBuilder
@@ -430,19 +519,33 @@ struct GroupDashboardView: View {
         let color = Color.memberColor(for: member.id)
 
         ZStack {
-            // Direction cone (Google Maps style) — only when we have a
-            // valid heading. Drawn behind the marker with a fading
-            // gradient so the avatar stays the focal point.
+            // Direction indicator (Google Maps style) — only when the
+            // device has a valid heading. Two layers: a wider faint halo
+            // and a focused brighter beam, both with a radial gradient
+            // so the apex (where the person is) is solid and the outer
+            // edge fades away. Blur softens the pie-slice edges.
             if let heading = member.heading {
-                DirectionCone()
-                    .fill(LinearGradient(
-                        colors: [color.opacity(0.55), color.opacity(0.0)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ))
-                    .frame(width: 82, height: 82)
-                    .rotationEffect(.degrees(heading))
-                    .animation(.smooth(duration: 0.3), value: heading)
+                ZStack {
+                    DirectionCone(spreadDegrees: 90)
+                        .fill(RadialGradient(
+                            colors: [color.opacity(0.30), color.opacity(0.0)],
+                            center: .center,
+                            startRadius: 8,
+                            endRadius: 50
+                        ))
+                        .blur(radius: 4)
+                    DirectionCone(spreadDegrees: 50)
+                        .fill(RadialGradient(
+                            colors: [color.opacity(0.65), color.opacity(0.0)],
+                            center: .center,
+                            startRadius: 6,
+                            endRadius: 44
+                        ))
+                        .blur(radius: 1.5)
+                }
+                .frame(width: 100, height: 100)
+                .rotationEffect(.degrees(heading))
+                .animation(.smooth(duration: 0.3), value: heading)
             }
             if isFocused {
                 Circle()
@@ -476,56 +579,76 @@ struct GroupDashboardView: View {
             now: now
         )
         let hasLocation = member.coordinate != nil
+        let isMe = member.id == viewModel.currentUser.id
+        let memberColor = Color.memberColor(for: member.id)
 
-        Button {
-            viewModel.focus(on: member)
-        } label: {
-            HStack(spacing: 12) {
-                AvatarView(data: member.avatarData,
-                           name: member.displayName,
-                           size: 40,
-                           tint: Color.memberColor(for: member.id))
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(member.displayName)
-                            .font(.body.weight(.medium))
-                            .foregroundStyle(.primary)
-                        if member.id == viewModel.currentUser.id {
-                            Text("You")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.accentColor.opacity(0.15), in: Capsule())
-                                .foregroundStyle(.tint)
+        HStack(spacing: 12) {
+            Button {
+                viewModel.focus(on: member)
+            } label: {
+                HStack(spacing: 12) {
+                    AvatarView(data: member.avatarData,
+                               name: member.displayName,
+                               size: 40,
+                               tint: memberColor)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(member.displayName)
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(.primary)
+                            if isMe {
+                                Text("You")
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                    .foregroundStyle(.tint)
+                            }
+                            if member.id == group.ownerID {
+                                Image(systemName: "crown.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .accessibilityLabel("Owner")
+                            }
                         }
-                        if member.id == group.ownerID {
-                            Image(systemName: "crown.fill")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                                .accessibilityLabel("Owner")
+                        if !hasLocation {
+                            Text("No location yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                    if !hasLocation {
-                        Text("No location yet")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
                 }
-                Spacer()
-                PresenceBadge(status: status)
-                if hasLocation {
-                    Image(systemName: "location.magnifyingglass")
-                        .font(.footnote)
-                        .foregroundStyle(.tint)
-                        .accessibilityHidden(true)
-                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .disabled(!hasLocation)
+            .accessibilityHint(hasLocation ? "Show on map" : "")
+
+            Spacer()
+
+            if let source = appState.transportSource(for: member.id), !isMe {
+                Image(systemName: source.icon)
+                    .font(.caption2)
+                    .foregroundStyle(source.tint)
+                    .accessibilityLabel(source.accessibilityLabel)
+            }
+            PresenceBadge(status: status)
+
+            if hasLocation && !isMe {
+                Button {
+                    compassMember = member
+                } label: {
+                    Image(systemName: "location.north.fill")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 36, height: 36)
+                        .foregroundStyle(memberColor)
+                        .background(memberColor.opacity(0.12), in: Circle())
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Find \(member.displayName)")
+            }
         }
-        .buttonStyle(.plain)
-        .disabled(!hasLocation)
-        .accessibilityHint(hasLocation ? "Show on map" : "")
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 

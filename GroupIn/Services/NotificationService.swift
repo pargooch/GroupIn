@@ -13,6 +13,7 @@ import UserNotifications
 enum AppNotificationType: String, Sendable {
     case expiryReminder
     case extensionProposed
+    case peerNearby
 }
 
 struct NotificationTap: Sendable {
@@ -26,6 +27,10 @@ protocol NotificationServicing: AnyObject {
     func requestAuthorization() async -> Bool
     func scheduleExpiryReminder(for group: GroupSession) async
     func cancelAll(for groupID: UUID) async
+    /// Fires a tickle notification on iBeacon region entry. iOS gives us
+    /// only ~10 seconds when launched in the background, so we keep the
+    /// payload trivial and let the user tap into the app for details.
+    func firePeerNearbyNotification(for groupID: UUID) async
 }
 
 @MainActor
@@ -74,10 +79,33 @@ final class NotificationService: NSObject, NotificationServicing, UNUserNotifica
     func cancelAll(for groupID: UUID) async {
         let ids = [
             Self.expiryReminderID(for: groupID),
-            Self.extensionProposedID(for: groupID)
+            Self.extensionProposedID(for: groupID),
+            Self.peerNearbyID(for: groupID)
         ]
         center.removePendingNotificationRequests(withIdentifiers: ids)
         center.removeDeliveredNotifications(withIdentifiers: ids)
+    }
+
+    func firePeerNearbyNotification(for groupID: UUID) async {
+        let id = Self.peerNearbyID(for: groupID)
+        // Coalesce repeated entries: clear any pending/delivered first so
+        // we don't pile up identical notifications.
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+        center.removeDeliveredNotifications(withIdentifiers: [id])
+
+        let content = UNMutableNotificationContent()
+        content.title = "Someone from your group is nearby"
+        content.body = "Open GroupIn to find them."
+        content.userInfo = [
+            "groupID": groupID.uuidString,
+            "type": AppNotificationType.peerNearby.rawValue
+        ]
+        content.sound = .default
+
+        // Fire ASAP. UNTimeIntervalNotificationTrigger needs at least 1s.
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        try? await center.add(request)
     }
 
     // MARK: - UNUserNotificationCenterDelegate
@@ -111,5 +139,9 @@ final class NotificationService: NSObject, NotificationServicing, UNUserNotifica
 
     private static func extensionProposedID(for groupID: UUID) -> String {
         "extensionProposed.\(groupID.uuidString)"
+    }
+
+    private static func peerNearbyID(for groupID: UUID) -> String {
+        "peerNearby.\(groupID.uuidString)"
     }
 }

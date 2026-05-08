@@ -23,6 +23,42 @@ enum AppRoute: Hashable {
     case profileEditor
 }
 
+enum TransportSource {
+    case cloud
+    case ble
+}
+
+struct PeerSourceTracking: Equatable {
+    var lastCloudUpdate: Date?
+    var lastBLEUpdate: Date?
+
+    /// The most recent transport that delivered an update inside the
+    /// freshness window. Nil if neither is fresh.
+    func dominant(now: Date = .now,
+                  freshnessWindow: TimeInterval) -> TransportSource? {
+        let cloudFresh = lastCloudUpdate.map {
+            now.timeIntervalSince($0) < freshnessWindow
+        } ?? false
+        let bleFresh = lastBLEUpdate.map {
+            now.timeIntervalSince($0) < freshnessWindow
+        } ?? false
+        if bleFresh && cloudFresh,
+           let bleAt = lastBLEUpdate, let cloudAt = lastCloudUpdate {
+            return bleAt > cloudAt ? .ble : .cloud
+        }
+        if bleFresh { return .ble }
+        if cloudFresh { return .cloud }
+        return nil
+    }
+}
+
+enum ConnectionMode: Equatable {
+    case onlineWithPeers   // internet + at least one nearby BLE peer
+    case online            // internet only, no BLE peers
+    case peersOnly         // no internet, BLE peers present
+    case offline           // no internet, no peers — last known only
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -37,7 +73,25 @@ final class AppState {
     /// is already the canonical source of member data.
     var currentUser: User
     var currentGroup: GroupSession? {
-        didSet { persistCurrentGroup() }
+        didSet {
+            persistCurrentGroup()
+            // Find My / Live Location-style: location flows for the
+            // duration of group membership, not just while the dashboard
+            // is on screen. Lock the phone, navigate Home, drop the app
+            // into background — sharing keeps going until you Leave.
+            // iBeacon region monitoring follows the same lifecycle so we
+            // can wake on peer proximity even when the app is closed.
+            switch (oldValue, currentGroup) {
+            case (nil, .some):
+                startLocationTracking()
+                startBeaconMonitoring()
+            case (.some, nil):
+                stopLocationTracking()
+                stopBeaconMonitoring()
+            default:
+                break
+            }
+        }
     }
     var myGroups: [GroupSession] = [] {
         didSet { persistMyGroups() }
@@ -49,12 +103,23 @@ final class AppState {
 
     var locationAuthorizationStatus: CLAuthorizationStatus = .notDetermined
 
+    /// True when the device has internet (any path satisfied).
+    /// Driven by NWPathMonitor.
+    var isOnline: Bool = true
+
+    /// Per-peer last-seen timestamps per transport. Drives the
+    /// connection-mode badge and the per-row transport icon.
+    private(set) var peerSources: [UUID: PeerSourceTracking] = [:]
+    private static let transportFreshnessWindow: TimeInterval = 60
+
     let groupService: CloudKitServicing
     let locationService: LocationServicing
     let notificationService: NotificationServicing
     let blePresenceService: BLEPresenceServicing
+    let beaconMonitor: BeaconMonitorService
 
     private let defaults: UserDefaults
+    private var networkMonitor: NetworkMonitor?
     private var locationTask: Task<Void, Never>?
     private var authTask: Task<Void, Never>?
     private var expiryMonitorTask: Task<Void, Never>?
@@ -64,6 +129,8 @@ final class AppState {
     private static let publishInterval: TimeInterval = 10
     private var bleConsumerTask: Task<Void, Never>?
     private var headingTask: Task<Void, Never>?
+    private var headingBuffer: [Double] = []
+    private static let headingSmoothingWindow = 5
 
     private static let localProfileKey = "GroupIn.AppState.localProfile"
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
@@ -93,6 +160,7 @@ final class AppState {
 
         self.notificationService = notificationService ?? NotificationService()
         self.blePresenceService = blePresenceService ?? BLEAdvertisementService()
+        self.beaconMonitor = BeaconMonitorService()
 
         self.membershipByGroupID = Self.loadMembershipMap(defaults: defaults)
 
@@ -116,6 +184,87 @@ final class AppState {
 
         startExpiryMonitor()
         startNotificationTapMonitor()
+        startNetworkMonitor()
+        configureBeaconMonitor()
+
+        // didSet doesn't fire during init, so if we restored a group from
+        // persistence, kick off location explicitly. The user comes back
+        // to a phone that's been locked all night and sharing is already
+        // alive when they unlock — same as Find My.
+        if currentGroup != nil {
+            startLocationTracking()
+            startBeaconMonitoring()
+        }
+    }
+
+    /// Wires the iBeacon region monitor's entry callback into the
+    /// notification service. This is the path that fires when iOS wakes
+    /// the app from a force-quit state because a group peer's iBeacon
+    /// came into range.
+    private func configureBeaconMonitor() {
+        beaconMonitor.onEnter = { [weak self] in
+            guard let self else { return }
+            // Use whichever group context we have. If currentGroup is
+            // nil (race during launch) prefer the most recently used.
+            guard let group = self.currentGroup ?? self.myGroups.first else { return }
+            Task { [notificationService = self.notificationService, groupID = group.id] in
+                await notificationService.firePeerNearbyNotification(for: groupID)
+            }
+        }
+    }
+
+    private func startBeaconMonitoring() {
+        beaconMonitor.start()
+    }
+
+    private func stopBeaconMonitoring() {
+        beaconMonitor.stop()
+    }
+
+    private func startNetworkMonitor() {
+        guard networkMonitor == nil else { return }
+        let monitor = NetworkMonitor()
+        monitor.onChange = { [weak self] online in
+            self?.isOnline = online
+        }
+        // Seed from current state so we don't have to wait for the first
+        // path change before the UI reflects reality.
+        self.isOnline = monitor.isOnline
+        self.networkMonitor = monitor
+    }
+
+    // MARK: - Transport tracking
+
+    func recordTransport(_ source: TransportSource, for memberID: UUID) {
+        var tracking = peerSources[memberID] ?? PeerSourceTracking()
+        switch source {
+        case .cloud: tracking.lastCloudUpdate = .now
+        case .ble:   tracking.lastBLEUpdate = .now
+        }
+        peerSources[memberID] = tracking
+    }
+
+    func transportSource(for memberID: UUID) -> TransportSource? {
+        peerSources[memberID]?.dominant(
+            freshnessWindow: Self.transportFreshnessWindow
+        )
+    }
+
+    var hasNearbyPeer: Bool {
+        let now = Date()
+        return peerSources.values.contains { source in
+            guard let bleAt = source.lastBLEUpdate else { return false }
+            return now.timeIntervalSince(bleAt) < Self.transportFreshnessWindow
+        }
+    }
+
+    var connectionMode: ConnectionMode {
+        switch (isOnline, hasNearbyPeer) {
+        case (true, true):   return .onlineWithPeers
+        case (true, false):  return .online
+        case (false, true):  return .peersOnly
+        case (false, false): return .offline
+        }
     }
 
     // MARK: - Membership construction
@@ -243,8 +392,10 @@ final class AppState {
             headingTask = Task { [weak self] in
                 guard let self else { return }
                 for await heading in self.locationService.headingUpdates {
+                    let smoothed = self.smoothHeading(heading)
+
                     var me = self.currentUser
-                    me.heading = heading
+                    me.heading = smoothed
                     self.currentUser = me
 
                     // Mirror into the active group's local member entry so
@@ -253,12 +404,30 @@ final class AppState {
                     // (which fires on location updates, not heading).
                     if var group = self.currentGroup,
                        let idx = group.members.firstIndex(where: { $0.id == me.id }) {
-                        group.members[idx].heading = heading
+                        group.members[idx].heading = smoothed
                         self.currentGroup = group
                     }
                 }
             }
         }
+    }
+
+    /// Circular moving average over the last few heading samples. Plain
+    /// averaging is wrong for compass bearings — averaging 350° and 10°
+    /// would yield 180° instead of the correct 0°. Going through the
+    /// unit circle with sin/cos and atan2 handles the wrap.
+    private func smoothHeading(_ raw: Double) -> Double {
+        headingBuffer.append(raw)
+        if headingBuffer.count > Self.headingSmoothingWindow {
+            headingBuffer.removeFirst()
+        }
+        let radians = headingBuffer.map { $0 * .pi / 180 }
+        let n = Double(headingBuffer.count)
+        let sumX = radians.map(cos).reduce(0, +) / n
+        let sumY = radians.map(sin).reduce(0, +) / n
+        let meanRad = atan2(sumY, sumX)
+        let meanDeg = meanRad * 180 / .pi
+        return (meanDeg + 360).truncatingRemainder(dividingBy: 360)
     }
 
     func stopLocationTracking() {
@@ -320,6 +489,10 @@ final class AppState {
             // following BLE read will then merge.
             return
         }
+        // Always record BLE contact even if the data isn't strictly fresher;
+        // the connection-mode pill cares about "we're hearing them on
+        // Bluetooth," not just "their position changed."
+        recordTransport(.ble, for: peer.memberID)
         guard peer.lastSeen > group.members[idx].lastSeen else { return }
         group.members[idx].lastSeen = peer.lastSeen
         if let lat = peer.latitude, let lon = peer.longitude {
@@ -378,9 +551,13 @@ final class AppState {
             // stale copy CloudKit still has from before they went offline.
             for i in updated.members.indices {
                 let cloudMember = updated.members[i]
-                if let local = active.members.first(where: { $0.id == cloudMember.id }),
-                   local.lastSeen > cloudMember.lastSeen {
+                let localCopy = active.members.first(where: { $0.id == cloudMember.id })
+                if let local = localCopy, local.lastSeen > cloudMember.lastSeen {
                     updated.members[i] = local
+                } else if cloudMember.lastSeen > (localCopy?.lastSeen ?? .distantPast) {
+                    // Cloud has fresher data — note that this peer is
+                    // currently reachable via the cloud transport.
+                    recordTransport(.cloud, for: cloudMember.id)
                 }
             }
             // Self entry: prefer the live `currentUser` if it's newer than
