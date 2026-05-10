@@ -15,6 +15,11 @@ struct GroupInApp: App {
     /// at launch from inside the CloudKit framework.
     private static let useCloudKit = true
 
+    /// Owns UIApplicationDelegate methods we need for CloudKit silent
+    /// pushes (CKQuerySubscription delivers via APNs). Without this,
+    /// AppState falls back to its 10-second polling refresh.
+    @UIApplicationDelegateAdaptor private var appDelegate: AppDelegate
+
     @State private var appState: AppState = {
         if Self.useCloudKit {
             return AppState(groupService: CloudKitService())

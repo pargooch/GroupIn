@@ -91,13 +91,15 @@ extension User {
 
         let avatarData = record["avatarData"] as? Data
         let heading = record["heading"] as? Double
+        let nearbyToken = record["nearbyToken"] as? Data
 
         self.init(id: id,
                   displayName: displayName,
                   avatarData: avatarData,
                   lastSeen: lastSeen,
                   coordinate: coordinate,
-                  heading: heading)
+                  heading: heading,
+                  nearbyToken: nearbyToken)
     }
 
     /// Mutates the record's fields. Caller is responsible for `database.save`.
@@ -117,5 +119,6 @@ extension User {
             record["longitude"] = nil
         }
         record["heading"] = heading
+        record["nearbyToken"] = nearbyToken
     }
 }

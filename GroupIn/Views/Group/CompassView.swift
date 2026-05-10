@@ -55,6 +55,16 @@ struct CompassView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .onAppear {
+            // Kicks off NI session, publishes our token, attempts to
+            // open a peer session if the target's token is known.
+            // Bidirectional UWB only activates if the peer ALSO opens
+            // their compass against us — graceful degradation otherwise.
+            appState.startUWBTracking(targetMemberID: memberID)
+        }
+        .onDisappear {
+            appState.stopUWBTracking()
+        }
     }
 
     // MARK: - Subviews
@@ -92,6 +102,13 @@ struct CompassView: View {
     private func arrowDisplay(reading: ArrowReading,
                               color: Color,
                               member: User?) -> some View {
+        // In gradient mode the arrow opacity reflects confidence so the
+        // user gets a visual cue when we're still locking on. GPS mode
+        // is always full opacity.
+        let arrowOpacity: Double = reading.mode == .gps
+            ? 1.0
+            : (0.35 + 0.65 * reading.confidence)
+
         VStack(spacing: 24) {
             ZStack {
                 Circle()
@@ -113,19 +130,50 @@ struct CompassView: View {
                     .shadow(color: color.opacity(0.6), radius: 24, x: 0, y: 0)
                     .rotationEffect(.degrees(reading.phoneFrameBearing))
                     .animation(.smooth(duration: 0.4), value: reading.phoneFrameBearing)
+                    .opacity(arrowOpacity)
             }
 
-            VStack(spacing: 6) {
+            VStack(spacing: 8) {
                 Text(reading.distanceBand)
                     .font(.title.weight(.semibold))
                     .foregroundStyle(.white)
-                if let member, !reading.isFresh {
+
+                modeBadge(reading: reading, color: color)
+
+                if let member, !reading.isFresh, reading.mode == .gps {
                     Text("Last seen \(member.lastSeen.formatted(.relative(presentation: .named)))")
+                        .font(.callout)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                if reading.mode == .bluetooth, reading.confidence < 0.4 {
+                    Text("Walk a few steps to lock on")
                         .font(.callout)
                         .foregroundStyle(.white.opacity(0.6))
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func modeBadge(reading: ArrowReading, color: Color) -> some View {
+        let (icon, label): (String, String) = {
+            switch reading.mode {
+            case .uwb:       return ("dot.radiowaves.up.forward", "via UWB")
+            case .gps:       return ("location.fill", "via GPS")
+            case .bluetooth: return ("antenna.radiowaves.left.and.right", "via Bluetooth")
+            }
+        }()
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.caption2.weight(.semibold))
+            Text(label)
+                .font(.caption.weight(.medium))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(color.opacity(0.4), lineWidth: 1))
+        .foregroundStyle(.white)
     }
 
     @ViewBuilder
@@ -148,10 +196,18 @@ struct CompassView: View {
 
     // MARK: - Math
 
+    private enum CompassMode {
+        case uwb         // NearbyInteraction — centimeter-accurate bearing + distance
+        case gps         // both phones have a fresh GPS fix; bearing from haversine
+        case bluetooth   // RSSI gradient over our walking path; offline-capable
+    }
+
     private struct ArrowReading {
         let phoneFrameBearing: Double  // degrees clockwise; 0 = up on screen
         let distanceBand: String
         let isFresh: Bool
+        let mode: CompassMode
+        let confidence: Double         // 0–1; full opacity for GPS, R² for gradient
     }
 
     private var currentMember: User? {
@@ -159,36 +215,104 @@ struct CompassView: View {
     }
 
     private func arrowReading() -> ArrowReading? {
-        guard
-            let myCoord = appState.currentUser.coordinate,
-            let theirCoord = currentMember?.coordinate
-        else { return nil }
-
-        let myCL = CLLocationCoordinate2D(
-            latitude: myCoord.latitude, longitude: myCoord.longitude
-        )
-        let theirCL = CLLocationCoordinate2D(
-            latitude: theirCoord.latitude, longitude: theirCoord.longitude
-        )
-
-        let worldBearing = CompassMath.bearing(from: myCL, to: theirCL)
         let myHeading = appState.currentUser.heading ?? 0
-        // Convert world-frame bearing into phone-frame: subtract the
-        // direction the phone is facing. 0° in phone-frame = "in front."
-        let phoneFrame = (worldBearing - myHeading).truncatingRemainder(dividingBy: 360)
+        let now = Date()
 
-        let metres = CompassMath.distance(from: myCL, to: theirCL)
+        // Mode 0: UWB precision finding — centimeter accuracy and a
+        // direction vector that's already in device-frame, so we don't
+        // even need to subtract the phone's heading. Highest priority.
+        if let uwb = appState.uwbReadings[memberID],
+           let direction = uwb.direction,
+           now.timeIntervalSince(uwb.timestamp) < 5 {
+            let bearingRad = atan2(Double(direction.x), Double(-direction.z))
+            let bearingDeg = bearingRad * 180 / .pi
+            return ArrowReading(
+                phoneFrameBearing: bearingDeg,
+                distanceBand: Self.uwbDistanceBand(metres: uwb.distance),
+                isFresh: true,
+                mode: .uwb,
+                confidence: 1.0
+            )
+        }
 
-        // Member is "fresh" if their lastSeen is within the live window.
-        let fresh = currentMember.map {
-            Date().timeIntervalSince($0.lastSeen) < 60
-        } ?? false
+        // Pre-compute a candidate GPS reading if both sides are fresh.
+        var gpsCandidate: (worldBearing: Double, metres: Double)?
+        if let myCoord = appState.currentUser.coordinate,
+           let theirCoord = currentMember?.coordinate,
+           let lastSeen = currentMember?.lastSeen,
+           now.timeIntervalSince(lastSeen) < 60 {
+            let myCL = CLLocationCoordinate2D(
+                latitude: myCoord.latitude, longitude: myCoord.longitude
+            )
+            let theirCL = CLLocationCoordinate2D(
+                latitude: theirCoord.latitude, longitude: theirCoord.longitude
+            )
+            gpsCandidate = (
+                CompassMath.bearing(from: myCL, to: theirCL),
+                CompassMath.distance(from: myCL, to: theirCL)
+            )
+        }
 
-        return ArrowReading(
-            phoneFrameBearing: phoneFrame,
-            distanceBand: CompassMath.distanceBand(metres: metres),
-            isFresh: fresh
-        )
+        // At close range (<30m), GPS noise (~5m) translates to large
+        // bearing error. If we have a confident RSSI gradient, prefer
+        // that — proximity-based signal beats GPS at short range.
+        if let gps = gpsCandidate, gps.metres < 30,
+           let gradient = appState.compassEngine.gradientBearing(toMember: memberID),
+           gradient.confidence > 0.3 {
+            let phoneFrame = (gradient.bearing - myHeading)
+                .truncatingRemainder(dividingBy: 360)
+            let band = appState.compassEngine.latestRSSI(for: memberID)
+                .map(CompassEngine.distanceBand(rssi:))
+                ?? CompassMath.distanceBand(metres: gps.metres)
+            return ArrowReading(
+                phoneFrameBearing: phoneFrame,
+                distanceBand: band,
+                isFresh: true,
+                mode: .bluetooth,
+                confidence: gradient.confidence
+            )
+        }
+
+        // Mode 1: position-based GPS bearing. Reliable from ~30m and up.
+        if let gps = gpsCandidate {
+            let phoneFrame = (gps.worldBearing - myHeading)
+                .truncatingRemainder(dividingBy: 360)
+            return ArrowReading(
+                phoneFrameBearing: phoneFrame,
+                distanceBand: CompassMath.distanceBand(metres: gps.metres),
+                isFresh: true,
+                mode: .gps,
+                confidence: 1.0
+            )
+        }
+
+        // Mode 2: gradient-only fallback when GPS isn't available at all.
+        if let gradient = appState.compassEngine.gradientBearing(toMember: memberID) {
+            let phoneFrame = (gradient.bearing - myHeading)
+                .truncatingRemainder(dividingBy: 360)
+            let band = appState.compassEngine.latestRSSI(for: memberID)
+                .map(CompassEngine.distanceBand(rssi:))
+                ?? "Nearby"
+            return ArrowReading(
+                phoneFrameBearing: phoneFrame,
+                distanceBand: band,
+                isFresh: false,
+                mode: .bluetooth,
+                confidence: gradient.confidence
+            )
+        }
+
+        return nil
+    }
+
+    private static func uwbDistanceBand(metres: Float?) -> String {
+        guard let m = metres else { return "Nearby" }
+        switch m {
+        case ..<1.0:   return "Right here"
+        case ..<5.0:   return "Close"
+        case ..<15.0:  return "Nearby"
+        default:       return "Further off"
+        }
     }
 }
 

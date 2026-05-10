@@ -50,3 +50,14 @@ struct PeerPresence: Codable, Equatable {
         return hash
     }
 }
+
+extension UUID {
+    /// First 16 bits of the UUID's raw bytes. Used as the iBeacon
+    /// `minor` to identify a member at the radio layer (16-bit space
+    /// is enough for groups under ~1000 members; collisions extremely
+    /// rare at festival group sizes).
+    var truncated16: UInt16 {
+        let raw = uuid
+        return (UInt16(raw.0) << 8) | UInt16(raw.1)
+    }
+}

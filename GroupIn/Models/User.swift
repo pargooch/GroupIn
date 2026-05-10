@@ -19,22 +19,29 @@ struct User: Identifiable, Hashable, Codable {
     /// Compass heading in degrees clockwise from true north (0 = north,
     /// 90 = east). Nil when the device hasn't produced a valid reading.
     var heading: Double?
+    /// NSKeyedArchiver-encoded `NIDiscoveryToken` for UWB precision
+    /// finding. Refreshed each time the local user opens the compass
+    /// view targeting another peer; nil for devices without UWB
+    /// hardware or before a session has started.
+    var nearbyToken: Data?
 
     init(id: UUID = UUID(),
          displayName: String,
          avatarData: Data? = nil,
          lastSeen: Date = .now,
          coordinate: Coordinate? = nil,
-         heading: Double? = nil) {
+         heading: Double? = nil,
+         nearbyToken: Data? = nil) {
         self.id = id
         self.displayName = displayName
         self.avatarData = avatarData
         self.lastSeen = lastSeen
         self.coordinate = coordinate
         self.heading = heading
+        self.nearbyToken = nearbyToken
     }
 
-    /// Old persisted Users (without heading) decode as nil heading.
+    /// Old persisted Users (without heading / nearbyToken) decode as nil.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decode(UUID.self, forKey: .id)
@@ -43,6 +50,7 @@ struct User: Identifiable, Hashable, Codable {
         self.lastSeen = try c.decode(Date.self, forKey: .lastSeen)
         self.coordinate = try? c.decode(Coordinate.self, forKey: .coordinate)
         self.heading = try? c.decode(Double.self, forKey: .heading)
+        self.nearbyToken = try? c.decode(Data.self, forKey: .nearbyToken)
     }
 }
 

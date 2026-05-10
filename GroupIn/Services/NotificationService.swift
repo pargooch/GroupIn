@@ -30,7 +30,9 @@ protocol NotificationServicing: AnyObject {
     /// Fires a tickle notification on iBeacon region entry. iOS gives us
     /// only ~10 seconds when launched in the background, so we keep the
     /// payload trivial and let the user tap into the app for details.
-    func firePeerNearbyNotification(for groupID: UUID) async
+    /// `peerName` lets us swap the generic body for a per-peer one when
+    /// region ranging identified who triggered the entry.
+    func firePeerNearbyNotification(for groupID: UUID, peerName: String?) async
 }
 
 @MainActor
@@ -38,6 +40,12 @@ final class NotificationService: NSObject, NotificationServicing, UNUserNotifica
     let notificationTaps: AsyncStream<NotificationTap>
     private nonisolated let tapContinuation: AsyncStream<NotificationTap>.Continuation
     private let center = UNUserNotificationCenter.current()
+
+    /// Per-group last-fired timestamp for the "peer nearby" notification.
+    /// Drives the time-window dedup so a friend bouncing in/out of BLE
+    /// range doesn't generate a notification storm.
+    private var lastPeerNearbyNotifyAt: [UUID: Date] = [:]
+    private static let peerNearbyDedupWindow: TimeInterval = 300  // 5 min
 
     override init() {
         let (stream, cont) = AsyncStream.makeStream(of: NotificationTap.self)
@@ -86,7 +94,18 @@ final class NotificationService: NSObject, NotificationServicing, UNUserNotifica
         center.removeDeliveredNotifications(withIdentifiers: ids)
     }
 
-    func firePeerNearbyNotification(for groupID: UUID) async {
+    func firePeerNearbyNotification(for groupID: UUID, peerName: String?) async {
+        // Time-window dedup: if we've already nudged the user about this
+        // group within the suppression window, skip. Prevents floods when
+        // someone repeatedly enters/exits BLE range while you're walking
+        // past each other in a crowd.
+        let now = Date()
+        if let last = lastPeerNearbyNotifyAt[groupID],
+           now.timeIntervalSince(last) < Self.peerNearbyDedupWindow {
+            return
+        }
+        lastPeerNearbyNotifyAt[groupID] = now
+
         let id = Self.peerNearbyID(for: groupID)
         // Coalesce repeated entries: clear any pending/delivered first so
         // we don't pile up identical notifications.
@@ -94,8 +113,13 @@ final class NotificationService: NSObject, NotificationServicing, UNUserNotifica
         center.removeDeliveredNotifications(withIdentifiers: [id])
 
         let content = UNMutableNotificationContent()
-        content.title = "Someone from your group is nearby"
-        content.body = "Open GroupIn to find them."
+        if let peerName, !peerName.isEmpty {
+            content.title = "\(peerName) is nearby"
+            content.body = "Open GroupIn to find them."
+        } else {
+            content.title = "Someone from your group is nearby"
+            content.body = "Open GroupIn to find them."
+        }
         content.userInfo = [
             "groupID": groupID.uuidString,
             "type": AppNotificationType.peerNearby.rawValue

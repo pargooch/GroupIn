@@ -82,12 +82,20 @@ final class AppState {
             // iBeacon region monitoring follows the same lifecycle so we
             // can wake on peer proximity even when the app is closed.
             switch (oldValue, currentGroup) {
-            case (nil, .some):
+            case (nil, .some(let group)):
                 startLocationTracking()
                 startBeaconMonitoring()
-            case (.some, nil):
+                startPresenceHeartbeat()
+                Task { [groupService = self.groupService, groupID = group.id] in
+                    try? await groupService.subscribeToPresenceUpdates(groupID: groupID)
+                }
+            case (.some(let oldGroup), nil):
                 stopLocationTracking()
                 stopBeaconMonitoring()
+                stopPresenceHeartbeat()
+                Task { [groupService = self.groupService, groupID = oldGroup.id] in
+                    try? await groupService.unsubscribeFromPresenceUpdates(groupID: groupID)
+                }
             default:
                 break
             }
@@ -103,6 +111,11 @@ final class AppState {
 
     var locationAuthorizationStatus: CLAuthorizationStatus = .notDetermined
 
+    /// Latest known iCloud account state from the active backend.
+    /// `.couldNotDetermine` is the conservative starting value; we
+    /// refresh at launch and on every CKAccountChanged broadcast.
+    var iCloudAccountStatus: ICloudAccountStatus = .couldNotDetermine
+
     /// True when the device has internet (any path satisfied).
     /// Driven by NWPathMonitor.
     var isOnline: Bool = true
@@ -117,6 +130,8 @@ final class AppState {
     let notificationService: NotificationServicing
     let blePresenceService: BLEPresenceServicing
     let beaconMonitor: BeaconMonitorService
+    let motionService: MotionActivityServicing
+    let uwbSessionService: UWBSessionServicing
 
     private let defaults: UserDefaults
     private var networkMonitor: NetworkMonitor?
@@ -128,9 +143,46 @@ final class AppState {
     private var lastLocationPublishAt: Date?
     private static let publishInterval: TimeInterval = 10
     private var bleConsumerTask: Task<Void, Never>?
+    private var bleRSSITask: Task<Void, Never>?
     private var headingTask: Task<Void, Never>?
+    private var motionTask: Task<Void, Never>?
+    private var pushTask: Task<Void, Never>?
     private var headingBuffer: [Double] = []
     private static let headingSmoothingWindow = 5
+
+    /// Compass gradient state. Public so view models can query bearings;
+    /// AppState owns the writes.
+    private(set) var compassEngine = CompassEngine()
+
+    /// Most recent UWB reading per peer. The compass view reads this to
+    /// override its GPS/RSSI bearing when a fresh reading is present.
+    private(set) var uwbReadings: [UUID: UWBReading] = [:]
+    private var uwbReadingsTask: Task<Void, Never>?
+
+    /// Rolling buffer of chat messages received over BLE for the active
+    /// group, plus our own outgoing ones. Capped at 100 to avoid growth.
+    /// Newest at the end, so chat list rendering reads naturally
+    /// top-to-bottom = oldest-to-newest.
+    private(set) var chatMessages: [ChatMessage] = []
+    private var chatTask: Task<Void, Never>?
+    private static let chatBufferLimit = 100
+
+    /// Live BLE diagnostics — surfaced in the chat sheet so the user
+    /// can see whether anyone's actually subscribed to receive their
+    /// messages. Populated from the BLE service's diagnostics stream.
+    private(set) var bleDiagnostics: BLEDiagnostics = BLEDiagnostics(
+        chatSubscribers: 0,
+        presenceSubscribers: 0,
+        serviceAddFailed: false,
+        bluetoothReady: true
+    )
+    private var bleDiagnosticsTask: Task<Void, Never>?
+    private var iCloudAccountChangeTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+    private static let heartbeatInterval: TimeInterval = 20
+    /// Threshold under which the heartbeat skips work — if a real GPS
+    /// fix updated `lastSeen` recently, no need to pile on extra writes.
+    private static let heartbeatStaleAfter: TimeInterval = 15
 
     private static let localProfileKey = "GroupIn.AppState.localProfile"
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
@@ -144,6 +196,8 @@ final class AppState {
          locationService: LocationServicing? = nil,
          notificationService: NotificationServicing? = nil,
          blePresenceService: BLEPresenceServicing? = nil,
+         motionService: MotionActivityServicing? = nil,
+         uwbSessionService: UWBSessionServicing? = nil,
          defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let resolvedProfile = localProfile ?? Self.loadLocalProfile(defaults: defaults)
@@ -161,6 +215,8 @@ final class AppState {
         self.notificationService = notificationService ?? NotificationService()
         self.blePresenceService = blePresenceService ?? BLEAdvertisementService()
         self.beaconMonitor = BeaconMonitorService()
+        self.motionService = motionService ?? MotionActivityService()
+        self.uwbSessionService = uwbSessionService ?? UWBSessionService()
 
         self.membershipByGroupID = Self.loadMembershipMap(defaults: defaults)
 
@@ -186,14 +242,28 @@ final class AppState {
         startNotificationTapMonitor()
         startNetworkMonitor()
         configureBeaconMonitor()
+        startPushHandler()
+        startICloudAccountMonitor()
+        startBLEDiagnosticsMonitor()
 
         // didSet doesn't fire during init, so if we restored a group from
         // persistence, kick off location explicitly. The user comes back
         // to a phone that's been locked all night and sharing is already
         // alive when they unlock — same as Find My.
-        if currentGroup != nil {
+        if let group = currentGroup {
             startLocationTracking()
             startBeaconMonitoring()
+            startPresenceHeartbeat()
+            // Re-confirm the CloudKit subscription on every launch — the
+            // CKDatabase persists subscriptions server-side, so this is
+            // a no-op if it's already there. Cheap insurance.
+            //
+            // Using `self.groupService` explicitly because the init
+            // parameter named `groupService` is the optional-arg form
+            // and would shadow the property otherwise.
+            Task { [groupService = self.groupService, groupID = group.id] in
+                try? await groupService.subscribeToPresenceUpdates(groupID: groupID)
+            }
         }
     }
 
@@ -202,13 +272,39 @@ final class AppState {
     /// the app from a force-quit state because a group peer's iBeacon
     /// came into range.
     private func configureBeaconMonitor() {
-        beaconMonitor.onEnter = { [weak self] in
+        beaconMonitor.onEnter = { [weak self] beacons in
             guard let self else { return }
             // Use whichever group context we have. If currentGroup is
             // nil (race during launch) prefer the most recently used.
             guard let group = self.currentGroup ?? self.myGroups.first else { return }
-            Task { [notificationService = self.notificationService, groupID = group.id] in
-                await notificationService.firePeerNearbyNotification(for: groupID)
+            let expectedMajor = BLEAdvertisementService.collapseGroupHash(
+                PeerPresence.groupHash(forInviteCode: group.inviteCode)
+            )
+            // Find the strongest in-range beacon whose major matches the
+            // group and whose minor matches a known member. Multiple peers
+            // can be in range — closest RSSI wins so the notification
+            // names whoever's actually arrived.
+            let candidates = beacons.filter { beacon in
+                beacon.major.uint16Value == expectedMajor
+                    && beacon.proximity != .unknown
+            }
+            let nearest = candidates.min(by: { lhs, rhs in
+                // RSSI is negative; closer is higher. accuracy is metres
+                // (lower = closer), more stable than raw RSSI.
+                lhs.accuracy < rhs.accuracy && lhs.accuracy > 0
+            })
+            let peerName: String? = nearest.flatMap { beacon in
+                let minor = UInt16(truncatingIfNeeded: beacon.minor.intValue)
+                return group.members
+                    .first(where: { $0.id != self.currentUser.id
+                                    && $0.id.truncated16 == minor })?
+                    .displayName
+            }
+            Task { [notificationService = self.notificationService,
+                    groupID = group.id, peerName] in
+                await notificationService.firePeerNearbyNotification(
+                    for: groupID, peerName: peerName
+                )
             }
         }
     }
@@ -219,6 +315,175 @@ final class AppState {
 
     private func stopBeaconMonitoring() {
         beaconMonitor.stop()
+    }
+
+    // MARK: - Presence heartbeat
+    //
+    // Without this, peers see us "go offline" after ~30 s of being still.
+    // The reason: the green/orange/red status badge each peer renders for
+    // us is driven by our `lastSeen`, which only advances when
+    // CLLocationManager fires a fresh fix. Stationary or backgrounded
+    // devices stop producing fixes, so `lastSeen` ages even though we're
+    // very much still in the group. This task republishes presence at a
+    // steady cadence so the cloud + nearby BLE peers always have a fresh
+    // timestamp from us.
+
+    private func startPresenceHeartbeat() {
+        guard heartbeatTask == nil else { return }
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.heartbeatInterval))
+                guard let self else { return }
+                self.tickHeartbeat()
+            }
+        }
+    }
+
+    private func stopPresenceHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+    }
+
+    private func tickHeartbeat() {
+        guard var group = currentGroup,
+              let idx = group.members.firstIndex(where: { $0.id == currentUser.id }) else {
+            return
+        }
+        // Skip if a real location fix already kept us fresh — keeps the
+        // CloudKit write rate from doubling when we're moving.
+        let now = Date()
+        guard now.timeIntervalSince(currentUser.lastSeen) > Self.heartbeatStaleAfter else {
+            return
+        }
+
+        var me = currentUser
+        me.lastSeen = now
+        currentUser = me
+        group.members[idx] = me
+        currentGroup = group
+        addOrUpdate(group: group)
+
+        // Push directly — bypass `publishLocationIfNeeded`'s 10 s throttle
+        // since the heartbeat is itself the cadence we want.
+        lastLocationPublishAt = now
+        let snapshot = me
+        let groupSnapshot = group
+        Task { [groupService = self.groupService, snapshot, groupSnapshot] in
+            try? await groupService.publish(user: snapshot, in: groupSnapshot)
+        }
+        broadcastBLEPresence()
+    }
+
+    // MARK: - UWB precision finding
+
+    /// Called by CompassView when the user taps Find on a member.
+    /// Starts the local NISession (so we have a token to publish), opens
+    /// a peer session against the target's stored token, publishes our
+    /// fresh token to CloudKit so the target's app can reciprocate.
+    func startUWBTracking(targetMemberID: UUID) {
+        guard uwbSessionService.isSupported else { return }
+        uwbSessionService.start()
+
+        // Start consuming readings; idempotent.
+        if uwbReadingsTask == nil {
+            uwbReadingsTask = Task { [weak self] in
+                guard let self else { return }
+                for await reading in self.uwbSessionService.readings {
+                    self.uwbReadings[reading.memberID] = reading
+                }
+            }
+        }
+
+        // Publish the fresh token so the peer can fetch it on their next
+        // refresh / push and start a session targeting us.
+        if let tokenData = uwbSessionService.localTokenData {
+            currentUser.nearbyToken = tokenData
+            if var group = currentGroup,
+               let idx = group.members.firstIndex(where: { $0.id == currentUser.id }) {
+                group.members[idx].nearbyToken = tokenData
+                currentGroup = group
+                addOrUpdate(group: group)
+                let me = currentUser
+                Task { [groupService = self.groupService, me, group] in
+                    try? await groupService.publish(user: me, in: group)
+                }
+            }
+        }
+
+        // If we already have the target's token cached, start the
+        // peer session immediately. Otherwise the next CloudKit refresh
+        // will surface it and we'll wire it up at that point.
+        if let group = currentGroup,
+           let target = group.members.first(where: { $0.id == targetMemberID }),
+           let theirToken = target.nearbyToken {
+            uwbSessionService.track(memberID: targetMemberID, tokenData: theirToken)
+        }
+    }
+
+    /// Called when the compass view dismisses. Tears down UWB sessions
+    /// and clears local readings so a re-open starts fresh.
+    func stopUWBTracking() {
+        uwbSessionService.stop()
+        uwbReadingsTask?.cancel()
+        uwbReadingsTask = nil
+        uwbReadings.removeAll()
+        // Clear our published token. Peers fetching after this point
+        // get a stale-token failure rather than a phantom session.
+        currentUser.nearbyToken = nil
+        if var group = currentGroup,
+           let idx = group.members.firstIndex(where: { $0.id == currentUser.id }) {
+            group.members[idx].nearbyToken = nil
+            currentGroup = group
+            addOrUpdate(group: group)
+            let me = currentUser
+            Task { [groupService = self.groupService, me, group] in
+                try? await groupService.publish(user: me, in: group)
+            }
+        }
+    }
+
+    // MARK: - CloudKit subscriptions
+
+    /// CloudKit delivers `CKQuerySubscription` updates as silent APNs
+    /// pushes. AppDelegate yields each one to a static AsyncStream and
+    /// we consume it here, refreshing the active group so the existing
+    /// newest-wins merge surfaces the new data.
+    private func startPushHandler() {
+        guard pushTask == nil else { return }
+        pushTask = Task { [weak self] in
+            for await _ in AppDelegate.pushStream {
+                guard let self else { return }
+                await self.refreshCurrentGroup()
+            }
+        }
+    }
+
+    /// Refresh the iCloud account status now and again every time the
+    /// system fires `CKAccountChanged` (e.g. user signs in/out from
+    /// Settings while we're running). Surfaced via `iCloudAccountStatus`
+    /// for the Home banner.
+    private func startICloudAccountMonitor() {
+        // Initial fetch so the banner reflects reality before the user
+        // even taps anything.
+        Task { [weak self] in
+            guard let self else { return }
+            let status = await self.groupService.iCloudAccountStatus()
+            self.iCloudAccountStatus = status
+        }
+        guard iCloudAccountChangeTask == nil else { return }
+        iCloudAccountChangeTask = Task { [weak self] in
+            // Use the raw name string to avoid importing CloudKit just
+            // for the notification constant. CloudKit posts this whenever
+            // the signed-in iCloud account changes (sign-in, sign-out,
+            // account-switch in Settings).
+            let name = Notification.Name("CKAccountChanged")
+            let notifications = NotificationCenter.default.notifications(named: name)
+            for await _ in notifications {
+                guard let self else { return }
+                let status = await self.groupService.iCloudAccountStatus()
+                self.iCloudAccountStatus = status
+            }
+        }
     }
 
     private func startNetworkMonitor() {
@@ -323,6 +588,8 @@ final class AppState {
     }
 
     func remove(group: GroupSession) {
+        let isOwner = group.ownerID == currentUser.id
+
         myGroups.removeAll { $0.id == group.id }
         membershipByGroupID.removeValue(forKey: group.id)
         if currentGroup?.id == group.id {
@@ -330,6 +597,16 @@ final class AppState {
         }
         Task { [notificationService, groupID = group.id] in
             await notificationService.cancelAll(for: groupID)
+        }
+
+        // Owner-initiated cloud delete. Non-owners can't authoritatively
+        // delete the group server-side; they just leave their member
+        // record behind for the natural expiry to clean up. Owners get
+        // the group + member cascade removed from CloudKit.
+        if isOwner {
+            Task { [groupService = self.groupService, groupID = group.id] in
+                try? await groupService.deleteGroup(groupID: groupID)
+            }
         }
     }
 
@@ -357,6 +634,19 @@ final class AppState {
         locationService.requestAuthorization()
         locationService.startUpdating()
 
+        // Adaptive accuracy: when motion classifies us as stationary,
+        // drop GPS budget to save battery; bump back to best when we
+        // start moving again.
+        motionService.start()
+        if motionTask == nil {
+            motionTask = Task { [weak self] in
+                guard let self else { return }
+                for await stationary in self.motionService.stationaryUpdates {
+                    self.locationService.adjustForMotion(stationary: stationary)
+                }
+            }
+        }
+
         if locationTask == nil {
             locationTask = Task { [weak self] in
                 guard let self else { return }
@@ -365,6 +655,13 @@ final class AppState {
                     me.coordinate = coordinate
                     me.lastSeen = .now
                     self.currentUser = me
+
+                    // Feed the gradient engine so the compass can fall
+                    // back to RSSI-based bearing when GPS isn't viable.
+                    self.compassEngine.recordPosition(
+                        latitude: coordinate.latitude,
+                        longitude: coordinate.longitude
+                    )
 
                     if var group = self.currentGroup,
                        let idx = group.members.firstIndex(where: { $0.id == me.id }) {
@@ -432,6 +729,10 @@ final class AppState {
 
     func stopLocationTracking() {
         locationService.stopUpdating()
+        motionService.stop()
+        // Ensure we're in best-accuracy mode for the next session;
+        // otherwise a stale "stationary" decision could carry over.
+        locationService.adjustForMotion(stationary: false)
     }
 
     // MARK: - BLE peer presence
@@ -454,10 +755,74 @@ final class AppState {
                 }
             }
         }
+
+        if bleRSSITask == nil {
+            bleRSSITask = Task { [weak self] in
+                guard let self else { return }
+                for await reading in self.blePresenceService.rssiUpdates {
+                    self.compassEngine.recordRSSI(
+                        reading.rssi,
+                        for: reading.memberID
+                    )
+                }
+            }
+        }
+
+        if chatTask == nil {
+            chatTask = Task { [weak self] in
+                guard let self else { return }
+                for await message in self.blePresenceService.chatMessages {
+                    self.appendChat(message)
+                }
+            }
+        }
+
     }
 
     func stopBLEPresence() {
         blePresenceService.stop()
+    }
+
+    /// Consume the BLE diagnostics stream for the lifetime of the app,
+    /// not just while the dashboard is open. The Home status banner
+    /// relies on the readiness flag, which can flip at any moment when
+    /// the user toggles Bluetooth in Control Center — including before
+    /// they've ever opened a group.
+    private func startBLEDiagnosticsMonitor() {
+        guard bleDiagnosticsTask == nil else { return }
+        bleDiagnosticsTask = Task { [weak self] in
+            guard let self else { return }
+            for await diag in self.blePresenceService.diagnostics {
+                self.bleDiagnostics = diag
+            }
+        }
+    }
+
+    // MARK: - Offline chat
+
+    /// Send a short text message over BLE to nearby group members.
+    /// Local echo is appended to `chatMessages` immediately so the
+    /// sender sees their own message in the thread without round-tripping.
+    func sendChatMessage(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let group = currentGroup else { return }
+        let message = ChatMessage(
+            groupHash: PeerPresence.groupHash(forInviteCode: group.inviteCode),
+            senderID: currentUser.id,
+            text: trimmed
+        )
+        appendChat(message)
+        blePresenceService.send(chatMessage: message)
+    }
+
+    private func appendChat(_ message: ChatMessage) {
+        // Dedup on id in case we somehow see the same packet twice.
+        guard !chatMessages.contains(where: { $0.id == message.id }) else { return }
+        chatMessages.append(message)
+        if chatMessages.count > Self.chatBufferLimit {
+            chatMessages.removeFirst(chatMessages.count - Self.chatBufferLimit)
+        }
     }
 
     private func makeLocalPresence(for group: GroupSession) -> PeerPresence {

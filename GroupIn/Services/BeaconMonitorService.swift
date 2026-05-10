@@ -12,27 +12,45 @@
 //  the always-prompt; without it, region events only fire while the app
 //  is foregrounded and the whole feature collapses.
 //
+//  On entry we briefly range beacons against the same UUID so we can pull
+//  the major (group) and minor (member) values out of the advertisements.
+//  That's how AppState turns "someone from your group is nearby" into
+//  "Kian is nearby."
+//
 
 import Foundation
 import CoreLocation
 
 @MainActor
 final class BeaconMonitorService: NSObject {
-    static let regionIdentifier = "com.NDE.GroupIn.peers"
+    nonisolated static let regionIdentifier = "com.NDE.GroupIn.peers"
 
     private let manager: CLLocationManager
     private let region: CLBeaconRegion
+    private let constraint: CLBeaconIdentityConstraint
+
+    /// Caps the ranging window after region entry. iOS only gives us
+    /// ~10 s of background time on entry, so we sample for a couple of
+    /// seconds and then hand off to the notification path.
+    private static let rangingWindow: TimeInterval = 3
+    private var rangingStopTask: Task<Void, Never>?
+    private var collectedBeacons: [CLBeacon] = []
 
     /// Fires whenever iOS reports we just entered the region. The
     /// callback runs on MainActor; AppState wires it into the
-    /// notification path.
-    var onEnter: (@MainActor () -> Void)?
+    /// notification path. The `[CLBeacon]` payload is the result of a
+    /// short ranging window — empty if the device went out of range
+    /// before we could sample, or if ranging isn't available.
+    var onEnter: (@MainActor ([CLBeacon]) -> Void)?
 
     override init() {
         self.manager = CLLocationManager()
         self.region = CLBeaconRegion(
             uuid: BLEAdvertisementService.iBeaconUUID,
             identifier: Self.regionIdentifier
+        )
+        self.constraint = CLBeaconIdentityConstraint(
+            uuid: BLEAdvertisementService.iBeaconUUID
         )
         self.region.notifyOnEntry = true
         self.region.notifyOnExit = false
@@ -61,6 +79,36 @@ final class BeaconMonitorService: NSObject {
 
     func stop() {
         manager.stopMonitoring(for: region)
+        manager.stopRangingBeacons(satisfying: constraint)
+        rangingStopTask?.cancel()
+        rangingStopTask = nil
+        collectedBeacons.removeAll()
+    }
+
+    private func beginRangingForEntry() {
+        guard CLLocationManager.isRangingAvailable() else {
+            // No ranging — fire the callback immediately with no beacon
+            // info so the user still gets a generic group nudge.
+            onEnter?([])
+            return
+        }
+        collectedBeacons.removeAll()
+        manager.startRangingBeacons(satisfying: constraint)
+
+        rangingStopTask?.cancel()
+        rangingStopTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.rangingWindow))
+            guard let self, !Task.isCancelled else { return }
+            self.finishRanging()
+        }
+    }
+
+    private func finishRanging() {
+        manager.stopRangingBeacons(satisfying: constraint)
+        let beacons = collectedBeacons
+        collectedBeacons.removeAll()
+        rangingStopTask = nil
+        onEnter?(beacons)
     }
 }
 
@@ -70,7 +118,27 @@ extension BeaconMonitorService: CLLocationManagerDelegate {
                                      didEnterRegion region: CLRegion) {
         guard region.identifier == Self.regionIdentifier else { return }
         Task { @MainActor [weak self] in
-            self?.onEnter?()
+            self?.beginRangingForEntry()
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager,
+                                     didRangeBeacons beacons: [CLBeacon],
+                                     in region: CLBeaconRegion) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Keep a rolling sample. CoreLocation streams ranging
+            // callbacks roughly once a second; we union by minor so we
+            // see every distinct member that came into range during the
+            // window (rather than just whoever happened to be in the
+            // last batch).
+            for beacon in beacons {
+                if !self.collectedBeacons.contains(where: {
+                    $0.minor == beacon.minor && $0.major == beacon.major
+                }) {
+                    self.collectedBeacons.append(beacon)
+                }
+            }
         }
     }
 

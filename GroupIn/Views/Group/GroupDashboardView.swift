@@ -15,6 +15,8 @@ struct GroupDashboardView: View {
     @State private var didCopyInviteCode = false
     @State private var showsLocationHelp = false
     @State private var compassMember: User?
+    @State private var showsChat = false
+    @State private var showsInviteQR = false
 
     init(viewModel: GroupDashboardViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -31,6 +33,18 @@ struct GroupDashboardView: View {
             .fullScreenCover(item: $compassMember) { member in
                 CompassView(memberID: member.id)
                     .environment(appState)
+            }
+            .sheet(isPresented: $showsChat) {
+                ChatSheet()
+                    .environment(appState)
+            }
+            .sheet(isPresented: $showsInviteQR) {
+                if let group = viewModel.group {
+                    InviteQRSheet(
+                        groupName: group.name,
+                        inviteCode: group.inviteCode
+                    )
+                }
             }
     }
 
@@ -60,6 +74,7 @@ struct GroupDashboardView: View {
             expirySection(group: group)
             groupSection(group: group)
             membersSection(group: group)
+            messagesSection
             safetySection
         }
     }
@@ -100,23 +115,37 @@ struct GroupDashboardView: View {
 
     @ViewBuilder
     private func inviteCodeButton(code: String) -> some View {
-        Button {
-            copyInviteCode(code)
-        } label: {
-            HStack {
-                Text("Invite Code")
-                    .foregroundStyle(.primary)
-                Spacer()
-                Text(code)
-                    .foregroundStyle(.secondary)
-                Image(systemName: didCopyInviteCode ? "checkmark.circle.fill" : "doc.on.doc")
-                    .foregroundStyle(didCopyInviteCode ? Color.green : Color.accentColor)
-                    .accessibilityHidden(true)
+        HStack(spacing: 12) {
+            Button {
+                copyInviteCode(code)
+            } label: {
+                HStack {
+                    Text("Invite Code")
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Text(code)
+                        .foregroundStyle(.secondary)
+                    Image(systemName: didCopyInviteCode ? "checkmark.circle.fill" : "doc.on.doc")
+                        .foregroundStyle(didCopyInviteCode ? Color.green : Color.accentColor)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .accessibilityLabel("Invite code \(code), tap to copy")
+
+            Button {
+                showsInviteQR = true
+            } label: {
+                Image(systemName: "qrcode")
+                    .font(.title3)
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show invite QR code")
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Invite code \(code), tap to copy")
     }
 
     @ViewBuilder
@@ -339,6 +368,54 @@ struct GroupDashboardView: View {
         @unknown default:
             Text("Unknown location authorization state.")
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Messages (offline BLE chat)
+
+    @ViewBuilder
+    private var messagesSection: some View {
+        Section {
+            Button {
+                showsChat = true
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.accentColor.opacity(0.18))
+                        Image(systemName: "bubble.left.and.bubble.right.fill")
+                            .foregroundStyle(.tint)
+                    }
+                    .frame(width: 36, height: 36)
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Messages")
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(.primary)
+                        Text("Send short notes to nearby members over Bluetooth.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if !appState.chatMessages.isEmpty {
+                        Text("\(appState.chatMessages.count)")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.accentColor.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.tint)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.footnote)
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        } header: {
+            Text("Messages")
         }
     }
 

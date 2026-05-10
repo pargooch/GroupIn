@@ -10,7 +10,27 @@
 
 import Foundation
 
-protocol CloudKitServicing {
+/// Backend-agnostic mirror of `CKAccountStatus` plus the local-dev case
+/// where iCloud isn't applicable at all. Used by AppState to surface a
+/// single banner whether the active backend is CloudKit or the local
+/// dev stub.
+enum ICloudAccountStatus: Sendable, Equatable {
+    /// Signed in and ready to use. Includes the LocalGroupService case
+    /// where iCloud isn't required at all.
+    case available
+    /// User is signed out. Surface a "sign into iCloud in Settings" banner.
+    case noAccount
+    /// MDM / parental restriction.
+    case restricted
+    /// CloudKit hasn't replied yet, or temporarily unreachable.
+    case couldNotDetermine
+    /// iCloud account in a transient bad state (e.g. account just changed
+    /// and CloudKit hasn't finished re-priming).
+    case temporarilyUnavailable
+}
+
+@MainActor
+protocol CloudKitServicing: AnyObject {
     func createGroup(named name: String,
                      category: GroupCategory,
                      ownerID: UUID,
@@ -39,4 +59,27 @@ protocol CloudKitServicing {
     ///   updated group.
     /// - If no extension, hard-deletes the group. Returns `nil`.
     func resolveExpiry(groupID: UUID) async throws -> GroupSession?
+
+    /// Register a server-side subscription that fires a silent push
+    /// whenever any member record in the given group is created or
+    /// updated. Replaces the 10-second polling refresh with near-instant
+    /// notifications.
+    func subscribeToPresenceUpdates(groupID: UUID) async throws
+
+    /// Tear down the subscription created by
+    /// `subscribeToPresenceUpdates(groupID:)`. Call when the user leaves
+    /// the group so we don't accumulate stale subscriptions server-side.
+    func unsubscribeFromPresenceUpdates(groupID: UUID) async throws
+
+    /// Owner-initiated hard delete. Removes the group record + cascading
+    /// member records from the backend. Distinct from `resolveExpiry`,
+    /// which handles natural expiration with potential extensions; this
+    /// is what swipe-remove on the owner's home list calls.
+    func deleteGroup(groupID: UUID) async throws
+
+    /// Quick health check the app does at launch (and again whenever the
+    /// system fires `CKAccountChanged`). Returns the user-visible state
+    /// so AppState can put up a "sign in to iCloud" banner before any
+    /// group action ever fails.
+    func iCloudAccountStatus() async -> ICloudAccountStatus
 }

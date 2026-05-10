@@ -23,12 +23,45 @@ import Foundation
 import CoreBluetooth
 import CoreLocation
 
+/// One RSSI sample for a known peer. Emitted on every BLE scan callback
+/// for peripherals we've already mapped to a member ID via a prior GATT
+/// read. Used by the compass's gradient mode.
+struct RSSIReading: Sendable {
+    let memberID: UUID
+    let rssi: Double
+    let timestamp: Date
+}
+
 @MainActor
 protocol BLEPresenceServicing: AnyObject {
     var peerUpdates: AsyncStream<PeerPresence> { get }
+    var rssiUpdates: AsyncStream<RSSIReading> { get }
+    /// Incoming chat messages from in-range peers. Filtered by group
+    /// hash; only messages matching the active group's hash arrive.
+    var chatMessages: AsyncStream<ChatMessage> { get }
+
+    /// Stream of diagnostics about the peripheral side of the BLE pipe:
+    /// how many remote centrals are connected to us, how many have
+    /// subscribed to chat. Useful for surfacing "no one's listening"
+    /// states in the UI.
+    var diagnostics: AsyncStream<BLEDiagnostics> { get }
+
     func start(groupHash: UInt32, localPresence: PeerPresence)
     func update(localPresence: PeerPresence)
     func stop()
+    /// Push a chat message to all subscribed central peers.
+    func send(chatMessage: ChatMessage)
+}
+
+struct BLEDiagnostics: Sendable, Equatable {
+    var chatSubscribers: Int
+    var presenceSubscribers: Int
+    var serviceAddFailed: Bool
+    /// True when both BLE roles report `.poweredOn`. Optimistic at app
+    /// launch so we don't flash a "Bluetooth is off" banner before iOS
+    /// has reported the real state. Driven down to false the moment
+    /// either manager sees `.poweredOff` / `.unauthorized` / `.unsupported`.
+    var bluetoothReady: Bool = true
 }
 
 @MainActor
@@ -43,6 +76,11 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// Characteristic UUID for the JSON-encoded PeerPresence payload.
     static let presenceCharacteristicUUID = CBUUID(string: "A5B7E1C1-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
 
+    /// Characteristic UUID for the JSON-encoded ChatMessage payload.
+    /// Same notify-on-write pattern as presence, just a different payload
+    /// shape; we share the same GroupIn service.
+    static let chatCharacteristicUUID = CBUUID(string: "A5B7E1C2-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
+
     /// iBeacon UUID for region monitoring. Different from the BLE service
     /// UUID because iBeacon advertisements use a manufacturer-data format
     /// while BLE service advertisements use the service-UUID list — iOS
@@ -53,7 +91,20 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     // MARK: - Streams
 
     let peerUpdates: AsyncStream<PeerPresence>
+    let rssiUpdates: AsyncStream<RSSIReading>
+    let chatMessages: AsyncStream<ChatMessage>
+    let diagnostics: AsyncStream<BLEDiagnostics>
     private nonisolated let peerContinuation: AsyncStream<PeerPresence>.Continuation
+    private nonisolated let rssiContinuation: AsyncStream<RSSIReading>.Continuation
+    private nonisolated let chatContinuation: AsyncStream<ChatMessage>.Continuation
+    private nonisolated let diagnosticsContinuation: AsyncStream<BLEDiagnostics>.Continuation
+
+    private var currentDiagnostics = BLEDiagnostics(
+        chatSubscribers: 0,
+        presenceSubscribers: 0,
+        serviceAddFailed: false,
+        bluetoothReady: true
+    )
 
     // MARK: - Stack
 
@@ -61,10 +112,20 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private var peripheralManager: CBPeripheralManager!
 
     private var presenceCharacteristic: CBMutableCharacteristic?
+    private var chatCharacteristic: CBMutableCharacteristic?
     private var advertisedService: CBMutableService?
     private var serviceAdded: Bool = false
+    private var lastChatData: Data?
+
+    /// Outbox for chat updates that hit a full BLE transmission queue.
+    /// `peripheralManager.updateValue` returns false when iOS can't
+    /// accept right now; we retry from `peripheralManagerIsReady(...)`.
+    /// Without this, fast-typed messages or congested channels silently
+    /// drop messages.
+    private var pendingChatUpdates: [Data] = []
 
     private var activeGroupHash: UInt32?
+    private var localMemberID: UUID?
     private var lastPresenceData: Data?
 
     /// Toggles the peripheral's advertised packet between Phase-1 GATT
@@ -80,22 +141,57 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// Strong reference holds them so iOS doesn't drop the link.
     private var connectedPeers: [UUID: CBPeripheral] = [:]
 
+    /// Maps CB peripheral identifier → group member UUID. Populated once
+    /// we've successfully read a peer's presence characteristic, which
+    /// tells us who they are. Lets us tag subsequent RSSI scan callbacks.
+    private var peripheralToMember: [UUID: UUID] = [:]
+
     // MARK: - Init
 
     override init() {
-        let (stream, continuation) = AsyncStream.makeStream(of: PeerPresence.self)
-        self.peerUpdates = stream
-        self.peerContinuation = continuation
+        let (peerStream, peerCont) = AsyncStream.makeStream(of: PeerPresence.self)
+        let (rssiStream, rssiCont) = AsyncStream.makeStream(of: RSSIReading.self)
+        let (chatStream, chatCont) = AsyncStream.makeStream(of: ChatMessage.self)
+        let (diagStream, diagCont) = AsyncStream.makeStream(of: BLEDiagnostics.self)
+        self.peerUpdates = peerStream
+        self.rssiUpdates = rssiStream
+        self.chatMessages = chatStream
+        self.diagnostics = diagStream
+        self.peerContinuation = peerCont
+        self.rssiContinuation = rssiCont
+        self.chatContinuation = chatCont
+        self.diagnosticsContinuation = diagCont
         super.init()
         self.centralManager = CBCentralManager(delegate: self, queue: nil)
         self.peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
+    }
+
+    /// Push a fresh snapshot of the diagnostics stream.
+    private func emitDiagnostics() {
+        diagnosticsContinuation.yield(currentDiagnostics)
     }
 
     // MARK: - Lifecycle
 
     func start(groupHash: UInt32, localPresence: PeerPresence) {
         activeGroupHash = groupHash
+        localMemberID = localPresence.memberID
         update(localPresence: localPresence)
+        // Force a fresh service registration on every start. Removing
+        // and re-adding the GATT service makes iOS send a Service
+        // Changed indication to any centrals that have us cached from
+        // a prior build (e.g., before the chat characteristic existed).
+        // Without this, the central's GATT cache holds the old service
+        // definition through Bluetooth toggles, app reinstalls, even
+        // reboots in some cases.
+        if let svc = advertisedService,
+           peripheralManager.state == .poweredOn {
+            peripheralManager.remove(svc)
+        }
+        serviceAdded = false
+        advertisedService = nil
+        presenceCharacteristic = nil
+        chatCharacteristic = nil
         beginScanIfReady()
         beginAdvertisingIfReady()
     }
@@ -128,7 +224,33 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         }
         connectedPeers.removeAll()
         connectingPeers.removeAll()
+        peripheralToMember.removeAll()
+        pendingChatUpdates.removeAll()
+        lastChatData = nil
         activeGroupHash = nil
+        localMemberID = nil
+        currentDiagnostics = BLEDiagnostics(
+            chatSubscribers: 0,
+            presenceSubscribers: 0,
+            serviceAddFailed: false,
+            bluetoothReady: bluetoothBothPoweredOn()
+        )
+        emitDiagnostics()
+    }
+
+    /// Combined power-state check across both BLE roles. We need both
+    /// peripheral and central up to be fully functional, so the banner
+    /// reflects the AND of the two states.
+    private func bluetoothBothPoweredOn() -> Bool {
+        centralManager.state == .poweredOn
+            && peripheralManager.state == .poweredOn
+    }
+
+    private func updateBluetoothReadiness() {
+        let ready = bluetoothBothPoweredOn()
+        guard currentDiagnostics.bluetoothReady != ready else { return }
+        currentDiagnostics.bluetoothReady = ready
+        emitDiagnostics()
     }
 
     // MARK: - Internal
@@ -185,11 +307,21 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
 
     private func advertiseAsBeacon() {
         guard let groupHash = activeGroupHash else { return }
-        // Pack the group hash into the iBeacon major+minor so other
-        // GroupIn devices in the same group can theoretically tell each
-        // other apart at the iBeacon layer if we want richer dedup later.
-        let major = CLBeaconMajorValue((groupHash >> 16) & 0xFFFF)
-        let minor = CLBeaconMinorValue(groupHash & 0xFFFF)
+        // Major identifies the group (collapsed 32→16 bits). Minor
+        // identifies *which member* is broadcasting, so the receiver can
+        // surface "Kian is nearby" instead of a generic group nudge.
+        // 16-bit minor space → ~65k IDs per group; collisions are
+        // negligible at festival-group sizes.
+        let major = CLBeaconMajorValue(Self.collapseGroupHash(groupHash))
+        let minor: CLBeaconMinorValue
+        if let id = localMemberID {
+            minor = CLBeaconMinorValue(id.truncated16)
+        } else {
+            // Fallback before we know our own member ID — fall back to
+            // the lower 16 bits of the group hash so the region still
+            // matches and other peers can detect us.
+            minor = CLBeaconMinorValue(groupHash & 0xFFFF)
+        }
         let region = CLBeaconRegion(
             uuid: Self.iBeaconUUID,
             major: major,
@@ -202,19 +334,60 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         }
     }
 
+    /// Collapse a 32-bit FNV hash into the 16-bit iBeacon major space.
+    /// XOR-fold preserves contribution from both halves, unlike a plain
+    /// truncation which would discard the upper half entirely.
+    static func collapseGroupHash(_ hash: UInt32) -> UInt16 {
+        UInt16((hash >> 16) & 0xFFFF) ^ UInt16(hash & 0xFFFF)
+    }
+
     private func setupService() {
-        let char = CBMutableCharacteristic(
+        let presence = CBMutableCharacteristic(
             type: Self.presenceCharacteristicUUID,
             properties: [.read, .notify],
             value: nil,                  // dynamic value (required for read+notify)
             permissions: [.readable]
         )
+        let chat = CBMutableCharacteristic(
+            type: Self.chatCharacteristicUUID,
+            properties: [.read, .notify],
+            value: nil,
+            permissions: [.readable]
+        )
         let svc = CBMutableService(type: Self.serviceUUID, primary: true)
-        svc.characteristics = [char]
+        svc.characteristics = [presence, chat]
         peripheralManager.add(svc)
-        presenceCharacteristic = char
+        presenceCharacteristic = presence
+        chatCharacteristic = chat
         advertisedService = svc
         serviceAdded = true
+    }
+
+    func send(chatMessage: ChatMessage) {
+        guard let data = chatMessage.encoded() else { return }
+        lastChatData = data
+        pendingChatUpdates.append(data)
+        drainChatQueue()
+    }
+
+    /// Drain pending chat updates through `peripheralManager.updateValue`.
+    /// Returns early if iOS pushes back; the manager will call
+    /// `peripheralManagerIsReady(toUpdateSubscribers:)` once it can
+    /// accept more, and we resume from there.
+    private func drainChatQueue() {
+        guard let char = chatCharacteristic else { return }
+        while let next = pendingChatUpdates.first {
+            let delivered = peripheralManager.updateValue(
+                next,
+                for: char,
+                onSubscribedCentrals: nil
+            )
+            if delivered {
+                pendingChatUpdates.removeFirst()
+            } else {
+                return
+            }
+        }
     }
 
     private func considerConnect(to peripheral: CBPeripheral) {
@@ -231,6 +404,9 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         let id = peripheral.identifier
         connectingPeers.remove(id)
         connectedPeers.removeValue(forKey: id)
+        // Don't remove the peripheral→member mapping here; we want to
+        // keep emitting RSSI for that member if their iBeacon advert is
+        // still detectable while we wait for a fresh GATT reconnect.
     }
 
     private func handlePresenceData(_ data: Data, from peripheral: CBPeripheral) {
@@ -239,8 +415,12 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             // Different group — drop the connection so we don't keep a
             // pointless link open.
             centralManager.cancelPeripheralConnection(peripheral)
+            peripheralToMember.removeValue(forKey: peripheral.identifier)
             return
         }
+        // Now that we know which member this peripheral is, tag future
+        // scan callbacks with their member ID for the RSSI stream.
+        peripheralToMember[peripheral.identifier] = presence.memberID
         peerContinuation.yield(presence)
     }
 }
@@ -251,6 +431,7 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
 
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor [weak self] in
+            self?.updateBluetoothReadiness()
             self?.beginScanIfReady()
         }
     }
@@ -259,8 +440,20 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
                                     didDiscover peripheral: CBPeripheral,
                                     advertisementData: [String: Any],
                                     rssi RSSI: NSNumber) {
+        let rssiValue = RSSI.doubleValue
         Task { @MainActor [weak self] in
-            self?.considerConnect(to: peripheral)
+            guard let self else { return }
+            // Emit an RSSI sample if we already know which member this
+            // peripheral belongs to. The compass uses these for gradient
+            // bearing computation when GPS isn't viable.
+            if let memberID = self.peripheralToMember[peripheral.identifier] {
+                self.rssiContinuation.yield(RSSIReading(
+                    memberID: memberID,
+                    rssi: rssiValue,
+                    timestamp: .now
+                ))
+            }
+            self.considerConnect(to: peripheral)
         }
     }
 
@@ -303,8 +496,13 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
         Task { @MainActor in
             guard let services = peripheral.services else { return }
             for service in services where service.uuid == Self.serviceUUID {
+                // Discover BOTH characteristics. The previous single-
+                // entry filter silently dropped chat — sender pushed
+                // notifies fine, but no peer ever subscribed because
+                // the chat characteristic was never discovered.
                 peripheral.discoverCharacteristics(
-                    [Self.presenceCharacteristicUUID],
+                    [Self.presenceCharacteristicUUID,
+                     Self.chatCharacteristicUUID],
                     for: service
                 )
             }
@@ -316,11 +514,21 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                                 error: Error?) {
         Task { @MainActor in
             guard let chars = service.characteristics else { return }
-            for char in chars where char.uuid == Self.presenceCharacteristicUUID {
-                // 1. Initial read so we get the peer's current state right away.
-                peripheral.readValue(for: char)
-                // 2. Subscribe for ongoing live updates pushed via notify.
-                peripheral.setNotifyValue(true, for: char)
+            for char in chars {
+                switch char.uuid {
+                case Self.presenceCharacteristicUUID:
+                    // 1. Initial read so we get the peer's current state right away.
+                    peripheral.readValue(for: char)
+                    // 2. Subscribe for ongoing live updates pushed via notify.
+                    peripheral.setNotifyValue(true, for: char)
+                case Self.chatCharacteristicUUID:
+                    // Chat messages are notify-driven. No initial read —
+                    // there's no concept of "current chat state," only a
+                    // stream of new messages from this point onward.
+                    peripheral.setNotifyValue(true, for: char)
+                default:
+                    break
+                }
             }
         }
     }
@@ -329,9 +537,27 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                                 didUpdateValueFor characteristic: CBCharacteristic,
                                 error: Error?) {
         guard error == nil, let data = characteristic.value else { return }
+        let charUUID = characteristic.uuid
         Task { @MainActor [weak self] in
-            self?.handlePresenceData(data, from: peripheral)
+            guard let self else { return }
+            switch charUUID {
+            case Self.presenceCharacteristicUUID:
+                self.handlePresenceData(data, from: peripheral)
+            case Self.chatCharacteristicUUID:
+                self.handleChatData(data)
+            default:
+                break
+            }
         }
+    }
+
+    private func handleChatData(_ data: Data) {
+        guard let message = ChatMessage.decoded(from: data) else { return }
+        // Drop messages from a different group; the per-device chat
+        // characteristic broadcasts to all subscribers regardless of
+        // group, so we filter at the app layer.
+        guard message.groupHash == activeGroupHash else { return }
+        chatContinuation.yield(message)
     }
 }
 
@@ -341,19 +567,92 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
 
     nonisolated func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         Task { @MainActor [weak self] in
+            self?.updateBluetoothReadiness()
             self?.beginAdvertisingIfReady()
+        }
+    }
+
+    nonisolated func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        // The transmission queue has space again. Resume any chat
+        // messages we couldn't push earlier.
+        Task { @MainActor [weak self] in
+            self?.drainChatQueue()
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager,
+                                       didAdd service: CBService,
+                                       error: Error?) {
+        let failed = error != nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.currentDiagnostics.serviceAddFailed = failed
+            self.emitDiagnostics()
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager,
+                                       central: CBCentral,
+                                       didSubscribeTo characteristic: CBCharacteristic) {
+        let charUUID = characteristic.uuid
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch charUUID {
+            case Self.chatCharacteristicUUID:
+                self.currentDiagnostics.chatSubscribers += 1
+            case Self.presenceCharacteristicUUID:
+                self.currentDiagnostics.presenceSubscribers += 1
+            default:
+                break
+            }
+            self.emitDiagnostics()
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager,
+                                       central: CBCentral,
+                                       didUnsubscribeFrom characteristic: CBCharacteristic) {
+        let charUUID = characteristic.uuid
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch charUUID {
+            case Self.chatCharacteristicUUID:
+                self.currentDiagnostics.chatSubscribers =
+                    max(0, self.currentDiagnostics.chatSubscribers - 1)
+            case Self.presenceCharacteristicUUID:
+                self.currentDiagnostics.presenceSubscribers =
+                    max(0, self.currentDiagnostics.presenceSubscribers - 1)
+            default:
+                break
+            }
+            self.emitDiagnostics()
         }
     }
 
     nonisolated func peripheralManager(_ peripheral: CBPeripheralManager,
                                        didReceiveRead request: CBATTRequest) {
+        let charUUID = request.characteristic.uuid
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if request.characteristic.uuid == Self.presenceCharacteristicUUID,
-               let data = self.lastPresenceData {
-                request.value = data
-                peripheral.respond(to: request, withResult: .success)
-            } else {
+            switch charUUID {
+            case Self.presenceCharacteristicUUID:
+                if let data = self.lastPresenceData {
+                    request.value = data
+                    peripheral.respond(to: request, withResult: .success)
+                } else {
+                    peripheral.respond(to: request, withResult: .attributeNotFound)
+                }
+            case Self.chatCharacteristicUUID:
+                if let data = self.lastChatData {
+                    request.value = data
+                    peripheral.respond(to: request, withResult: .success)
+                } else {
+                    // No message sent yet — respond cleanly with empty
+                    // value rather than an error.
+                    request.value = Data()
+                    peripheral.respond(to: request, withResult: .success)
+                }
+            default:
                 peripheral.respond(to: request, withResult: .attributeNotFound)
             }
         }

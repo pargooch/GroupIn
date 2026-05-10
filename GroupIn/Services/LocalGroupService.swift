@@ -146,6 +146,30 @@ final class LocalGroupService: CloudKitServicing {
         }
     }
 
+    // MARK: - Subscriptions (no-ops for the in-memory backend)
+
+    func subscribeToPresenceUpdates(groupID: UUID) async throws {
+        // Local backend has no server-side push; nothing to do.
+    }
+
+    func unsubscribeFromPresenceUpdates(groupID: UUID) async throws {
+        // Local backend has no server-side push; nothing to do.
+    }
+
+    func deleteGroup(groupID: UUID) async throws {
+        // Wipe from in-memory storage. Mirrors the cloud delete behavior
+        // so swipe-remove feels symmetric across backends.
+        if let key = groupsByCode.first(where: { $0.value.id == groupID })?.key {
+            groupsByCode.removeValue(forKey: key)
+            save()
+        }
+    }
+
+    func iCloudAccountStatus() async -> ICloudAccountStatus {
+        // Local backend doesn't depend on iCloud, so always green.
+        .available
+    }
+
     // MARK: - Helpers
 
     private func findGroup(id: UUID) -> GroupSession? {

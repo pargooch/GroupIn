@@ -10,6 +10,8 @@ struct HomeView: View {
 
     var body: some View {
         List {
+            statusSection
+
             Section {
                 Button {
                     appState.path.append(.profileEditor)
@@ -80,6 +82,87 @@ struct HomeView: View {
         }
         .navigationTitle("GroupIn")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private struct StatusBanner: Identifiable {
+        let id: String
+        let icon: String
+        let title: String
+        let body: String
+        let tint: Color
+    }
+
+    private var statusBanners: [StatusBanner] {
+        var banners: [StatusBanner] = []
+        switch appState.iCloudAccountStatus {
+        case .available, .couldNotDetermine:
+            // .couldNotDetermine is the optimistic default — don't flash
+            // a banner before CloudKit has had a chance to reply.
+            break
+        case .noAccount:
+            banners.append(StatusBanner(
+                id: "icloud",
+                icon: "icloud.slash",
+                title: "Sign in to iCloud",
+                body: "GroupIn syncs locations through your iCloud account. Open Settings → Apple ID to sign in.",
+                tint: .red
+            ))
+        case .restricted:
+            banners.append(StatusBanner(
+                id: "icloud",
+                icon: "lock.icloud",
+                title: "iCloud is restricted",
+                body: "Parental controls or device management are blocking iCloud. GroupIn needs it to sync.",
+                tint: .red
+            ))
+        case .temporarilyUnavailable:
+            banners.append(StatusBanner(
+                id: "icloud",
+                icon: "exclamationmark.icloud",
+                title: "iCloud is temporarily unavailable",
+                body: "Your account is being reconfigured. Try again in a moment.",
+                tint: .orange
+            ))
+        }
+        if !appState.bleDiagnostics.bluetoothReady {
+            banners.append(StatusBanner(
+                id: "ble",
+                icon: "antenna.radiowaves.left.and.right.slash",
+                title: "Bluetooth is off",
+                body: "Turn Bluetooth on so GroupIn can find nearby members and exchange location offline.",
+                tint: .orange
+            ))
+        }
+        return banners
+    }
+
+    @ViewBuilder
+    private var statusSection: some View {
+        let banners = statusBanners
+        if !banners.isEmpty {
+            Section {
+                ForEach(banners) { banner in
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: banner.icon)
+                            .font(.title3)
+                            .foregroundStyle(banner.tint)
+                            .frame(width: 28)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(banner.title)
+                                .font(.subheadline.weight(.semibold))
+                            Text(banner.body)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .accessibilityElement(children: .combine)
+                }
+            } header: {
+                Text("Status")
+            }
+        }
     }
 
     @ViewBuilder

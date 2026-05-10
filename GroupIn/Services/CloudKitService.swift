@@ -228,6 +228,110 @@ final class CloudKitService: CloudKitServicing {
         }
     }
 
+    // MARK: - Subscriptions
+
+    func subscribeToPresenceUpdates(groupID: UUID) async throws {
+        let groupRecordID = CKRecord.ID(recordName: groupID.uuidString)
+        let groupRef = CKRecord.Reference(recordID: groupRecordID, action: .none)
+        let predicate = NSPredicate(format: "groupID == %@", groupRef)
+
+        let subscriptionID = Self.subscriptionID(for: groupID)
+        let subscription = CKQuerySubscription(
+            recordType: User.recordType,
+            predicate: predicate,
+            subscriptionID: subscriptionID,
+            options: [.firesOnRecordCreation, .firesOnRecordUpdate]
+        )
+
+        // Silent push: shouldSendContentAvailable wakes the app in the
+        // background without showing a banner. The body / title fields
+        // are intentionally left nil — this notification is plumbing,
+        // not a user-facing message.
+        let info = CKSubscription.NotificationInfo()
+        info.shouldSendContentAvailable = true
+        subscription.notificationInfo = info
+
+        do {
+            _ = try await database.save(subscription)
+        } catch let ckError as CKError where ckError.code == .serverRejectedRequest {
+            // Most common cause: a subscription with this ID already
+            // exists from a previous session. CloudKit persists
+            // subscriptions across app launches, so this is fine — our
+            // re-registration is just confirming what's already there.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
+    func unsubscribeFromPresenceUpdates(groupID: UUID) async throws {
+        let subscriptionID = Self.subscriptionID(for: groupID)
+        do {
+            _ = try await database.deleteSubscription(withID: subscriptionID)
+        } catch let ckError as CKError where ckError.code == .unknownItem {
+            // Already gone — nothing to clean up.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
+    private static func subscriptionID(for groupID: UUID) -> String {
+        "presence-\(groupID.uuidString)"
+    }
+
+    // MARK: - Owner delete
+
+    func deleteGroup(groupID: UUID) async throws {
+        let recordID = CKRecord.ID(recordName: groupID.uuidString)
+
+        // Best-effort: also clear the subscription so we don't leak it
+        // server-side. Failures here shouldn't block the group delete.
+        let subID = Self.subscriptionID(for: groupID)
+        _ = try? await database.deleteSubscription(withID: subID)
+
+        // Reuse the resolveExpiry hard-delete path: fetch members, batch-
+        // delete them along with the group record. CKRecord.Reference
+        // action `.deleteSelf` would cascade if we modified records via
+        // the batch op anyway, but doing it explicitly keeps it sturdy
+        // even if the parent reference field is missing for some reason.
+        let memberIDs: [CKRecord.ID]
+        do {
+            let members = try await fetchMembers(groupRecordID: recordID,
+                                                 groupID: groupID)
+            memberIDs = members.map { CKRecord.ID(recordName: $0.id.uuidString) }
+        } catch {
+            memberIDs = []
+        }
+
+        do {
+            _ = try await database.modifyRecords(
+                saving: [],
+                deleting: memberIDs + [recordID]
+            )
+        } catch let ckError as CKError where ckError.code == .unknownItem {
+            // Already gone server-side. Treat as success.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
+    // MARK: - Account preflight
+
+    func iCloudAccountStatus() async -> ICloudAccountStatus {
+        do {
+            let status = try await container.accountStatus()
+            switch status {
+            case .available:               return .available
+            case .noAccount:               return .noAccount
+            case .restricted:              return .restricted
+            case .couldNotDetermine:       return .couldNotDetermine
+            case .temporarilyUnavailable:  return .temporarilyUnavailable
+            @unknown default:              return .couldNotDetermine
+            }
+        } catch {
+            return .couldNotDetermine
+        }
+    }
+
     // MARK: - Internals
 
     private func fetchRecord(id: CKRecord.ID) async throws -> CKRecord {

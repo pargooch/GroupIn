@@ -19,6 +19,11 @@ protocol LocationServicing: AnyObject {
     func requestAuthorization()
     func startUpdating()
     func stopUpdating()
+    /// Adaptive battery hook. AppState calls this in response to motion
+    /// classification: when the user has been stationary, drop accuracy
+    /// to ~100m to ease the GPS chip's duty cycle; when they're moving
+    /// again, ramp back to best.
+    func adjustForMotion(stationary: Bool)
 }
 
 @MainActor
@@ -54,10 +59,11 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
         // is delivered. Battery-heavy; revisit with adaptive throttling later.
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = kCLDistanceFilterNone
-        // Heading filter: only deliver updates when bearing changes by
-        // ≥3°. Avoids flooding the stream while the device is held still
-        // (where magnetometer noise causes constant micro-fluctuations).
-        manager.headingFilter = 3
+        // Heading filter: deliver updates on every ≥1° change. Combined
+        // with our 5-sample circular smoothing in AppState, this gives a
+        // fluid arrow that tracks phone rotation smoothly without
+        // chasing magnetometer noise.
+        manager.headingFilter = 1
 
         // Background sharing: with whenInUse + UIBackgroundModes=location,
         // location keeps flowing while the app is backgrounded or the
@@ -97,6 +103,17 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
     func stopUpdating() {
         manager.stopUpdatingLocation()
         manager.stopUpdatingHeading()
+    }
+
+    func adjustForMotion(stationary: Bool) {
+        // Distance filter stays at None so we still receive heartbeat
+        // fixes — they let the "Sharing live" indicator stay green and
+        // keep the freshness window honest. Only the accuracy budget
+        // shifts. Apple's GPS hardware uses much less power at lower
+        // accuracy targets.
+        manager.desiredAccuracy = stationary
+            ? kCLLocationAccuracyHundredMeters
+            : kCLLocationAccuracyBest
     }
 
     // MARK: - CLLocationManagerDelegate

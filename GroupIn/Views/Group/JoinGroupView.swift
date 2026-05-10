@@ -7,6 +7,7 @@ import SwiftUI
 
 struct JoinGroupView: View {
     @State private var viewModel: JoinGroupViewModel
+    @State private var showsScanner = false
 
     init(viewModel: JoinGroupViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -23,6 +24,16 @@ struct JoinGroupView: View {
                     .submitLabel(.go)
                     .onSubmit { Task { await viewModel.joinGroup() } }
                     .accessibilityLabel("Invite code")
+            }
+
+            Section {
+                Button {
+                    showsScanner = true
+                } label: {
+                    Label("Scan QR code", systemImage: "qrcode.viewfinder")
+                        .frame(maxWidth: .infinity)
+                }
+                .accessibilityHint("Opens the camera to scan a group's invite QR code")
             }
 
             if let message = viewModel.errorMessage {
@@ -50,6 +61,17 @@ struct JoinGroupView: View {
         }
         .navigationTitle("Join Group")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showsScanner) {
+            QRScannerView { scanned in
+                // Reuse the manual-entry path: drop the scanned text into
+                // the same field (so the user can confirm/edit if it
+                // came in malformed) and immediately try to join.
+                viewModel.inviteCode = scanned
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .uppercased()
+                Task { await viewModel.joinGroup() }
+            }
+        }
     }
 }
 
