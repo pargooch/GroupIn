@@ -17,8 +17,7 @@ struct CreateGroupView: View {
 
         Form {
             Section {
-                categoryPicker
-                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                categoryMenu
             } header: {
                 Text("Type")
             } footer: {
@@ -87,44 +86,49 @@ struct CreateGroupView: View {
     }
 
     @ViewBuilder
-    private var categoryPicker: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
+    private var categoryMenu: some View {
+        Menu {
+            // Native iOS dropdown — each row gets the category's SF
+            // Symbol on the leading edge, the user's current pick is
+            // marked with a checkmark by SwiftUI automatically when we
+            // bind through Picker.
+            Picker(selection: $viewModel.category) {
                 ForEach(GroupCategory.allCases) { cat in
-                    categoryChip(cat)
+                    Label(cat.label, systemImage: cat.systemImage)
+                        .tag(cat)
                 }
+            } label: {
+                EmptyView()
             }
-            .padding(.horizontal, 16)
-        }
-    }
-
-    @ViewBuilder
-    private func categoryChip(_ cat: GroupCategory) -> some View {
-        let isSelected = viewModel.category == cat
-        Button {
-            viewModel.category = cat
         } label: {
-            VStack(spacing: 6) {
-                Image(systemName: cat.systemImage)
-                    .font(.title2)
-                    .foregroundStyle(cat.tint)
-                Text(cat.label)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.primary)
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(viewModel.category.tint.opacity(0.18))
+                    Image(systemName: viewModel.category.systemImage)
+                        .foregroundStyle(viewModel.category.tint)
+                }
+                .frame(width: 32, height: 32)
+                .accessibilityHidden(true)
+
+                // Text uses the same category tint as the icon so the row
+                // reads as a single colored unit instead of "colored icon
+                // + black text" mismatch.
+                Text(viewModel.category.label)
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(viewModel.category.tint)
+
+                Spacer()
+
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(viewModel.category.tint.opacity(0.7))
+                    .accessibilityHidden(true)
             }
-            .frame(width: 84, height: 84)
-            .background(
-                cat.tint.opacity(isSelected ? 0.22 : 0.10),
-                in: RoundedRectangle(cornerRadius: 12)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(isSelected ? cat.tint : Color.clear, lineWidth: 2)
-            )
+            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(cat.label), \(cat.subtitle)")
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityLabel("Type: \(viewModel.category.label)")
+        .accessibilityHint("Tap to choose a different group type")
     }
 
     /// Suggest a placeholder name based on the picked category.

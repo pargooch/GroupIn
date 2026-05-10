@@ -39,11 +39,11 @@ struct HomeView: View {
                 .accessibilityHint("Opens your profile to edit name and photo")
             }
 
+            createJoinSection
+
             Section {
                 if appState.myGroups.isEmpty {
-                    Text("You haven't joined any groups yet. Create one or join with a code.")
-                        .font(.body)
-                        .foregroundStyle(.secondary)
+                    emptyGroupsState
                 } else {
                     ForEach(appState.myGroups) { group in
                         Button {
@@ -62,22 +62,6 @@ struct HomeView: View {
                 }
             } header: {
                 Text("Your groups")
-            }
-
-            Section {
-                Button {
-                    appState.path.append(.createGroup)
-                } label: {
-                    Label("Create a Group", systemImage: "plus.circle.fill")
-                }
-                .accessibilityHint("Starts a new group you can invite others to")
-
-                Button {
-                    appState.path.append(.joinGroup)
-                } label: {
-                    Label("Join a Group", systemImage: "person.badge.plus")
-                }
-                .accessibilityHint("Join an existing group with an invite code")
             }
         }
         .navigationTitle("GroupIn")
@@ -163,6 +147,63 @@ struct HomeView: View {
                 Text("Status")
             }
         }
+    }
+
+    @ViewBuilder
+    private var createJoinSection: some View {
+        Section {
+            Button {
+                appState.path.append(.createGroup)
+            } label: {
+                Label("Create a Group", systemImage: "plus.circle.fill")
+            }
+            .accessibilityHint("Starts a new group you can invite others to")
+
+            Button {
+                appState.path.append(.joinGroup)
+            } label: {
+                Label("Join a Group", systemImage: "person.badge.plus")
+            }
+            .accessibilityHint("Join an existing group with an invite code")
+        }
+    }
+
+    @ViewBuilder
+    private var emptyGroupsState: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                // Soft background halo so the icon doesn't float in white
+                // space — matches the colored-circle motif used elsewhere
+                // in the app (member avatars, category chips).
+                Circle()
+                    .fill(Color.accentColor.opacity(0.12))
+                    .frame(width: 96, height: 96)
+                Image(systemName: "person.3.sequence.fill")
+                    .font(.system(size: 44, weight: .semibold))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [.accentColor, .accentColor.opacity(0.65)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+            }
+            .accessibilityHidden(true)
+
+            Text("No groups yet")
+                .font(.headline)
+
+            Text("Create one or join with a code to start finding your friends in real time — online or off.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .listRowBackground(Color.clear)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("No groups yet. Create one or join with a code.")
     }
 
     @ViewBuilder

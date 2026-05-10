@@ -170,6 +170,18 @@ final class LocalGroupService: CloudKitServicing {
         .available
     }
 
+    func removeMember(memberID: UUID,
+                      fromGroup groupID: UUID) async throws -> GroupSession {
+        guard let key = groupsByCode.first(where: { $0.value.id == groupID })?.key,
+              var group = groupsByCode[key] else {
+            throw GroupServiceError.groupNotFound
+        }
+        group.members.removeAll { $0.id == memberID }
+        groupsByCode[key] = group
+        save()
+        return group
+    }
+
     // MARK: - Helpers
 
     private func findGroup(id: UUID) -> GroupSession? {

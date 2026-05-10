@@ -258,7 +258,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "GroupIn uses Bluetooth to find nearby group members when the internet isn't available.";
-				INFOPLIST_KEY_NSCameraUsageDescription = "GroupIn uses the camera to scan a group's invite QR code so you can join without typing.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "GroupIn uses the camera to scan invite QR codes and to take a new profile photo.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "GroupIn alerts you when group members come nearby — even when the app is closed — and keeps sharing your location with the group while you're an active member.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "GroupIn shares your location with members of your group so you can keep an eye on each other.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "GroupIn detects when you're sitting still so it can save battery by reducing GPS accuracy. Sharing keeps working — it just costs less power.";
@@ -298,7 +298,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "GroupIn uses Bluetooth to find nearby group members when the internet isn't available.";
-				INFOPLIST_KEY_NSCameraUsageDescription = "GroupIn uses the camera to scan a group's invite QR code so you can join without typing.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "GroupIn uses the camera to scan invite QR codes and to take a new profile photo.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "GroupIn alerts you when group members come nearby — even when the app is closed — and keeps sharing your location with the group while you're an active member.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "GroupIn shares your location with members of your group so you can keep an eye on each other.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "GroupIn detects when you're sitting still so it can save battery by reducing GPS accuracy. Sharing keeps working — it just costs less power.";

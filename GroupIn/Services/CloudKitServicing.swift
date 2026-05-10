@@ -77,6 +77,14 @@ protocol CloudKitServicing: AnyObject {
     /// is what swipe-remove on the owner's home list calls.
     func deleteGroup(groupID: UUID) async throws
 
+    /// Owner kicks a single member out of the group. The member's
+    /// record is deleted server-side; their device still has the group
+    /// in local storage until it next refreshes (or the owner's update
+    /// pushes through). Returns the freshly-fetched group so the UI
+    /// can reconcile immediately.
+    func removeMember(memberID: UUID,
+                      fromGroup groupID: UUID) async throws -> GroupSession
+
     /// Quick health check the app does at launch (and again whenever the
     /// system fires `CKAccountChanged`). Returns the user-visible state
     /// so AppState can put up a "sign in to iCloud" banner before any

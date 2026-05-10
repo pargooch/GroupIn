@@ -17,6 +17,7 @@ struct GroupDashboardView: View {
     @State private var compassMember: User?
     @State private var showsChat = false
     @State private var showsInviteQR = false
+    @State private var memberToRemove: User?
 
     init(viewModel: GroupDashboardViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -45,6 +46,23 @@ struct GroupDashboardView: View {
                         inviteCode: group.inviteCode
                     )
                 }
+            }
+            .alert(
+                "Remove \(memberToRemove?.displayName ?? "this member")?",
+                isPresented: Binding(
+                    get: { memberToRemove != nil },
+                    set: { if !$0 { memberToRemove = nil } }
+                ),
+                presenting: memberToRemove
+            ) { member in
+                Button("Cancel", role: .cancel) { memberToRemove = nil }
+                Button("Remove", role: .destructive) {
+                    let id = member.id
+                    memberToRemove = nil
+                    Task { await appState.removeMember(id) }
+                }
+            } message: { _ in
+                Text("They'll lose access to this group. They can rejoin if they still have the invite code.")
             }
     }
 
@@ -239,10 +257,16 @@ struct GroupDashboardView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button("Leave", role: .destructive) {
+                // "Done" — closes this dashboard and returns home. The
+                // user stays a member of the group; sharing keeps
+                // running in the background. Removing yourself from
+                // the group entirely is a separate swipe-delete action
+                // on the Home screen's group list.
+                Button("Done") {
                     appState.leaveGroup()
                 }
-                .accessibilityHint("Leaves this group view and returns home")
+                .fontWeight(.semibold)
+                .accessibilityHint("Closes this group view and returns home. You stay a member.")
             }
         }
     }
@@ -726,6 +750,18 @@ struct GroupDashboardView: View {
             }
         }
         .accessibilityElement(children: .contain)
+        // Owner-only: long-press a non-self, non-owner member to open
+        // a context menu offering removal. Confirmation alert is
+        // wired one level up via `memberToRemove`.
+        .contextMenu {
+            if viewModel.isOwner && !isMe && member.id != group.ownerID {
+                Button(role: .destructive) {
+                    memberToRemove = member
+                } label: {
+                    Label("Remove from group", systemImage: "person.fill.xmark")
+                }
+            }
+        }
     }
 }
 

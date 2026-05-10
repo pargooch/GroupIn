@@ -5,6 +5,12 @@
 //  Edits the device-side profile. Saving propagates the new name and
 //  avatar into every existing group membership.
 //
+//  Layout follows iOS Contacts/Settings convention: a big circular
+//  avatar with a camera-icon overlay that opens an action sheet of
+//  edit options. The avatar only updates when the user explicitly
+//  confirms a new pick (cropper "Done" or emoji "Use this") — canceling
+//  any step leaves the existing avatar untouched.
+//
 
 import SwiftUI
 import PhotosUI
@@ -16,47 +22,20 @@ struct ProfileEditorView: View {
 
     @State private var name: String = ""
     @State private var avatarData: Data?
+
     @State private var photoSelection: PhotosPickerItem?
     @State private var loadingPhoto = false
     @State private var cropperSource: CropperSource?
 
+    @State private var showsActionSheet = false
+    @State private var showsPhotosPicker = false
+    @State private var showsMemojiPicker = false
+    @State private var showsCameraPicker = false
+    @State private var confirmingRemoval = false
+
     var body: some View {
         Form {
-            Section {
-                HStack(spacing: 16) {
-                    AvatarView(data: avatarData, name: name, size: 80)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        PhotosPicker(selection: $photoSelection,
-                                     matching: .images,
-                                     photoLibrary: .shared()) {
-                            Label(avatarData == nil ? "Choose photo" : "Change photo",
-                                  systemImage: "photo")
-                        }
-                        .disabled(loadingPhoto)
-                        .accessibilityHint("Pick a photo or memoji from your library")
-
-                        if avatarData != nil {
-                            Button(role: .destructive) {
-                                avatarData = nil
-                                photoSelection = nil
-                            } label: {
-                                Label("Remove photo", systemImage: "trash")
-                            }
-                        }
-
-                        if loadingPhoto {
-                            ProgressView()
-                        }
-                    }
-                }
-                .padding(.vertical, 4)
-            } header: {
-                Text("Photo")
-            } footer: {
-                Text("Tip: save a memoji as a sticker in Photos to use it here.")
-                    .font(.caption)
-            }
+            avatarSection
 
             Section("Display name") {
                 TextField("e.g. Alex", text: $name)
@@ -81,7 +60,59 @@ struct ProfileEditorView: View {
             name = appState.localProfile.displayName
             avatarData = appState.localProfile.avatarData
         }
+        // Action sheet — what to do with the avatar.
+        .confirmationDialog("Profile picture",
+                            isPresented: $showsActionSheet,
+                            titleVisibility: .hidden) {
+            Button("Take Photo") { showsCameraPicker = true }
+            Button("Choose Photo") { showsPhotosPicker = true }
+            Button("Use Memoji") { showsMemojiPicker = true }
+            if avatarData != nil {
+                Button("Remove Photo", role: .destructive) {
+                    confirmingRemoval = true
+                }
+            }
+        }
+        // Removing is destructive — confirm before clearing.
+        .alert("Remove profile photo?",
+               isPresented: $confirmingRemoval) {
+            Button("Cancel", role: .cancel) {}
+            Button("Remove", role: .destructive) {
+                avatarData = nil
+                photoSelection = nil
+            }
+        } message: {
+            Text("Your avatar will fall back to your initial.")
+        }
+        // Photos library picker.
+        .photosPicker(
+            isPresented: $showsPhotosPicker,
+            selection: $photoSelection,
+            matching: .images,
+            photoLibrary: .shared()
+        )
+        // Memoji sticker capture sheet.
+        .sheet(isPresented: $showsMemojiPicker) {
+            MemojiAvatarPickerSheet { data in
+                avatarData = data
+            }
+        }
+        // Live camera capture — routes back through the cropper so the
+        // captured photo gets the same circular framing/zoom as a
+        // library pick.
+        .fullScreenCover(isPresented: $showsCameraPicker) {
+            CameraPicker { image in
+                showsCameraPicker = false
+                cropperSource = CropperSource(image: image)
+            } onCancel: {
+                showsCameraPicker = false
+            }
+            .ignoresSafeArea()
+        }
         .onChange(of: photoSelection) { _, newItem in
+            // Only react when a real selection arrives. nil happens when
+            // we reset the picker after a successful crop, and must NOT
+            // touch avatarData.
             guard let newItem else { return }
             loadingPhoto = true
             Task {
@@ -94,12 +125,68 @@ struct ProfileEditorView: View {
         }
         .fullScreenCover(item: $cropperSource) { src in
             AvatarCropperView(sourceImage: src.image) { cropped in
+                // Cropper Cancel returns nil — leave avatar untouched.
+                // Only a confirmed crop replaces the existing avatar.
                 if let cropped {
                     avatarData = cropped
                 }
                 cropperSource = nil
                 photoSelection = nil
             }
+        }
+    }
+
+    // MARK: - Avatar section
+
+    @ViewBuilder
+    private var avatarSection: some View {
+        Section {
+            VStack(spacing: 10) {
+                ZStack(alignment: .bottomTrailing) {
+                    AvatarView(data: avatarData, name: name, size: 140)
+                        .shadow(color: .black.opacity(0.08), radius: 10, y: 4)
+
+                    Button {
+                        showsActionSheet = true
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(Color.accentColor)
+                                .frame(width: 38, height: 38)
+                                .shadow(color: .black.opacity(0.18), radius: 5, y: 2)
+                            Image(systemName: "camera.fill")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.white)
+                        }
+                        .overlay(
+                            // White ring so the badge separates cleanly
+                            // from the avatar behind it.
+                            Circle()
+                                .stroke(Color(.systemBackground), lineWidth: 3)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Change profile picture")
+                }
+                // Whole avatar is also tappable — large hit target.
+                .contentShape(Circle())
+                .onTapGesture { showsActionSheet = true }
+
+                if loadingPhoto {
+                    ProgressView()
+                        .padding(.top, 4)
+                } else {
+                    Text("Tap to change")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .listRowBackground(Color.clear)
+        } footer: {
+            Text("Photos, Memoji stickers, and emoji all work.")
+                .font(.caption)
         }
     }
 

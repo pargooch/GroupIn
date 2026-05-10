@@ -314,6 +314,26 @@ final class CloudKitService: CloudKitServicing {
         }
     }
 
+    // MARK: - Owner-initiated member removal
+
+    func removeMember(memberID: UUID,
+                      fromGroup groupID: UUID) async throws -> GroupSession {
+        let memberRecordID = CKRecord.ID(recordName: memberID.uuidString)
+        let groupRecordID = CKRecord.ID(recordName: groupID.uuidString)
+
+        do {
+            _ = try await database.deleteRecord(withID: memberRecordID)
+        } catch let ckError as CKError where ckError.code == .unknownItem {
+            // Already gone — proceed to fetch the fresh group state.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+
+        // Refetch the group so the caller gets the post-removal state.
+        let groupRecord = try await fetchRecord(id: groupRecordID)
+        return try await groupSession(from: groupRecord)
+    }
+
     // MARK: - Account preflight
 
     func iCloudAccountStatus() async -> ICloudAccountStatus {

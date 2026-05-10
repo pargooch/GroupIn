@@ -628,6 +628,32 @@ final class AppState {
         path.removeAll()
     }
 
+    /// Owner-only kick. Removes the target member's record from the
+    /// backend and updates local state so the dashboard reflects the
+    /// change immediately. Silently no-ops if the local user isn't
+    /// the group owner — the UI shouldn't even surface the option to
+    /// non-owners, but this is a defense-in-depth check.
+    func removeMember(_ memberID: UUID) async {
+        guard let group = currentGroup,
+              group.ownerID == currentUser.id,
+              memberID != currentUser.id else { return }
+        do {
+            let updated = try await groupService.removeMember(
+                memberID: memberID, fromGroup: group.id
+            )
+            currentGroup = updated
+            addOrUpdate(group: updated)
+            // Drop the now-stale per-peer tracking so the UI isn't
+            // briefly trying to render a member who's no longer in
+            // the list.
+            peerSources.removeValue(forKey: memberID)
+            uwbReadings.removeValue(forKey: memberID)
+        } catch {
+            // Silent fail — next refresh will reconcile if the delete
+            // actually went through but the fetch errored.
+        }
+    }
+
     // MARK: - Location lifecycle
 
     func startLocationTracking() {
