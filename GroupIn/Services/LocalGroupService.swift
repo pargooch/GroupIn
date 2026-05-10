@@ -15,6 +15,9 @@ enum GroupServiceError: LocalizedError {
     case invalidCode
     case groupNotFound
     case noPendingExtension
+    /// The local user has been banned from this group by its owner.
+    /// Surface a recovery path: ask the owner to invite them again.
+    case banned
 
     var errorDescription: String? {
         switch self {
@@ -22,6 +25,7 @@ enum GroupServiceError: LocalizedError {
         case .invalidCode:         return "Please enter an invite code."
         case .groupNotFound:       return "No group matches that invite code."
         case .noPendingExtension:  return "There's no pending extension to accept."
+        case .banned:              return "You were removed from this group. Ask the owner to invite you again."
         }
     }
 }
@@ -29,6 +33,11 @@ enum GroupServiceError: LocalizedError {
 @MainActor
 final class LocalGroupService: CloudKitServicing {
     private static let storageKey = "GroupIn.LocalGroupService.groups"
+    /// Stable per-install identifier used for ban-hash computation in
+    /// the local backend. Generated once and persisted; survives app
+    /// relaunches but rotates on uninstall (the local backend exists
+    /// for development only, so reinstall-rotation is acceptable).
+    private static let installIDKey = "GroupIn.LocalGroupService.installID"
 
     private let defaults: UserDefaults
     private var groupsByCode: [String: GroupSession]
@@ -176,10 +185,45 @@ final class LocalGroupService: CloudKitServicing {
               var group = groupsByCode[key] else {
             throw GroupServiceError.groupNotFound
         }
+        // Snapshot the kicked member's banHash + display name before
+        // we drop them from the members list, so the banlist entry is
+        // populated correctly.
+        if let kicked = group.members.first(where: { $0.id == memberID }),
+           let hash = kicked.banHash,
+           !group.bannedMembers.contains(where: { $0.banHash == hash }) {
+            group.bannedMembers.append(BannedMember(
+                banHash: hash,
+                displayName: kicked.displayName,
+                bannedAt: .now
+            ))
+        }
         group.members.removeAll { $0.id == memberID }
         groupsByCode[key] = group
         save()
         return group
+    }
+
+    func unbanMember(banHash: String,
+                     fromGroup groupID: UUID) async throws -> GroupSession {
+        guard let key = groupsByCode.first(where: { $0.value.id == groupID })?.key,
+              var group = groupsByCode[key] else {
+            throw GroupServiceError.groupNotFound
+        }
+        group.bannedMembers.removeAll { $0.banHash == banHash }
+        groupsByCode[key] = group
+        save()
+        return group
+    }
+
+    func cloudUserID() async -> String? {
+        // Stable per-install ID. Created lazily on first call and
+        // persisted in UserDefaults so re-runs share the same value.
+        if let existing = defaults.string(forKey: Self.installIDKey) {
+            return existing
+        }
+        let new = UUID().uuidString
+        defaults.set(new, forKey: Self.installIDKey)
+        return new
     }
 
     // MARK: - Helpers

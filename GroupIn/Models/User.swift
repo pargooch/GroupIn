@@ -24,6 +24,13 @@ struct User: Identifiable, Hashable, Codable {
     /// view targeting another peer; nil for devices without UWB
     /// hardware or before a session has started.
     var nearbyToken: Data?
+    /// Per-(iCloud-account, group) salted SHA-256 hash. Stored on
+    /// this member's record so the owner can copy it into the group's
+    /// banlist when removing them. Opaque to other members; not
+    /// correlatable across groups. Nil for users not signed into
+    /// iCloud (those users can't be banned but also can't use the
+    /// CloudKit backend at all, so the gap is benign).
+    var banHash: String?
 
     init(id: UUID = UUID(),
          displayName: String,
@@ -31,7 +38,8 @@ struct User: Identifiable, Hashable, Codable {
          lastSeen: Date = .now,
          coordinate: Coordinate? = nil,
          heading: Double? = nil,
-         nearbyToken: Data? = nil) {
+         nearbyToken: Data? = nil,
+         banHash: String? = nil) {
         self.id = id
         self.displayName = displayName
         self.avatarData = avatarData
@@ -39,9 +47,11 @@ struct User: Identifiable, Hashable, Codable {
         self.coordinate = coordinate
         self.heading = heading
         self.nearbyToken = nearbyToken
+        self.banHash = banHash
     }
 
-    /// Old persisted Users (without heading / nearbyToken) decode as nil.
+    /// Old persisted Users (without heading / nearbyToken / banHash)
+    /// decode as nil for the missing fields.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decode(UUID.self, forKey: .id)
@@ -51,6 +61,7 @@ struct User: Identifiable, Hashable, Codable {
         self.coordinate = try? c.decode(Coordinate.self, forKey: .coordinate)
         self.heading = try? c.decode(Double.self, forKey: .heading)
         self.nearbyToken = try? c.decode(Data.self, forKey: .nearbyToken)
+        self.banHash = try? c.decode(String.self, forKey: .banHash)
     }
 }
 

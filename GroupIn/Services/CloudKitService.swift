@@ -24,7 +24,7 @@ import CloudKit
 enum CloudKitError: LocalizedError {
     case invalidRecord
     case notSignedIn
-    case schemaIncomplete
+    case schemaIncomplete(field: String?)
     case other(Error)
 
     var errorDescription: String? {
@@ -33,11 +33,68 @@ enum CloudKitError: LocalizedError {
             return "Couldn't read group data from CloudKit."
         case .notSignedIn:
             return "Sign in to iCloud in Settings to use GroupIn."
-        case .schemaIncomplete:
-            return "CloudKit schema not ready. Mark inviteCode/groupID as queryable in CloudKit Console."
+        case .schemaIncomplete(let field):
+            if let field {
+                return "CloudKit field '\(field)' isn't queryable. Open CloudKit Console → Schema → Indexes and add a Queryable index for it, then deploy."
+            }
+            return "CloudKit schema isn't ready. Mark Group.inviteCode and Member.groupID as queryable in CloudKit Console, then deploy."
         case .other(let err):
+            // Surface the raw error verbatim so we don't lose context.
+            // CKError descriptions usually contain the field name and
+            // the underlying server-side complaint, which is exactly
+            // what we need to debug schema issues without attaching a
+            // debugger.
+            if let ckError = err as? CKError {
+                return "CloudKit error \(ckError.code.rawValue) (\(ckErrorCodeName(ckError.code))): \(ckError.localizedDescription)"
+            }
             return err.localizedDescription
         }
+    }
+}
+
+/// Human-readable name for a CKError.Code value. The default
+/// `localizedDescription` often hides the code name — this lets the
+/// error surface "ZONE_NOT_FOUND" or "PARTIAL_FAILURE" instead of a
+/// generic "An error occurred."
+private func ckErrorCodeName(_ code: CKError.Code) -> String {
+    switch code {
+    case .internalError:           return "internalError"
+    case .partialFailure:          return "partialFailure"
+    case .networkUnavailable:      return "networkUnavailable"
+    case .networkFailure:          return "networkFailure"
+    case .badContainer:            return "badContainer"
+    case .serviceUnavailable:      return "serviceUnavailable"
+    case .requestRateLimited:      return "requestRateLimited"
+    case .missingEntitlement:      return "missingEntitlement"
+    case .notAuthenticated:        return "notAuthenticated"
+    case .permissionFailure:       return "permissionFailure"
+    case .unknownItem:             return "unknownItem"
+    case .invalidArguments:        return "invalidArguments"
+    case .resultsTruncated:        return "resultsTruncated"
+    case .serverRecordChanged:     return "serverRecordChanged"
+    case .serverRejectedRequest:   return "serverRejectedRequest"
+    case .assetFileNotFound:       return "assetFileNotFound"
+    case .assetFileModified:       return "assetFileModified"
+    case .incompatibleVersion:     return "incompatibleVersion"
+    case .constraintViolation:     return "constraintViolation"
+    case .operationCancelled:      return "operationCancelled"
+    case .changeTokenExpired:      return "changeTokenExpired"
+    case .batchRequestFailed:      return "batchRequestFailed"
+    case .zoneBusy:                return "zoneBusy"
+    case .badDatabase:             return "badDatabase"
+    case .quotaExceeded:           return "quotaExceeded"
+    case .zoneNotFound:            return "zoneNotFound"
+    case .limitExceeded:           return "limitExceeded"
+    case .userDeletedZone:         return "userDeletedZone"
+    case .tooManyParticipants:     return "tooManyParticipants"
+    case .alreadyShared:           return "alreadyShared"
+    case .referenceViolation:      return "referenceViolation"
+    case .managedAccountRestricted: return "managedAccountRestricted"
+    case .participantMayNeedVerification: return "participantMayNeedVerification"
+    case .serverResponseLost:      return "serverResponseLost"
+    case .assetNotAvailable:       return "assetNotAvailable"
+    case .accountTemporarilyUnavailable: return "accountTemporarilyUnavailable"
+    @unknown default:              return "unknown(\(code.rawValue))"
     }
 }
 
@@ -126,17 +183,36 @@ final class CloudKitService: CloudKitServicing {
         let recordID = CKRecord.ID(recordName: user.id.uuidString)
         let groupRecordID = CKRecord.ID(recordName: group.id.uuidString)
 
-        var record: CKRecord
+        let record = CKRecord(recordType: User.recordType, recordID: recordID)
+        user.writeTo(record: record, groupRecordID: groupRecordID)
+
+        // `.allKeys` writes regardless of the server-side etag —
+        // CloudKit creates the record if it doesn't exist and
+        // overwrites all fields if it does. Unlike the default
+        // `.ifServerRecordUnchanged` policy, it doesn't require
+        // fetching the existing record first to get a valid etag,
+        // which means **one network roundtrip in all cases**:
+        //   • first publish from create / join → no wasted fetch
+        //   • update from heartbeat / location → no wasted fetch
+        // This is the right policy for our model where the device
+        // publishing the record is also the canonical owner of its
+        // contents — there's no concurrent writer to merge with.
         do {
-            record = try await database.record(for: recordID)
-        } catch let ckError as CKError where ckError.code == .unknownItem {
-            record = CKRecord(recordType: User.recordType, recordID: recordID)
+            let result = try await database.modifyRecords(
+                saving: [record],
+                deleting: [],
+                savePolicy: .allKeys,
+                atomically: true
+            )
+            if case .failure(let err) = result.saveResults[recordID] ?? .success(record) {
+                if let ckError = err as? CKError {
+                    throw mapCKError(ckError)
+                }
+                throw err
+            }
         } catch let ckError as CKError {
             throw mapCKError(ckError)
         }
-
-        user.writeTo(record: record, groupRecordID: groupRecordID)
-        try await save(record)
     }
 
     // MARK: - Extension flow
@@ -321,17 +397,110 @@ final class CloudKitService: CloudKitServicing {
         let memberRecordID = CKRecord.ID(recordName: memberID.uuidString)
         let groupRecordID = CKRecord.ID(recordName: groupID.uuidString)
 
+        // Read the kicked member's banHash + display name BEFORE
+        // deleting their record. Without this snapshot the banlist
+        // entry would have nothing to record. If the member record
+        // is already gone (race with another admin device), we fall
+        // through to deletion with no banlist update.
+        var capturedBan: BannedMember?
+        if let memberRecord = try? await database.record(for: memberRecordID),
+           let user = User(record: memberRecord, groupID: groupID),
+           let hash = user.banHash {
+            capturedBan = BannedMember(
+                banHash: hash,
+                displayName: user.displayName,
+                bannedAt: .now
+            )
+        }
+
         do {
             _ = try await database.deleteRecord(withID: memberRecordID)
         } catch let ckError as CKError where ckError.code == .unknownItem {
-            // Already gone — proceed to fetch the fresh group state.
+            // Already gone — proceed to write the banlist update anyway.
         } catch let ckError as CKError {
             throw mapCKError(ckError)
         }
 
-        // Refetch the group so the caller gets the post-removal state.
+        // Append to the group's banlist if we managed to snapshot the
+        // member's hash. Doing this in a separate write keeps the
+        // delete and the banlist mutation independent — if the banlist
+        // write fails, the member is still removed.
+        if let entry = capturedBan {
+            try await appendBanlistEntry(entry, on: groupRecordID)
+        }
+
         let groupRecord = try await fetchRecord(id: groupRecordID)
         return try await groupSession(from: groupRecord)
+    }
+
+    func unbanMember(banHash: String,
+                     fromGroup groupID: UUID) async throws -> GroupSession {
+        let groupRecordID = CKRecord.ID(recordName: groupID.uuidString)
+        let record = try await fetchRecord(id: groupRecordID)
+
+        var hashes = (record["bannedHashes"] as? [String]) ?? []
+        var names = (record["bannedNames"] as? [String]) ?? []
+        var dates = (record["bannedTimestamps"] as? [Date]) ?? []
+
+        // Find and excise the entry. Lengths are kept in lockstep so
+        // a future ban append doesn't desync the parallel arrays.
+        let count = min(hashes.count, names.count, dates.count)
+        var keepHashes: [String] = []
+        var keepNames: [String] = []
+        var keepDates: [Date] = []
+        for i in 0..<count where hashes[i] != banHash {
+            keepHashes.append(hashes[i])
+            keepNames.append(names[i])
+            keepDates.append(dates[i])
+        }
+        hashes = keepHashes
+        names = keepNames
+        dates = keepDates
+
+        if hashes.isEmpty {
+            record["bannedHashes"] = nil
+            record["bannedNames"] = nil
+            record["bannedTimestamps"] = nil
+        } else {
+            record["bannedHashes"] = hashes
+            record["bannedNames"] = names
+            record["bannedTimestamps"] = dates
+        }
+        try await save(record)
+        return try await groupSession(from: record)
+    }
+
+    /// Read-modify-write append on the group record's banlist arrays.
+    /// Pulled into its own helper so removeMember stays focused on the
+    /// kick flow and the parallel-array invariant lives in one place.
+    private func appendBanlistEntry(_ entry: BannedMember,
+                                    on groupRecordID: CKRecord.ID) async throws {
+        let record = try await fetchRecord(id: groupRecordID)
+
+        var hashes = (record["bannedHashes"] as? [String]) ?? []
+        var names = (record["bannedNames"] as? [String]) ?? []
+        var dates = (record["bannedTimestamps"] as? [Date]) ?? []
+
+        // Idempotent on hash — re-banning the same person doesn't
+        // duplicate them in the list.
+        guard !hashes.contains(entry.banHash) else { return }
+        hashes.append(entry.banHash)
+        names.append(entry.displayName)
+        dates.append(entry.bannedAt)
+
+        record["bannedHashes"] = hashes
+        record["bannedNames"] = names
+        record["bannedTimestamps"] = dates
+        try await save(record)
+    }
+
+    func cloudUserID() async -> String? {
+        do {
+            let id = try await container.userRecordID()
+            return id.recordName
+        } catch {
+            return nil
+        }
     }
 
     // MARK: - Account preflight
@@ -372,7 +541,12 @@ final class CloudKitService: CloudKitServicing {
 
     private func fetchMembers(groupRecordID: CKRecord.ID,
                               groupID: UUID) async throws -> [User] {
-        let groupRef = CKRecord.Reference(recordID: groupRecordID, action: .deleteSelf)
+        // Predicate references use `.none` action — we're matching by
+        // recordID equality, not asking for a cascade behavior. Some
+        // predicate paths in CloudKit are picky about action values
+        // not matching the original write, so keeping reads neutral
+        // avoids subtle "no results" failures.
+        let groupRef = CKRecord.Reference(recordID: groupRecordID, action: .none)
         let predicate = NSPredicate(format: "groupID == %@", groupRef)
         let query = CKQuery(recordType: User.recordType, predicate: predicate)
 
@@ -403,14 +577,35 @@ final class CloudKitService: CloudKitServicing {
         case .unknownItem:
             return GroupServiceError.groupNotFound
         case .invalidArguments:
-            // CloudKit returns this when the field isn't marked queryable.
-            if error.localizedDescription.lowercased().contains("queryable") {
-                return CloudKitError.schemaIncomplete
+            // CloudKit returns invalidArguments for both "field not
+            // queryable" and "field type mismatch." Pull the field name
+            // out of the description so the user sees actionable copy
+            // rather than the generic 12.
+            let desc = error.localizedDescription
+            if desc.lowercased().contains("queryable")
+                || desc.lowercased().contains("not marked") {
+                return CloudKitError.schemaIncomplete(field: extractFieldName(from: desc))
             }
             return CloudKitError.other(error)
         default:
             return CloudKitError.other(error)
         }
+    }
+
+    /// Best-effort scrape for a backtick-quoted or single-quoted field
+    /// name in a CloudKit error description. Returns nil if no field
+    /// can be identified — the caller falls back to a generic message.
+    private func extractFieldName(from description: String) -> String? {
+        // CloudKit phrases vary: "Field 'groupID' is not queryable",
+        // "field `inviteCode` is not marked indexable", etc.
+        for delimiter in ["'", "`", "\""] {
+            let parts = description.components(separatedBy: delimiter)
+            // Pattern: prefix, fieldName, suffix → at least 3 parts.
+            if parts.count >= 3, !parts[1].isEmpty, parts[1].count < 50 {
+                return parts[1]
+            }
+        }
+        return nil
     }
 
     // MARK: - Invite codes

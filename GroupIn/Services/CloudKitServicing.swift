@@ -78,12 +78,26 @@ protocol CloudKitServicing: AnyObject {
     func deleteGroup(groupID: UUID) async throws
 
     /// Owner kicks a single member out of the group. The member's
-    /// record is deleted server-side; their device still has the group
-    /// in local storage until it next refreshes (or the owner's update
-    /// pushes through). Returns the freshly-fetched group so the UI
-    /// can reconcile immediately.
+    /// record is deleted server-side and their `banHash` is appended
+    /// to the group's banlist so they can't rejoin with the same
+    /// invite code. Returns the freshly-fetched group so the UI can
+    /// reconcile immediately.
     func removeMember(memberID: UUID,
                       fromGroup groupID: UUID) async throws -> GroupSession
+
+    /// Owner reverses a ban. The entry is removed from the group's
+    /// banlist; the previously-banned user can now rejoin with the
+    /// invite code as if they'd never been removed.
+    func unbanMember(banHash: String,
+                     fromGroup groupID: UUID) async throws -> GroupSession
+
+    /// Stable, anonymous identifier for the local user — `recordName`
+    /// of `CKContainer.userRecordID()` for the CloudKit backend, or a
+    /// per-install UUID for the local stub. Used to compute the
+    /// per-group ban hash. Returns nil if the user isn't signed into
+    /// iCloud (or the backend is offline) — callers should treat that
+    /// as "ban enforcement unavailable" and degrade gracefully.
+    func cloudUserID() async -> String?
 
     /// Quick health check the app does at launch (and again whenever the
     /// system fires `CKAccountChanged`). Returns the user-visible state

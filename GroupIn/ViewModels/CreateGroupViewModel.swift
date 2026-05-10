@@ -83,7 +83,7 @@ final class CreateGroupViewModel {
 
         do {
             let service = appState.groupService
-            let me = appState.makeMembership()
+            var me = appState.makeMembership()
             let expiresAt = resolvedExpiry
 
             let group = try await service.createGroup(
@@ -92,8 +92,18 @@ final class CreateGroupViewModel {
                 ownerID: me.id,
                 expiresAt: expiresAt
             )
-            try await service.publish(user: me, in: group)
+            // Stamp the per-group ban hash now that we know the
+            // invite code. Persisting it on the User record means
+            // the owner has it on hand for their own future removal
+            // operations (the owner can't ban themselves, but the
+            // schema is uniform across roles).
+            me = appState.stampBanHash(me, for: group)
 
+            // Navigate immediately — the publish runs in the
+            // background so the user doesn't sit on the create form
+            // waiting for the third network roundtrip. Heartbeat
+            // re-publishes within ~20 s if the initial write loses
+            // a race, so members in the cloud see the owner reliably.
             var withCreator = group
             withCreator.members.append(me)
 
@@ -102,6 +112,10 @@ final class CreateGroupViewModel {
             appState.currentUser = me
             appState.currentGroup = withCreator
             appState.path.append(.groupDashboard(groupID: withCreator.id))
+
+            Task { [service, me, withCreator] in
+                try? await service.publish(user: me, in: withCreator)
+            }
 
             // Fire the permission prompt + schedule T-30 reminder.
             // Detached so navigation isn't blocked by the system prompt.

@@ -134,8 +134,12 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private static let advertiseToggleInterval: TimeInterval = 4
 
     /// Peripherals we've called `connect()` on but haven't yet seen
-    /// `didConnect`. Keyed by `peripheral.identifier`.
-    private var connectingPeers: Set<UUID> = []
+    /// `didConnect`. Stored as a dict (not a Set of IDs) so we hold a
+    /// strong reference to each `CBPeripheral` during the connection
+    /// attempt — without it, iOS prints "API MISUSE: Cancelling
+    /// connection for unused peripheral" and can drop the link
+    /// before `didConnect` fires.
+    private var connectingPeers: [UUID: CBPeripheral] = [:]
 
     /// Peripherals with established connections we're keeping open.
     /// Strong reference holds them so iOS doesn't drop the link.
@@ -393,16 +397,18 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private func considerConnect(to peripheral: CBPeripheral) {
         guard activeGroupHash != nil else { return }
         let id = peripheral.identifier
-        if connectingPeers.contains(id) || connectedPeers[id] != nil { return }
+        if connectingPeers[id] != nil || connectedPeers[id] != nil { return }
 
-        connectingPeers.insert(id)
+        // Hold a strong reference to the peripheral while connect()
+        // is in flight — iOS otherwise drops the connection.
+        connectingPeers[id] = peripheral
         peripheral.delegate = self
         centralManager.connect(peripheral, options: nil)
     }
 
     private func cleanupPeer(_ peripheral: CBPeripheral) {
         let id = peripheral.identifier
-        connectingPeers.remove(id)
+        connectingPeers.removeValue(forKey: id)
         connectedPeers.removeValue(forKey: id)
         // Don't remove the peripheral→member mapping here; we want to
         // keep emitting RSSI for that member if their iBeacon advert is
@@ -462,7 +468,7 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let id = peripheral.identifier
-            self.connectingPeers.remove(id)
+            self.connectingPeers.removeValue(forKey: id)
             self.connectedPeers[id] = peripheral
             peripheral.discoverServices([Self.serviceUUID])
         }

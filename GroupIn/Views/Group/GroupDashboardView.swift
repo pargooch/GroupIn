@@ -62,7 +62,18 @@ struct GroupDashboardView: View {
                     Task { await appState.removeMember(id) }
                 }
             } message: { _ in
-                Text("They'll lose access to this group. They can rejoin if they still have the invite code.")
+                Text("They'll be removed from this group and added to the banlist — they can't rejoin with the invite code unless you unban them.")
+            }
+            .alert(
+                "You were removed from \(appState.bannedFromGroupName ?? "the group")",
+                isPresented: Binding(
+                    get: { appState.bannedFromGroupName != nil },
+                    set: { if !$0 { appState.bannedFromGroupName = nil } }
+                )
+            ) {
+                Button("OK") { appState.bannedFromGroupName = nil }
+            } message: {
+                Text("The group owner removed you. Ask them to invite you again if you'd like to rejoin.")
             }
     }
 
@@ -92,8 +103,19 @@ struct GroupDashboardView: View {
             expirySection(group: group)
             groupSection(group: group)
             membersSection(group: group)
+            if viewModel.isOwner {
+                bannedSection(group: group)
+            }
             messagesSection
             safetySection
+        }
+        // Pull-to-refresh — forces a CloudKit fetch on demand so the
+        // user doesn't have to wait for the 10s polling tick or a
+        // silent-push delivery. Especially useful when CloudKit
+        // subscriptions are delayed (which they often are on first
+        // launch after a schema change).
+        .refreshable {
+            await appState.refreshCurrentGroupManually()
         }
     }
 
@@ -220,6 +242,67 @@ struct GroupDashboardView: View {
                 .background(.thickMaterial, in: Circle())
         }
         .accessibilityLabel("Fit all members on map")
+    }
+
+    /// Owner-only banlist UI. Hidden when the group has no banned
+    /// members so the dashboard doesn't carry empty sections. Each
+    /// row offers an Unban button that re-opens the group to the
+    /// previously-removed person.
+    @ViewBuilder
+    private func bannedSection(group: GroupSession) -> some View {
+        if !group.bannedMembers.isEmpty {
+            Section {
+                ForEach(group.bannedMembers) { entry in
+                    bannedRow(entry)
+                }
+            } header: {
+                Text("Banned (\(group.bannedMembers.count))")
+            } footer: {
+                Text("Banned members can't rejoin with the invite code. Tap Unban to let them back in.")
+                    .font(.caption)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func bannedRow(_ entry: BannedMember) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color.gray.opacity(0.2))
+                    .frame(width: 36, height: 36)
+                Image(systemName: "person.fill.xmark")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.displayName)
+                    .font(.body.weight(.medium))
+                Text("Banned \(entry.bannedAt, style: .relative) ago")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                let hash = entry.banHash
+                Task { await appState.unbanMember(banHash: hash) }
+            } label: {
+                Text("Unban")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.tint)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Unban \(entry.displayName)")
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(entry.displayName), banned \(entry.bannedAt, style: .relative) ago")
     }
 
     @ViewBuilder

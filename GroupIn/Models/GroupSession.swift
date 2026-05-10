@@ -24,6 +24,11 @@ struct GroupSession: Identifiable, Hashable, Codable {
     let ownerID: UUID
     var expiresAt: Date
     var pendingExtension: PendingExtension?
+    /// Owner-managed banlist. Stored as a list of `BannedMember`
+    /// entries so the dashboard can show "Alice (banned 2 days ago)"
+    /// without leaking any cross-group identity. New groups default
+    /// to empty and old persisted/CloudKit records decode safely.
+    var bannedMembers: [BannedMember]
 
     init(id: UUID = UUID(),
          name: String,
@@ -33,7 +38,8 @@ struct GroupSession: Identifiable, Hashable, Codable {
          expiresAt: Date,
          createdAt: Date = .now,
          members: [User] = [],
-         pendingExtension: PendingExtension? = nil) {
+         pendingExtension: PendingExtension? = nil,
+         bannedMembers: [BannedMember] = []) {
         self.id = id
         self.name = name
         self.inviteCode = inviteCode
@@ -43,10 +49,11 @@ struct GroupSession: Identifiable, Hashable, Codable {
         self.createdAt = createdAt
         self.members = members
         self.pendingExtension = pendingExtension
+        self.bannedMembers = bannedMembers
     }
 
-    /// Custom decoder so old persisted groups (no `category` field) decode
-    /// gracefully as `.other`.
+    /// Custom decoder so old persisted groups (no `category` /
+    /// `bannedMembers` fields) decode gracefully with sensible defaults.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decode(UUID.self, forKey: .id)
@@ -58,6 +65,7 @@ struct GroupSession: Identifiable, Hashable, Codable {
         self.ownerID = try c.decode(UUID.self, forKey: .ownerID)
         self.expiresAt = try c.decode(Date.self, forKey: .expiresAt)
         self.pendingExtension = try? c.decode(PendingExtension.self, forKey: .pendingExtension)
+        self.bannedMembers = (try? c.decode([BannedMember].self, forKey: .bannedMembers)) ?? []
     }
 
     var isExpired: Bool { expiresAt <= .now }

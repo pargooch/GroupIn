@@ -40,6 +40,22 @@ extension GroupSession {
         let category = (record["category"] as? String)
             .flatMap(GroupCategory.init(rawValue:)) ?? .other
 
+        // Banlist is stored as three parallel arrays so the schema
+        // stays in CloudKit primitives. Decoder is defensive: missing
+        // arrays = empty banlist; mismatched lengths fall back to the
+        // shortest array so we never read past an index.
+        let banHashes = (record["bannedHashes"] as? [String]) ?? []
+        let banNames = (record["bannedNames"] as? [String]) ?? []
+        let banDates = (record["bannedTimestamps"] as? [Date]) ?? []
+        let banCount = min(banHashes.count, banNames.count, banDates.count)
+        let bannedMembers: [BannedMember] = (0..<banCount).map { i in
+            BannedMember(
+                banHash: banHashes[i],
+                displayName: banNames[i],
+                bannedAt: banDates[i]
+            )
+        }
+
         self.init(id: id,
                   name: name,
                   inviteCode: inviteCode,
@@ -48,7 +64,8 @@ extension GroupSession {
                   expiresAt: expiresAt,
                   createdAt: createdAt,
                   members: [],
-                  pendingExtension: pending)
+                  pendingExtension: pending,
+                  bannedMembers: bannedMembers)
     }
 
     /// Mutates the record's fields. Caller is responsible for `database.save`.
@@ -68,6 +85,18 @@ extension GroupSession {
             record["pendingNewExpiresAt"] = nil
             record["pendingProposedAt"] = nil
             record["pendingAcceptedMemberIDs"] = nil
+        }
+        // Banlist round-trip: same parallel-arrays shape the decoder
+        // expects. Empty banlist clears all three fields to nil so the
+        // record doesn't accumulate stale data.
+        if bannedMembers.isEmpty {
+            record["bannedHashes"] = nil
+            record["bannedNames"] = nil
+            record["bannedTimestamps"] = nil
+        } else {
+            record["bannedHashes"] = bannedMembers.map(\.banHash)
+            record["bannedNames"] = bannedMembers.map(\.displayName)
+            record["bannedTimestamps"] = bannedMembers.map(\.bannedAt)
         }
     }
 }
@@ -92,6 +121,7 @@ extension User {
         let avatarData = record["avatarData"] as? Data
         let heading = record["heading"] as? Double
         let nearbyToken = record["nearbyToken"] as? Data
+        let banHash = record["banHash"] as? String
 
         self.init(id: id,
                   displayName: displayName,
@@ -99,7 +129,8 @@ extension User {
                   lastSeen: lastSeen,
                   coordinate: coordinate,
                   heading: heading,
-                  nearbyToken: nearbyToken)
+                  nearbyToken: nearbyToken,
+                  banHash: banHash)
     }
 
     /// Mutates the record's fields. Caller is responsible for `database.save`.
@@ -120,5 +151,6 @@ extension User {
         }
         record["heading"] = heading
         record["nearbyToken"] = nearbyToken
+        record["banHash"] = banHash
     }
 }

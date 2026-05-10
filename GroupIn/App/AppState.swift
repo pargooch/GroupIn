@@ -116,6 +116,19 @@ final class AppState {
     /// refresh at launch and on every CKAccountChanged broadcast.
     var iCloudAccountStatus: ICloudAccountStatus = .couldNotDetermine
 
+    /// Cached anonymous identifier for the local user — `recordName`
+    /// of `CKContainer.userRecordID()` for the CloudKit backend, or a
+    /// per-install UUID for the local stub. Populated asynchronously
+    /// at launch; nil until the first fetch succeeds. Used purely as
+    /// the salt input for `BanHash.compute(...)`.
+    private(set) var localCloudUserID: String?
+
+    /// Set when the active group's refresh notices our `banHash` in
+    /// its `bannedMembers`. The dashboard's modifier surfaces an alert
+    /// + dismisses the screen so the user lands back on Home with a
+    /// clear explanation. Cleared after the alert is acknowledged.
+    var bannedFromGroupName: String?
+
     /// True when the device has internet (any path satisfied).
     /// Driven by NWPathMonitor.
     var isOnline: Bool = true
@@ -245,6 +258,7 @@ final class AppState {
         startPushHandler()
         startICloudAccountMonitor()
         startBLEDiagnosticsMonitor()
+        loadLocalCloudUserID()
 
         // didSet doesn't fire during init, so if we restored a group from
         // persistence, kick off location explicitly. The user comes back
@@ -448,14 +462,59 @@ final class AppState {
     /// pushes. AppDelegate yields each one to a static AsyncStream and
     /// we consume it here, refreshing the active group so the existing
     /// newest-wins merge surfaces the new data.
+    ///
+    /// Why two refreshes per push: CKQuerySubscription fires on record
+    /// *creation*, which can beat the public-DB *index* by 1–3 seconds.
+    /// The first refresh sometimes returns stale results that miss the
+    /// just-arrived record. A second refresh a few seconds later picks
+    /// up records the index has finished propagating. Cheap insurance
+    /// against the most common "I got the notification but the member
+    /// isn't on my screen" symptom.
     private func startPushHandler() {
         guard pushTask == nil else { return }
         pushTask = Task { [weak self] in
             for await _ in AppDelegate.pushStream {
                 guard let self else { return }
                 await self.refreshCurrentGroup()
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled else { return }
+                await self.refreshCurrentGroup()
             }
         }
+    }
+
+    // MARK: - Identity
+
+    /// One-shot fetch of the backend's stable identifier for this user.
+    /// Cached in `localCloudUserID` and used as the salt input for the
+    /// per-group ban hash. Re-fetched after CKAccountChanged in case
+    /// the user switched iCloud accounts.
+    private func loadLocalCloudUserID() {
+        Task { [weak self] in
+            guard let self else { return }
+            let id = await self.groupService.cloudUserID()
+            self.localCloudUserID = id
+        }
+    }
+
+    /// SHA-256 hash for the local user against a given invite code.
+    /// Returns nil if we don't yet have a cached cloud ID — callers
+    /// must treat that as "ban enforcement unavailable for this
+    /// session" and degrade gracefully (don't silently let banned
+    /// users back in; instead refuse to join until the ID resolves).
+    func localBanHash(forInviteCode inviteCode: String) -> String? {
+        guard let cloudID = localCloudUserID else { return nil }
+        return BanHash.compute(cloudUserID: cloudID, inviteCode: inviteCode)
+    }
+
+    /// True if the local user's hash appears in the given group's
+    /// banlist. Used by the join flow (pre-publish gate) and by
+    /// `refreshCurrentGroup` (detect that we've been kicked).
+    func isLocalUserBanned(from group: GroupSession) -> Bool {
+        guard let myHash = localBanHash(forInviteCode: group.inviteCode) else {
+            return false
+        }
+        return group.bannedMembers.contains(where: { $0.banHash == myHash })
     }
 
     /// Refresh the iCloud account status now and again every time the
@@ -482,6 +541,12 @@ final class AppState {
                 guard let self else { return }
                 let status = await self.groupService.iCloudAccountStatus()
                 self.iCloudAccountStatus = status
+                // Account switch invalidates the cached cloud ID — the
+                // user's hash for any active group is now wrong. Drop
+                // the cache and refetch so subsequent ban checks use
+                // the right identity.
+                self.localCloudUserID = nil
+                self.loadLocalCloudUserID()
             }
         }
     }
@@ -545,6 +610,19 @@ final class AppState {
 
     func registerMembership(groupID: UUID, memberID: UUID) {
         membershipByGroupID[groupID] = memberID
+    }
+
+    /// Returns a copy of `user` with the per-group ban hash stamped
+    /// in. Called from create / join flows just before publishing the
+    /// user record, so the owner has the hash on hand if they later
+    /// remove this member. If we don't yet have a cached cloud ID
+    /// (offline, signed out), the hash stays nil — the local user
+    /// can still participate, they just can't be banned, which is
+    /// also true if they reinstall later, so this is consistent.
+    func stampBanHash(_ user: User, for group: GroupSession) -> User {
+        var copy = user
+        copy.banHash = localBanHash(forInviteCode: group.inviteCode)
+        return copy
     }
 
     private func propagateProfileToMemberships() {
@@ -651,6 +729,23 @@ final class AppState {
         } catch {
             // Silent fail — next refresh will reconcile if the delete
             // actually went through but the fetch errored.
+        }
+    }
+
+    /// Owner-only unban. Reverses a previous removal so the named
+    /// person can rejoin with the invite code. Like `removeMember`,
+    /// double-checks ownership defensively.
+    func unbanMember(banHash: String) async {
+        guard let group = currentGroup,
+              group.ownerID == currentUser.id else { return }
+        do {
+            let updated = try await groupService.unbanMember(
+                banHash: banHash, fromGroup: group.id
+            )
+            currentGroup = updated
+            addOrUpdate(group: updated)
+        } catch {
+            // Silent retry next refresh.
         }
     }
 
@@ -930,11 +1025,30 @@ final class AppState {
         groupRefreshTask = nil
     }
 
+    /// Public manual-refresh entry point. Triggered by pull-to-refresh
+    /// on the dashboard so the user has a way to force a fetch when
+    /// the silent-push subscription is delayed or stuck. Returns when
+    /// the refresh completes so SwiftUI's `.refreshable` can reset its
+    /// progress indicator at the right moment.
+    func refreshCurrentGroupManually() async {
+        await refreshCurrentGroup()
+    }
+
     private func refreshCurrentGroup() async {
         guard let active = currentGroup else { return }
         do {
             guard var updated = try await groupService.fetchGroup(groupID: active.id) else {
                 // Server-side gone — let the expiry monitor handle removal.
+                return
+            }
+            // Detect post-removal: if the owner kicked us, our banHash
+            // is now in the banlist on the server. Tear down local
+            // group state and surface the alert via the dashboard
+            // modifier so the user understands why they're back home.
+            if isLocalUserBanned(from: updated) {
+                let groupName = updated.name
+                remove(group: updated)
+                bannedFromGroupName = groupName
                 return
             }
             // Newest-wins merge per member. Without this, an offline peer's
@@ -951,13 +1065,42 @@ final class AppState {
                     recordTransport(.cloud, for: cloudMember.id)
                 }
             }
-            // Self entry: prefer the live `currentUser` if it's newer than
-            // either cloud or the active cached copy.
-            if let myID = membershipByGroupID[updated.id],
-               let myIdx = updated.members.firstIndex(where: { $0.id == myID }),
-               currentUser.lastSeen >= updated.members[myIdx].lastSeen {
-                updated.members[myIdx] = currentUser
+            // Self entry: prefer the live `currentUser` if it's newer
+            // than either cloud or the active cached copy. If the cloud
+            // query missed us entirely (indexing delay right after
+            // join), append our own record so we don't vanish from
+            // our own group view on the post-join refresh tick.
+            if let myID = membershipByGroupID[updated.id] {
+                if let myIdx = updated.members.firstIndex(where: { $0.id == myID }) {
+                    if currentUser.lastSeen >= updated.members[myIdx].lastSeen {
+                        updated.members[myIdx] = currentUser
+                    }
+                } else {
+                    updated.members.append(currentUser)
+                }
             }
+
+            // Indexing-delay safety net: re-add any local members the
+            // cloud query missed, UNLESS they've been banned (signal
+            // they're intentionally removed). CloudKit's public-DB
+            // index updates a few seconds behind writes, so a refresh
+            // fired by a silent push can return stale results. Without
+            // this merge, every member would briefly disappear from
+            // every other member's screen the moment a new join arrives.
+            // The merge is conservative — only members with a recent
+            // `lastSeen` survive (60s), so genuinely-removed members
+            // (record deleted server-side) aren't resurrected forever.
+            let cloudIDs = Set(updated.members.map(\.id))
+            let bannedHashes = Set(updated.bannedMembers.map(\.banHash))
+            let staleCutoff = Date().addingTimeInterval(-60)
+            for localMember in active.members where !cloudIDs.contains(localMember.id) {
+                if let hash = localMember.banHash, bannedHashes.contains(hash) {
+                    continue
+                }
+                guard localMember.lastSeen > staleCutoff else { continue }
+                updated.members.append(localMember)
+            }
+
             currentGroup = updated
             addOrUpdate(group: updated)
         } catch {
