@@ -2,13 +2,21 @@
 //  CompassView.swift
 //  GroupIn
 //
-//  Full-screen "Finding X" experience. Big rotating arrow that points
-//  from your current location toward the chosen member, smoothed by your
-//  phone's heading so the arrow stays alive between location updates.
+//  Full-screen "Finding X" experience. A neon, wearable-inspired
+//  directional compass:
 //
-//  v1 uses position-to-position bearing (great accuracy when both phones
-//  have a fresh GPS fix). RSSI-gradient fallback for offline / stale-GPS
-//  cases is the next iteration.
+//    • A glowing circular orb in the center holding a thin-line
+//      geometric gemstone glyph (cyan-blue, like a reactor core).
+//    • A ring of 24 small dots orbiting the orb, illuminated by
+//      proximity to the friend's bearing — the closest dot to the
+//      direction glows brightest, neighbours fade off via cosine
+//      falloff.
+//    • Friend avatar floating above the orb in their assigned
+//      member color, distance + transport mode badge below.
+//
+//  Data sources are unchanged from the previous iteration —
+//  `arrowReading()` still resolves UWB → GPS → BLE-gradient in
+//  that priority order. Only the visual layer is new.
 //
 
 import SwiftUI
@@ -18,138 +26,184 @@ struct CompassView: View {
     let memberID: UUID
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Cyan-blue tone used for the orb ring + diamond gem. Fixed
+    /// across all members — it's the "GroupIn brand" element of the
+    /// compass. Per-member color is used for the dot ring and the
+    /// surrounding accents so each friend's compass still feels
+    /// theirs.
+    private static let orbAccent = Color(
+        red: 0.30, green: 0.92, blue: 1.00  // ~#4DEBFF — electric cyan
+    )
 
     var body: some View {
         let member = currentMember
         let memberColor = Color.memberColor(for: memberID)
+        let reading = arrowReading()
 
         ZStack {
             backdrop(color: memberColor)
 
-            VStack(spacing: 28) {
+            VStack(spacing: 0) {
                 header(member: member, color: memberColor)
                     .padding(.top, 32)
 
                 Spacer(minLength: 12)
 
-                if let arrow = arrowReading() {
-                    arrowDisplay(reading: arrow, color: memberColor, member: member)
+                if let reading {
+                    compassDial(reading: reading, memberColor: memberColor)
+                        .frame(width: 320, height: 320)
                 } else {
                     waitingState(member: member)
+                        .frame(width: 320, height: 320)
                 }
 
-                Spacer(minLength: 12)
+                Spacer(minLength: 8)
 
-                Button {
-                    dismiss()
-                } label: {
-                    Text("Done")
-                        .font(.body.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
-                        .foregroundStyle(.white)
+                if let reading {
+                    distanceBlock(reading: reading, color: memberColor, member: member)
+                        .padding(.bottom, 8)
                 }
-                .padding(.horizontal)
-                .padding(.bottom, 32)
+
+                doneButton
+                    .padding(.horizontal, 32)
+                    .padding(.bottom, 32)
             }
         }
         .preferredColorScheme(.dark)
-        .onAppear {
-            // Kicks off NI session, publishes our token, attempts to
-            // open a peer session if the target's token is known.
-            // Bidirectional UWB only activates if the peer ALSO opens
-            // their compass against us — graceful degradation otherwise.
-            appState.startUWBTracking(targetMemberID: memberID)
-        }
-        .onDisappear {
-            appState.stopUWBTracking()
-        }
+        .onAppear { appState.startUWBTracking(targetMemberID: memberID) }
+        .onDisappear { appState.stopUWBTracking() }
     }
 
-    // MARK: - Subviews
+    // MARK: - Backdrop
 
     @ViewBuilder
     private func backdrop(color: Color) -> some View {
         ZStack {
-            Color.black
+            // Near-black base. A pure-black bg makes the neon glow
+            // feel sharp; the radial wash on top adds depth.
+            Color(red: 0.02, green: 0.02, blue: 0.04)
             RadialGradient(
-                colors: [color.opacity(0.35), color.opacity(0.0)],
-                center: .top,
-                startRadius: 60,
-                endRadius: 600
+                colors: [
+                    color.opacity(0.18),
+                    color.opacity(0.05),
+                    .clear
+                ],
+                center: .center,
+                startRadius: 50,
+                endRadius: 500
+            )
+            // Faint cyan vignette top-down — reinforces the "reactor"
+            // feel even before the orb appears.
+            LinearGradient(
+                colors: [
+                    Self.orbAccent.opacity(0.08),
+                    .clear
+                ],
+                startPoint: .top,
+                endPoint: .center
             )
         }
         .ignoresSafeArea()
     }
 
+    // MARK: - Header
+
     @ViewBuilder
     private func header(member: User?, color: Color) -> some View {
         VStack(spacing: 10) {
-            AvatarView(
-                data: member?.avatarData,
-                name: member?.displayName ?? "?",
-                size: 72,
-                tint: color
-            )
-            Text("Finding \(member?.displayName ?? "member")")
+            ZStack {
+                Circle()
+                    .fill(color.opacity(0.15))
+                    .frame(width: 76, height: 76)
+                    .blur(radius: 12)
+                AvatarView(
+                    data: member?.avatarData,
+                    name: member?.displayName ?? "?",
+                    size: 56,
+                    tint: color
+                )
+                .overlay(
+                    Circle()
+                        .strokeBorder(color.opacity(0.6), lineWidth: 1)
+                )
+            }
+            Text(member?.displayName ?? "Member")
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.white)
+                .shadow(color: color.opacity(0.4), radius: 8)
         }
     }
 
+    // MARK: - Compass dial
+
     @ViewBuilder
-    private func arrowDisplay(reading: ArrowReading,
-                              color: Color,
-                              member: User?) -> some View {
-        // In gradient mode the arrow opacity reflects confidence so the
-        // user gets a visual cue when we're still locking on. GPS mode
-        // is always full opacity.
-        let arrowOpacity: Double = reading.mode == .gps
-            ? 1.0
-            : (0.35 + 0.65 * reading.confidence)
+    private func compassDial(reading: ArrowReading,
+                             memberColor: Color) -> some View {
+        ZStack {
+            // 1. Direction ring — one continuous circle. A dim base
+            //    runs all the way around in the member's color, and a
+            //    bright arc lights up the portion pointing at the
+            //    friend. The arc is rendered via an AngularGradient
+            //    rotated so the gradient's brightest point sits at
+            //    the bearing.
+            DirectionRing(
+                bearing: reading.phoneFrameBearing,
+                color: memberColor,
+                proximity: proximity(for: reading.distanceBand),
+                reduceMotion: reduceMotion
+            )
+            // 2. Standalone diamond gem — no surrounding orb / no
+            //    concentric circles. Just the gemstone glyph, glowing.
+            DiamondGem(
+                color: memberColor,
+                confidence: reading.confidence,
+                proximity: proximity(for: reading.distanceBand),
+                reduceMotion: reduceMotion
+            )
+        }
+        .animation(.smooth(duration: 0.4), value: reading.phoneFrameBearing)
+    }
 
-        VStack(spacing: 24) {
-            ZStack {
-                Circle()
-                    .stroke(color.opacity(0.25), lineWidth: 1)
-                    .frame(width: 280, height: 280)
-                Circle()
-                    .stroke(color.opacity(0.15), lineWidth: 1)
-                    .frame(width: 200, height: 200)
+    /// Maps the textual `distanceBand` ("Close" / "Nearby" / etc.) onto
+    /// a 0–1 proximity value the dot ring + orb pulse can scale to.
+    /// Centralizing here keeps the visual response monotonic with the
+    /// existing band labels.
+    private func proximity(for band: String) -> Double {
+        switch band {
+        case "Right here":   return 1.00
+        case "Close":        return 0.85
+        case "Nearby":       return 0.55
+        case "Further off":  return 0.30
+        case "Far away":     return 0.15
+        default:             return 0.40
+        }
+    }
 
-                Image(systemName: "location.north.fill")
-                    .font(.system(size: 180, weight: .bold))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [color, color.opacity(0.7)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .shadow(color: color.opacity(0.6), radius: 24, x: 0, y: 0)
-                    .rotationEffect(.degrees(reading.phoneFrameBearing))
-                    .animation(.smooth(duration: 0.4), value: reading.phoneFrameBearing)
-                    .opacity(arrowOpacity)
+    // MARK: - Distance block
+
+    @ViewBuilder
+    private func distanceBlock(reading: ArrowReading,
+                               color: Color,
+                               member: User?) -> some View {
+        VStack(spacing: 10) {
+            Text(reading.distanceBand)
+                .font(.system(size: 36, weight: .light, design: .rounded))
+                .foregroundStyle(.white)
+                .shadow(color: color.opacity(0.6), radius: 18)
+
+            modeBadge(reading: reading, color: color)
+
+            if let member, !reading.isFresh, reading.mode == .gps {
+                Text("Last seen \(member.lastSeen.formatted(.relative(presentation: .named)))")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.5))
             }
-
-            VStack(spacing: 8) {
-                Text(reading.distanceBand)
-                    .font(.title.weight(.semibold))
-                    .foregroundStyle(.white)
-
-                modeBadge(reading: reading, color: color)
-
-                if let member, !reading.isFresh, reading.mode == .gps {
-                    Text("Last seen \(member.lastSeen.formatted(.relative(presentation: .named)))")
-                        .font(.callout)
-                        .foregroundStyle(.white.opacity(0.6))
-                }
-                if reading.mode == .bluetooth, reading.confidence < 0.4 {
-                    Text("Walk a few steps to lock on")
-                        .font(.callout)
-                        .foregroundStyle(.white.opacity(0.6))
-                }
+            if reading.mode == .bluetooth, reading.confidence < 0.4 {
+                Text("Walk a few steps to lock on")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.5))
             }
         }
     }
@@ -158,9 +212,9 @@ struct CompassView: View {
     private func modeBadge(reading: ArrowReading, color: Color) -> some View {
         let (icon, label): (String, String) = {
             switch reading.mode {
-            case .uwb:       return ("dot.radiowaves.up.forward", "via UWB")
-            case .gps:       return ("location.fill", "via GPS")
-            case .bluetooth: return ("antenna.radiowaves.left.and.right", "via Bluetooth")
+            case .uwb:       return ("dot.radiowaves.up.forward", "UWB")
+            case .gps:       return ("location.fill", "GPS")
+            case .bluetooth: return ("antenna.radiowaves.left.and.right", "Bluetooth")
             }
         }()
         HStack(spacing: 6) {
@@ -168,33 +222,64 @@ struct CompassView: View {
                 .font(.caption2.weight(.semibold))
             Text(label)
                 .font(.caption.weight(.medium))
+                .tracking(0.8)
+                .textCase(.uppercase)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .padding(.vertical, 5)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(color.opacity(0.4), lineWidth: 1))
+        .background(
+            Capsule().fill(.ultraThinMaterial)
+        )
+        .overlay(
+            Capsule().strokeBorder(color.opacity(0.5), lineWidth: 1)
+        )
         .foregroundStyle(.white)
+        .shadow(color: color.opacity(0.3), radius: 6)
     }
+
+    // MARK: - Waiting state
 
     @ViewBuilder
     private func waitingState(member: User?) -> some View {
         VStack(spacing: 18) {
-            Image(systemName: "location.slash")
-                .font(.system(size: 80))
-                .foregroundStyle(.white.opacity(0.5))
-            Text("Need a location fix from both of you")
+            ZStack {
+                Circle()
+                    .strokeBorder(Self.orbAccent.opacity(0.4), lineWidth: 1)
+                    .frame(width: 200, height: 200)
+                Image(systemName: "location.slash")
+                    .font(.system(size: 56))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
+            Text("Locking on")
                 .font(.title3.weight(.medium))
                 .foregroundStyle(.white)
-                .multilineTextAlignment(.center)
-            Text("Make sure you and \(member?.displayName ?? "this member") both have GPS active. The arrow appears when locations are flowing.")
-                .font(.callout)
-                .foregroundStyle(.white.opacity(0.65))
+            Text("Need a fix from both of you. Make sure \(member?.displayName ?? "this member") has GroupIn open.")
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.55))
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 24)
         }
     }
 
-    // MARK: - Math
+    // MARK: - Done button
+
+    @ViewBuilder
+    private var doneButton: some View {
+        Button { dismiss() } label: {
+            Text("Done")
+                .font(.body.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(Self.orbAccent.opacity(0.2), lineWidth: 1)
+                )
+                .foregroundStyle(.white)
+        }
+    }
+
+    // MARK: - Math (unchanged from prior version)
 
     private enum CompassMode {
         case uwb         // NearbyInteraction — centimeter-accurate bearing + distance
@@ -315,6 +400,213 @@ struct CompassView: View {
         }
     }
 }
+
+// MARK: - Direction ring
+
+/// One continuous circular ring with two clearly-distinct visual
+/// layers. The eye locks onto direction instantly because there's
+/// no soft fade — only a *discrete* bright arc against a dimmer
+/// base ring:
+///
+///   • **Base ring** — always-visible 1.5pt stroke at ~35% opacity,
+///     showing the full circumference so the user has the whole
+///     "compass dial" as visual context.
+///   • **Bright arc** — 60°-wide segment with rounded caps, much
+///     thicker (5pt), much brighter (full color + bloom). Rotated
+///     so the arc's *center* sits exactly at the bearing direction.
+///
+/// Contrast does the work: thin/medium vs thick/bright, with a
+/// sharp edge between them. No gradient fade.
+private struct DirectionRing: View {
+    let bearing: Double         // degrees clockwise from up
+    let color: Color            // per-member accent
+    let proximity: Double       // 0–1; tempo + brightness scaling
+    let reduceMotion: Bool
+
+    private static let ringDiameter: CGFloat = 282
+    /// Width of the bright arc in degrees. 60° = roughly a sixth of
+    /// the circle — wide enough to read at a glance, narrow enough
+    /// to point unambiguously.
+    private static let arcSpanDegrees: Double = 60
+
+    var body: some View {
+        // Breathing on the arc's brightness only. Tempo accelerates
+        // with proximity, so a friend in the same room feels alive.
+        TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1.0 / 30,
+                                paused: reduceMotion)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let rate = 1.5 + 1.5 * proximity
+            let breath = reduceMotion ? 1.0 : (0.88 + 0.12 * sin(t * rate))
+
+            ZStack {
+                // Base ring — full circle, clearly visible.
+                Circle()
+                    .strokeBorder(
+                        color.opacity(0.32),
+                        lineWidth: 1.5
+                    )
+                    .frame(width: Self.ringDiameter, height: Self.ringDiameter)
+
+                // Bright directional arc. `trim(from:to:)` cuts the
+                // circle to a 60° segment; `.rotationEffect` then
+                // positions the segment so its CENTER is at the
+                // bearing direction.
+                //
+                // Math: SwiftUI's circle trim starts at 3 o'clock
+                // (AngularGradient angle 0) and advances clockwise.
+                // We want the arc's *center* at the bearing (where
+                // bearing 0° = 12 o'clock).
+                //   start of arc at bearing = bearing - half_arc
+                //   3 o'clock + rotation = start position
+                //   rotation = (bearing - half_arc) - 90  (to convert
+                //              compass-frame to AngularGradient-frame)
+                let halfArc = Self.arcSpanDegrees / 2
+                let rotationDegrees = bearing - 90 - halfArc
+
+                Circle()
+                    .trim(from: 0, to: Self.arcSpanDegrees / 360)
+                    .stroke(
+                        color.opacity(breath),
+                        style: StrokeStyle(
+                            lineWidth: 5,
+                            lineCap: .round
+                        )
+                    )
+                    .frame(width: Self.ringDiameter, height: Self.ringDiameter)
+                    .rotationEffect(.degrees(rotationDegrees))
+                    .shadow(color: color.opacity(0.9), radius: 14)
+                    .shadow(color: color.opacity(0.5), radius: 32)
+            }
+        }
+        .animation(.smooth(duration: 0.45), value: bearing)
+        .animation(.smooth(duration: 0.6), value: proximity)
+    }
+}
+
+// MARK: - Standalone diamond gem
+
+/// The geometric gemstone glyph — standalone, no surrounding orb /
+/// no concentric rings. Sits at the center of the screen, glows in
+/// the member's color, breathes subtly with proximity.
+private struct DiamondGem: View {
+    let color: Color
+    let confidence: Double      // 0–1; gem opacity scales with lock confidence
+    let proximity: Double       // 0–1; pulse tempo + brightness
+    let reduceMotion: Bool
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1.0 / 30,
+                                paused: reduceMotion)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let rate = 1.8 + 2.0 * proximity
+            let breath = reduceMotion ? 1.0 : (1.0 + 0.04 * sin(t * rate))
+            let glow = reduceMotion ? 1.0 : (0.85 + 0.15 * sin(t * rate))
+
+            DiamondGemShape()
+                .stroke(
+                    LinearGradient(
+                        // Subtle top-to-bottom brightness gradient
+                        // inside the stroke itself — makes the gem
+                        // feel like it's catching ambient light
+                        // rather than being a flat outline.
+                        colors: [
+                            color,
+                            color.opacity(0.85),
+                            color
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    style: StrokeStyle(
+                        lineWidth: 1.5,
+                        lineCap: .round,
+                        lineJoin: .round
+                    )
+                )
+                .frame(width: 92, height: 124)
+                .shadow(color: color.opacity(0.9 * glow), radius: 8)
+                .shadow(color: color.opacity(0.55 * glow), radius: 22)
+                .shadow(color: color.opacity(0.25 * glow), radius: 50)
+                .opacity(0.6 + 0.4 * confidence)
+                .scaleEffect(breath)
+        }
+    }
+}
+
+// MARK: - Diamond gem shape
+
+/// Classic "playing-card-suit" rhombus — sharp point at the top,
+/// widest at the horizontal midpoint, sharp point at the bottom —
+/// with an inscribed inner rhombus for crystal-facet depth. Reads
+/// instantly as a diamond, no flat-top "table" that can look
+/// truncated. The inner facet lines converge at two points on the
+/// girdle (halfway in from each outer corner) to suggest the
+/// brilliant-cut "kite" facets without the clutter of explicit
+/// pavilion lines.
+///
+/// Total: 4 outer edges + 1 girdle + 4 inner facets = 9 line
+/// segments. Symmetric across both axes. Looks like a refined
+/// gemstone icon, not a technical diagram.
+private struct DiamondGemShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = rect.width
+        let cx = rect.midX
+        let cy = rect.midY
+        let topY = rect.minY
+        let bottomY = rect.maxY
+        let leftX = rect.minX
+        let rightX = rect.maxX
+
+        // ───── 1. Outer rhombus ─────
+        // Sharp points at top + bottom, widest at the horizontal
+        // midline (girdle). Four straight edges, no flat table.
+        let topPoint = CGPoint(x: cx, y: topY)
+        let rightPoint = CGPoint(x: rightX, y: cy)   // girdle right
+        let bottomPoint = CGPoint(x: cx, y: bottomY) // culet
+        let leftPoint = CGPoint(x: leftX, y: cy)     // girdle left
+
+        path.move(to: topPoint)
+        path.addLine(to: rightPoint)
+        path.addLine(to: bottomPoint)
+        path.addLine(to: leftPoint)
+        path.closeSubpath()
+
+        // ───── 2. Girdle line ─────
+        // Horizontal across the widest part. Structural — defines
+        // crown vs pavilion boundary.
+        path.move(to: leftPoint)
+        path.addLine(to: rightPoint)
+
+        // ───── 3. Inner facet anchors ─────
+        // Two points on the girdle, halfway in from each outer
+        // corner. The four inner facet lines all terminate at these
+        // two points, creating an inscribed slim diamond inside
+        // the wider outer one.
+        let innerOffset = w * 0.26
+        let innerGirdleLeft = CGPoint(x: cx - innerOffset, y: cy)
+        let innerGirdleRight = CGPoint(x: cx + innerOffset, y: cy)
+
+        // ───── 4. Crown facets (inverted V from top) ─────
+        path.move(to: topPoint)
+        path.addLine(to: innerGirdleLeft)
+        path.move(to: topPoint)
+        path.addLine(to: innerGirdleRight)
+
+        // ───── 5. Pavilion facets (V from bottom) ─────
+        // Mirrors the crown — same convergence points, opposite
+        // apex. Together with the crown facets, draws a thin
+        // diamond inscribed inside the wider outer rhombus.
+        path.move(to: bottomPoint)
+        path.addLine(to: innerGirdleLeft)
+        path.move(to: bottomPoint)
+        path.addLine(to: innerGirdleRight)
+
+        return path
+    }
+}
+
+// MARK: - Math utilities (unchanged)
 
 enum CompassMath {
     /// Initial bearing in degrees clockwise from true north
