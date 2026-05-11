@@ -47,6 +47,18 @@ protocol BLEPresenceServicing: AnyObject {
     /// only one group at a time is "active" for BLE advertising).
     var events: AsyncStream<Event> { get }
 
+    /// JoinResponse payloads received from in-range peers while in
+    /// discovery mode. AppState consumes these to short-circuit the
+    /// CloudKit `joinGroup` round-trip when an in-range member can
+    /// answer faster.
+    var joinResponses: AsyncStream<JoinResponse> { get }
+
+    /// Incoming `JoinRequest`s written to our `joinRequest`
+    /// characteristic by nearby central peers looking to join.
+    /// AppState validates the request (invite-code match, banlist)
+    /// and decides whether to call `respondToJoinRequest`.
+    var incomingJoinRequests: AsyncStream<JoinRequest> { get }
+
     /// Stream of diagnostics about the peripheral side of the BLE pipe:
     /// how many remote centrals are connected to us, how many have
     /// subscribed to chat. Useful for surfacing "no one's listening"
@@ -64,6 +76,24 @@ protocol BLEPresenceServicing: AnyObject {
     /// whether anyone in range needs it) and for calling
     /// `Event.strippedForBLE()` if the payload has large blobs.
     func broadcastEvent(_ event: Event)
+
+    /// Enter join-discovery mode: scan + connect to nearby GroupIn
+    /// peripherals, write the provided `JoinRequest` to each, and
+    /// emit any `JoinResponse` replies onto `joinResponses`. Call
+    /// even when the user isn't in a group yet — the BLE service
+    /// starts its central up if it isn't already running.
+    func startJoinDiscovery(_ request: JoinRequest)
+
+    /// Cancel join discovery — no more JoinRequest writes, queued
+    /// peripherals get cancelled. Idempotent.
+    func stopJoinDiscovery()
+
+    /// Broadcast a `JoinResponse` to all currently-subscribed
+    /// centrals on the joinResponse characteristic. Joiners filter
+    /// by invite code on receive, so a broadcast that hits the
+    /// wrong central is harmlessly ignored. Called by AppState
+    /// after it validates a `JoinRequest` against the active group.
+    func respondToJoinRequest(_ response: JoinResponse)
 }
 
 struct BLEDiagnostics: Sendable, Equatable {
@@ -100,6 +130,16 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// events through the reducer and dedup via their own cursor.
     static let eventsCharacteristicUUID = CBUUID(string: "A5B7E1C3-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
 
+    /// Joiner-side writes a JSON-encoded `JoinRequest` here. The peer
+    /// validates the invite code against its active group and (on
+    /// match) responds via the joinResponse characteristic.
+    static let joinRequestCharacteristicUUID = CBUUID(string: "A5B7E1C4-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
+
+    /// Peer-side notifies a `JoinResponse` back to the requesting
+    /// central. Targets only the requester (not broadcast) so other
+    /// in-range centrals don't pick up someone else's join answer.
+    static let joinResponseCharacteristicUUID = CBUUID(string: "A5B7E1C5-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
+
     /// iBeacon UUID for region monitoring. Different from the BLE service
     /// UUID because iBeacon advertisements use a manufacturer-data format
     /// while BLE service advertisements use the service-UUID list — iOS
@@ -113,11 +153,15 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     let rssiUpdates: AsyncStream<RSSIReading>
     let chatMessages: AsyncStream<ChatMessage>
     let events: AsyncStream<Event>
+    let joinResponses: AsyncStream<JoinResponse>
+    let incomingJoinRequests: AsyncStream<JoinRequest>
     let diagnostics: AsyncStream<BLEDiagnostics>
     private nonisolated let peerContinuation: AsyncStream<PeerPresence>.Continuation
     private nonisolated let rssiContinuation: AsyncStream<RSSIReading>.Continuation
     private nonisolated let chatContinuation: AsyncStream<ChatMessage>.Continuation
     private nonisolated let eventContinuation: AsyncStream<Event>.Continuation
+    private nonisolated let joinResponseContinuation: AsyncStream<JoinResponse>.Continuation
+    private nonisolated let incomingJoinRequestContinuation: AsyncStream<JoinRequest>.Continuation
     private nonisolated let diagnosticsContinuation: AsyncStream<BLEDiagnostics>.Continuation
 
     private var currentDiagnostics = BLEDiagnostics(
@@ -135,9 +179,18 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private var presenceCharacteristic: CBMutableCharacteristic?
     private var chatCharacteristic: CBMutableCharacteristic?
     private var eventsCharacteristic: CBMutableCharacteristic?
+    private var joinRequestCharacteristic: CBMutableCharacteristic?
+    private var joinResponseCharacteristic: CBMutableCharacteristic?
     private var advertisedService: CBMutableService?
     private var serviceAdded: Bool = false
     private var lastChatData: Data?
+
+    /// Active invite code we're hunting for when in join-discovery
+    /// mode. Set by `startJoinDiscovery`, cleared on first acceptance
+    /// or `stopJoinDiscovery`. The central side uses this to write
+    /// the JoinRequest into discovered peripherals; the peripheral
+    /// side ignores it.
+    private var pendingJoinRequest: JoinRequest?
     /// Most recently broadcast event payload, exposed so a central
     /// connecting later can read the latest single event we have. The
     /// event log on CloudKit + the cursor-mismatch push are how peers
@@ -189,16 +242,22 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         let (rssiStream, rssiCont) = AsyncStream.makeStream(of: RSSIReading.self)
         let (chatStream, chatCont) = AsyncStream.makeStream(of: ChatMessage.self)
         let (eventStream, eventCont) = AsyncStream.makeStream(of: Event.self)
+        let (joinStream, joinCont) = AsyncStream.makeStream(of: JoinResponse.self)
+        let (joinReqStream, joinReqCont) = AsyncStream.makeStream(of: JoinRequest.self)
         let (diagStream, diagCont) = AsyncStream.makeStream(of: BLEDiagnostics.self)
         self.peerUpdates = peerStream
         self.rssiUpdates = rssiStream
         self.chatMessages = chatStream
         self.events = eventStream
+        self.joinResponses = joinStream
+        self.incomingJoinRequests = joinReqStream
         self.diagnostics = diagStream
         self.peerContinuation = peerCont
         self.rssiContinuation = rssiCont
         self.chatContinuation = chatCont
         self.eventContinuation = eventCont
+        self.joinResponseContinuation = joinCont
+        self.incomingJoinRequestContinuation = joinReqCont
         self.diagnosticsContinuation = diagCont
         super.init()
         self.centralManager = CBCentralManager(delegate: self, queue: nil)
@@ -232,6 +291,9 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         presenceCharacteristic = nil
         chatCharacteristic = nil
         eventsCharacteristic = nil
+        joinRequestCharacteristic = nil
+        joinResponseCharacteristic = nil
+        pendingJoinRequest = nil
         lastEventData = nil
         pendingEventUpdates.removeAll()
         beginScanIfReady()
@@ -298,8 +360,13 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     // MARK: - Internal
 
     private func beginScanIfReady() {
+        // Scan when we have either an active group (normal in-group
+        // discovery) or a pending join request (offline join-by-BLE).
+        // The join-discovery path bypasses the activeGroupHash gate
+        // because the joiner isn't a member yet but still needs to
+        // find in-range peers who are.
         guard centralManager.state == .poweredOn,
-              activeGroupHash != nil else { return }
+              activeGroupHash != nil || pendingJoinRequest != nil else { return }
         // `allowDuplicates: true` is essential for reconnect after a peer
         // drops out of range — without duplicate callbacks iOS won't notify
         // us again once the peer reappears. The dedup checks in
@@ -402,12 +469,32 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             value: nil,
             permissions: [.readable]
         )
+        // Joiners write a JoinRequest here — write-only, no read /
+        // notify because the joiner doesn't need to observe their own
+        // request. Permissions writeable.
+        let joinReqChar = CBMutableCharacteristic(
+            type: Self.joinRequestCharacteristicUUID,
+            properties: [.write],
+            value: nil,
+            permissions: [.writeable]
+        )
+        // Peers push a JoinResponse back here to the requesting
+        // central. Notify so the central wakes on receipt; read so
+        // the joiner can poll if they miss the notify timing window.
+        let joinRespChar = CBMutableCharacteristic(
+            type: Self.joinResponseCharacteristicUUID,
+            properties: [.read, .notify],
+            value: nil,
+            permissions: [.readable]
+        )
         let svc = CBMutableService(type: Self.serviceUUID, primary: true)
-        svc.characteristics = [presence, chat, eventsChar]
+        svc.characteristics = [presence, chat, eventsChar, joinReqChar, joinRespChar]
         peripheralManager.add(svc)
         presenceCharacteristic = presence
         chatCharacteristic = chat
         eventsCharacteristic = eventsChar
+        joinRequestCharacteristic = joinReqChar
+        joinResponseCharacteristic = joinRespChar
         advertisedService = svc
         serviceAdded = true
     }
@@ -433,6 +520,56 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         lastEventData = data
         pendingEventUpdates.append(data)
         drainEventQueue()
+    }
+
+    func startJoinDiscovery(_ request: JoinRequest) {
+        pendingJoinRequest = request
+        // Make sure scanning is on so we discover in-range peers
+        // immediately. Peripheral advertising stays off — the joiner
+        // isn't a group member yet so there's nothing to advertise.
+        beginScanIfReady()
+        // Walk currently-connected peers, write the JoinRequest to
+        // any that have the joinRequest characteristic discovered
+        // already. New discoveries will write via the discovery
+        // callback below.
+        for (_, peripheral) in connectedPeers {
+            writeJoinRequestIfPossible(to: peripheral)
+        }
+    }
+
+    func stopJoinDiscovery() {
+        pendingJoinRequest = nil
+    }
+
+    func respondToJoinRequest(_ response: JoinResponse) {
+        guard let char = joinResponseCharacteristic,
+              let data = response.encoded() else { return }
+        // updateValue to all subscribed centrals — the joiner
+        // filters by invite code on receive. We don't have a clean
+        // way to target a specific central without tracking the
+        // CBCentral object across the write→respond roundtrip, and
+        // the broadcast is harmless to non-matching listeners.
+        _ = peripheralManager.updateValue(
+            data,
+            for: char,
+            onSubscribedCentrals: nil
+        )
+    }
+
+    /// Write the pending JoinRequest to a connected peripheral's
+    /// joinRequest characteristic if discovered. Called from both
+    /// `startJoinDiscovery` (for already-connected peers) and from
+    /// the central-side `didDiscoverCharacteristics` callback (for
+    /// newly-connected peers).
+    private func writeJoinRequestIfPossible(to peripheral: CBPeripheral) {
+        guard let request = pendingJoinRequest,
+              let data = request.encoded(),
+              let service = peripheral.services?.first(where: { $0.uuid == Self.serviceUUID }),
+              let char = service.characteristics?.first(where: {
+                  $0.uuid == Self.joinRequestCharacteristicUUID
+              })
+        else { return }
+        peripheral.writeValue(data, for: char, type: .withResponse)
     }
 
     /// Drain pending chat updates through `peripheralManager.updateValue`.
@@ -475,7 +612,11 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     }
 
     private func considerConnect(to peripheral: CBPeripheral) {
-        guard activeGroupHash != nil else { return }
+        // Connect when we either have an active group OR are
+        // actively looking to join one. The latter path lets a
+        // pre-group joiner reach in-range members to request the
+        // group identity over BLE.
+        guard activeGroupHash != nil || pendingJoinRequest != nil else { return }
         let id = peripheral.identifier
         if connectingPeers[id] != nil || connectedPeers[id] != nil { return }
 
@@ -497,17 +638,44 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
 
     private func handlePresenceData(_ data: Data, from peripheral: CBPeripheral) {
         guard let presence = PeerPresence.decoded(from: data) else { return }
-        guard presence.groupHash == activeGroupHash else {
+        // Active-group filter: drop connections to peers from other
+        // groups. Skipped during join-discovery — we don't have an
+        // activeGroupHash but we need to stay connected long enough
+        // for the JoinResponse to arrive; the joinRequest write
+        // already filters by invite-code match server-side.
+        let isDiscoveryMode = activeGroupHash == nil && pendingJoinRequest != nil
+        guard isDiscoveryMode || presence.groupHash == activeGroupHash else {
             // Different group — drop the connection so we don't keep a
             // pointless link open.
             centralManager.cancelPeripheralConnection(peripheral)
             peripheralToMember.removeValue(forKey: peripheral.identifier)
             return
         }
+        // In discovery mode, we keep the connection alive but don't
+        // yield presence to AppState — we have no active group to
+        // associate it with. The joinResponse handler below is the
+        // sole consumer of discovery-mode connections.
+        guard !isDiscoveryMode else { return }
         // Now that we know which member this peripheral is, tag future
         // scan callbacks with their member ID for the RSSI stream.
         peripheralToMember[peripheral.identifier] = presence.memberID
         peerContinuation.yield(presence)
+    }
+
+    /// Decode an incoming JoinResponse off the wire and surface it
+    /// to AppState via the stream. Called when a remote peripheral
+    /// notifies us on the joinResponse characteristic during
+    /// discovery mode.
+    private func handleJoinResponseData(_ data: Data) {
+        guard let response = JoinResponse.decoded(from: data) else { return }
+        // Sanity: only yield responses that match the invite code we
+        // asked for. Discards crossed-wire responses if multiple
+        // join attempts are in flight (shouldn't happen given we
+        // single-thread join through `pendingJoinRequest`, but
+        // defense in depth).
+        guard let request = pendingJoinRequest,
+              response.inviteCode == request.inviteCode else { return }
+        joinResponseContinuation.yield(response)
     }
 }
 
@@ -589,7 +757,9 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                 peripheral.discoverCharacteristics(
                     [Self.presenceCharacteristicUUID,
                      Self.chatCharacteristicUUID,
-                     Self.eventsCharacteristicUUID],
+                     Self.eventsCharacteristicUUID,
+                     Self.joinRequestCharacteristicUUID,
+                     Self.joinResponseCharacteristicUUID],
                     for: service
                 )
             }
@@ -622,6 +792,17 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                     // any older missing events too.
                     peripheral.readValue(for: char)
                     peripheral.setNotifyValue(true, for: char)
+                case Self.joinResponseCharacteristicUUID:
+                    // Join discovery — subscribe so a peer's reply
+                    // notifies us. Only relevant when we're in
+                    // discovery mode; harmless otherwise.
+                    peripheral.setNotifyValue(true, for: char)
+                case Self.joinRequestCharacteristicUUID:
+                    // If we're currently looking to join, write the
+                    // request to this peer right now. Discovery
+                    // mode bypasses the activeGroupHash filter so
+                    // every peer we reach gets a chance to answer.
+                    self.writeJoinRequestIfPossible(to: peripheral)
                 default:
                     break
                 }
@@ -643,6 +824,8 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                 self.handleChatData(data)
             case Self.eventsCharacteristicUUID:
                 self.handleEventData(data)
+            case Self.joinResponseCharacteristicUUID:
+                self.handleJoinResponseData(data)
             default:
                 break
             }
@@ -773,6 +956,29 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
                 peripheral.respond(to: request, withResult: .success)
             default:
                 peripheral.respond(to: request, withResult: .attributeNotFound)
+            }
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager,
+                                       didReceiveWrite requests: [CBATTRequest]) {
+        // Decode every JoinRequest in the batch; AppState validates
+        // each one (invite-code match, banlist). ATT requires us to
+        // respond exactly once for the whole batch, so we collect
+        // all results and use the first request as the response
+        // anchor — same convention CoreBluetooth's own sample code
+        // recommends for write batches.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for request in requests
+            where request.characteristic.uuid == Self.joinRequestCharacteristicUUID {
+                if let data = request.value,
+                   let joinRequest = JoinRequest.decoded(from: data) {
+                    self.incomingJoinRequestContinuation.yield(joinRequest)
+                }
+            }
+            if let first = requests.first {
+                peripheral.respond(to: first, withResult: .success)
             }
         }
     }

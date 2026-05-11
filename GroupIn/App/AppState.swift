@@ -261,6 +261,7 @@ final class AppState {
     private var iCloudAccountChangeTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var bleEventTask: Task<Void, Never>?
+    private var bleJoinRequestTask: Task<Void, Never>?
     private var deadReckoningTask: Task<Void, Never>?
 
     /// Timestamp of the most recent fresh GPS fix. The DR consumer
@@ -370,6 +371,7 @@ final class AppState {
         startBLEDiagnosticsMonitor()
         loadLocalCloudUserID()
         startEmitRetryLoop()
+        startJoinRequestResponder()
 
         // didSet doesn't fire during init, so if we restored any
         // memberships from persistence we need to kick off the
@@ -1477,54 +1479,93 @@ final class AppState {
     /// version — same "newest wins" rule we use for CloudKit refresh.
     private func mergeBLEPeer(_ peer: PeerPresence) {
         guard var group = currentGroup else { return }
-        guard let idx = group.members.firstIndex(where: { $0.id == peer.memberID }) else {
-            // Unknown member — they may not have synced via CloudKit yet.
-            // Skip; the next CloudKit refresh will surface them and the
-            // following BLE read will then merge.
-            return
-        }
-        // Always record BLE contact even if the data isn't strictly fresher;
-        // the connection-mode pill cares about "we're hearing them on
-        // Bluetooth," not just "their position changed."
+
+        // Transport bookkeeping runs unconditionally — we want the
+        // "we're hearing this peer on Bluetooth" signal regardless of
+        // whether their full member record has caught up yet.
         recordTransport(.ble, for: peer.memberID)
-        guard peer.lastSeen > group.members[idx].lastSeen else { return }
-        group.members[idx].lastSeen = peer.lastSeen
-        if let lat = peer.latitude, let lon = peer.longitude {
-            group.members[idx].coordinate = Coordinate(latitude: lat, longitude: lon)
-        }
-        group.members[idx].heading = peer.heading
-        // Pull provenance off the BLE payload so locally-received
-        // positions render with the same accuracy bubble + source
-        // styling as CloudKit-fetched ones. Unknown raw-source
-        // strings decode to nil and the UI treats nil as `.gps`.
-        group.members[idx].accuracy = peer.accuracy
-        group.members[idx].positionSource = peer.positionSource
-            .flatMap(PositionSource.init(rawValue:))
-        group.members[idx].positionAnchorAt = peer.positionAnchorAt
-        // Copy the BLE-arrived event cursor onto the member's User
-        // struct too — drives delivery-dot rendering. The CKRecord
-        // mirror happens via heartbeat republish; this in-memory
-        // copy makes the dot promotion responsive instead of waiting
-        // for the next CloudKit fetch.
-        group.members[idx].eventCursorCreatedAt = peer.eventCursorCreatedAt
-        group.members[idx].eventCursorID = peer.eventCursorID
-        currentGroup = group
-        addOrUpdate(group: group)
 
-        // Cursor update may have caught a peer up to one of our
-        // outgoing events — promote the delivery status if so.
-        reevaluateDeliveryStatus(for: group.id)
-
-        // Event-log gossip — track the peer's cursor and, if they're
-        // behind us, push the events they're missing right away. This
-        // is the cursor-mismatch path: a peer with no time gate gets
-        // every event newer than theirs.
+        // Cursor tracking + cursor-mismatch push run unconditionally
+        // too. The BLE service has already verified the peer's
+        // groupHash matches our active group, so they're legitimately
+        // a member from our perspective — even if our local
+        // `members` list hasn't gotten their `memberJoined` event
+        // yet (which can happen when CloudKit silent push for
+        // memberJoined is delayed or lost). Without this, the first
+        // few minutes after a new member joins look like:
+        //   1. They have us, see us as a member.
+        //   2. We don't have them — `mergeBLEPeer` bailed at the
+        //      members-lookup guard, never tracked their cursor.
+        //   3. Their chats reach us via their BLE broadcast.
+        //   4. Our chats never reach them — empty peerCursors map
+        //      means `broadcastEventIfPeersBehind` skips the broadcast.
+        //   5. CloudKit push is unreliable enough that the gap
+        //      persists indefinitely.
+        // Moving cursor tracking out of the guard unsticks all of it.
         if let peerCursor = peer.eventCursor {
             peerCursors[peer.memberID] = peerCursor
             Task { [weak self, groupID = group.id, peerCursor] in
                 await self?.pushEventsNewer(than: peerCursor, in: groupID)
             }
         }
+
+        // Member-list update: if we know who this peer is, patch
+        // their entry with the fresh BLE data. If we don't, stub a
+        // skeleton entry so the dashboard reflects "there's someone
+        // in BLE range" while we wait for the `memberJoined` event
+        // to arrive and fill in their identity. The reducer will
+        // upgrade the stub to a proper entry when the event lands —
+        // both paths use the same memberID, so the update merges.
+        if let idx = group.members.firstIndex(where: { $0.id == peer.memberID }) {
+            guard peer.lastSeen > group.members[idx].lastSeen else {
+                currentGroup = group
+                addOrUpdate(group: group)
+                reevaluateDeliveryStatus(for: group.id)
+                return
+            }
+            group.members[idx].lastSeen = peer.lastSeen
+            if let lat = peer.latitude, let lon = peer.longitude {
+                group.members[idx].coordinate = Coordinate(latitude: lat, longitude: lon)
+            }
+            group.members[idx].heading = peer.heading
+            group.members[idx].accuracy = peer.accuracy
+            group.members[idx].positionSource = peer.positionSource
+                .flatMap(PositionSource.init(rawValue:))
+            group.members[idx].positionAnchorAt = peer.positionAnchorAt
+            group.members[idx].eventCursorCreatedAt = peer.eventCursorCreatedAt
+            group.members[idx].eventCursorID = peer.eventCursorID
+        } else {
+            // Stub a placeholder member entry. Display name uses a
+            // best-effort placeholder; the `memberJoined` event for
+            // this peer will overwrite it once it arrives via gossip
+            // or CloudKit.
+            let stub = User(
+                id: peer.memberID,
+                displayName: "Member",
+                avatarData: nil,
+                lastSeen: peer.lastSeen,
+                coordinate: (peer.latitude.flatMap { lat in
+                    peer.longitude.map { Coordinate(latitude: lat, longitude: $0) }
+                }) ?? nil,
+                heading: peer.heading,
+                nearbyToken: nil,
+                banHash: nil,
+                accuracy: peer.accuracy,
+                positionSource: peer.positionSource
+                    .flatMap(PositionSource.init(rawValue:)),
+                positionAnchorAt: peer.positionAnchorAt,
+                positionSourcePeerID: nil,
+                eventCursor: peer.eventCursor
+            )
+            group.members.append(stub)
+        }
+
+        currentGroup = group
+        addOrUpdate(group: group)
+
+        // Cursor update may have caught a peer up to one of our
+        // outgoing events — promote the delivery status if so.
+        reevaluateDeliveryStatus(for: group.id)
     }
 
     /// Throttled CloudKit publish: at most once every `publishInterval`
@@ -1620,8 +1661,96 @@ final class AppState {
             }
         }
 
-        // BLE gossip — broadcast if any tracked peer is behind.
-        broadcastEventIfPeersBehind(event)
+        // BLE gossip — always broadcast our own emits. Receivers
+        // dedup at the event-ID layer, so the only cost of an
+        // unnecessary broadcast is the bandwidth of one ~150-byte
+        // GATT write. Skipping the gate here is what unblocks the
+        // "first chat after a peer joins" path, where their cursor
+        // hasn't reached us yet.
+        broadcastLocalEmit(event)
+    }
+
+    // MARK: - BLE join-request responder (peripheral side)
+
+    /// Long-lived consumer of `blePresenceService.incomingJoinRequests`.
+    /// Always running — even before the local user is in a group —
+    /// because as soon as we join one we want to immediately respond
+    /// to nearby joiners hunting for the same invite code. Skipping
+    /// the active-group filter is safe: if no group of ours matches
+    /// the request's invite code, we just don't respond.
+    private func startJoinRequestResponder() {
+        guard bleJoinRequestTask == nil else { return }
+        bleJoinRequestTask = Task { [weak self] in
+            guard let self else { return }
+            for await request in self.blePresenceService.incomingJoinRequests {
+                self.handleIncomingJoinRequest(request)
+            }
+        }
+    }
+
+    /// Validate an incoming `JoinRequest` against our memberships and
+    /// reply with a `JoinResponse` if there's a match. Banlist check
+    /// happens at the request layer (the request carries the
+    /// joiner's salted hash) so we can refuse pre-banned joiners
+    /// before any group identity leaves our device.
+    private func handleIncomingJoinRequest(_ request: JoinRequest) {
+        let normalized = request.inviteCode
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+
+        guard let group = myGroups.first(where: {
+            $0.inviteCode.uppercased() == normalized
+        }) else { return }
+
+        if let hash = request.joinerBanHash,
+           group.bannedMembers.contains(where: { $0.banHash == hash }) {
+            return
+        }
+
+        let response = JoinResponse(
+            groupID: group.id,
+            name: group.name,
+            inviteCode: group.inviteCode,
+            category: group.category.rawValue,
+            ownerID: group.ownerID,
+            createdAt: group.createdAt,
+            expiresAt: group.expiresAt,
+            responderMemberID: membershipByGroupID[group.id] ?? currentUser.id
+        )
+        blePresenceService.respondToJoinRequest(response)
+    }
+
+    // MARK: - BLE join discovery (joiner side)
+
+    /// Spin up BLE in join-discovery mode for the given invite code.
+    /// Used in parallel with the CloudKit join attempt so an in-range
+    /// member can answer instantly even if CloudKit is unreachable.
+    /// Returns the next valid `JoinResponse` matching `inviteCode`,
+    /// or nil if the calling task is cancelled before any response
+    /// arrives.
+    func awaitBLEJoinResponse(forInviteCode inviteCode: String,
+                              joiner: User) async -> JoinResponse? {
+        let banHash = localBanHash(forInviteCode: inviteCode)
+        let request = JoinRequest(
+            inviteCode: inviteCode,
+            joinerBanHash: banHash,
+            joinerMemberID: joiner.id,
+            joinerDisplayName: joiner.displayName
+        )
+        blePresenceService.startJoinDiscovery(request)
+
+        // Wait for the first matching response. The BLE service
+        // already filters by invite code before yielding, so any
+        // yielded response is for us.
+        for await response in blePresenceService.joinResponses {
+            if Task.isCancelled { break }
+            if response.inviteCode == inviteCode {
+                blePresenceService.stopJoinDiscovery()
+                return response
+            }
+        }
+        blePresenceService.stopJoinDiscovery()
+        return nil
     }
 
     /// One-shot CloudKit append attempt with delivery-status
@@ -1799,12 +1928,29 @@ final class AppState {
     /// tracked peer is already caught up — saves bandwidth and
     /// battery without losing any actual coverage (any peer that
     /// arrives later will catch up via the cursor-mismatch path).
+    ///
+    /// **First-sync flooding caveat:** when we receive a large batch
+    /// from CloudKit (e.g. after a cold launch sync), each event runs
+    /// through this filter so we don't re-broadcast events nearby
+    /// peers already have. That use case wants the gate.
     private func broadcastEventIfPeersBehind(_ event: Event) {
         guard !peerCursors.isEmpty else { return }
         let anyBehind = peerCursors.values.contains { peerCursor in
             event.cursor > peerCursor
         }
         guard anyBehind else { return }
+        blePresenceService.broadcastEvent(event.strippedForBLE())
+    }
+
+    /// Unconditional BLE broadcast for events the local user just
+    /// authored. Skipping the `peerCursors`-empty gate matters when a
+    /// new peer is in BLE range but their `PeerPresence` hasn't been
+    /// received yet — without this, our outgoing chat would never
+    /// reach them until their first cursor arrives (which itself
+    /// requires our PeerPresence to land on them first). Idempotent
+    /// at the receiver because the reducer dedups on event ID, so
+    /// duplicate-arrival is harmless.
+    private func broadcastLocalEmit(_ event: Event) {
         blePresenceService.broadcastEvent(event.strippedForBLE())
     }
 

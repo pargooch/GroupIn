@@ -50,32 +50,116 @@ final class JoinGroupViewModel {
         let service = appState.groupService
         let code = inviteCode
 
-        // Retry loop — silently retries transient errors with
-        // exponential backoff. Hard errors (wrong code, banned,
-        // not signed in) bail immediately with a clear message.
-        var delay: TimeInterval = 2
-        while !Task.isCancelled {
-            let outcome = await attemptJoin(service: service, inviteCode: code)
-            switch outcome {
-            case .succeeded:
-                return
-            case .hardError(let message):
-                errorMessage = message
-                return
-            case .transient:
-                statusMessage = "Looking for group… retrying"
-                try? await Task.sleep(for: .seconds(delay))
-                delay = min(Self.maxRetryDelay, delay * 2)
+        statusMessage = "Looking for group…"
+
+        // Race two paths in parallel:
+        //   1. CloudKit join — retries transient errors silently.
+        //   2. BLE discovery — asks any in-range peer "do you have a
+        //      group with this invite code?" via the joinRequest /
+        //      joinResponse handshake.
+        // Whichever resolves first wins; the other is cancelled. BLE
+        // discovery is uniquely useful when CloudKit is unreachable
+        // OR when the host's group save is still queued (so the cloud
+        // hasn't seen it yet but a member in BLE range has).
+        await withTaskGroup(of: JoinAttemptResult.self) { group in
+            group.addTask { @MainActor [appState = appState] in
+                let joiner = appState.makeMembership()
+                if let response = await appState.awaitBLEJoinResponse(
+                    forInviteCode: code, joiner: joiner
+                ) {
+                    return .bleResolved(response, joiner)
+                }
+                return .transient
+            }
+            group.addTask { @MainActor [self, service, code] in
+                var delay: TimeInterval = 2
+                while !Task.isCancelled {
+                    let outcome = await self.attemptJoin(service: service, inviteCode: code)
+                    switch outcome {
+                    case .succeeded, .hardError, .bleResolved:
+                        return outcome
+                    case .transient:
+                        try? await Task.sleep(for: .seconds(delay))
+                        delay = min(Self.maxRetryDelay, delay * 2)
+                    }
+                }
+                return .transient
+            }
+
+            // Accept the first authoritative answer (success / hard
+            // error / BLE-resolved) and cancel the other task.
+            while let result = await group.next() {
+                switch result {
+                case .succeeded:
+                    group.cancelAll()
+                    return
+                case .hardError(let message):
+                    errorMessage = message
+                    group.cancelAll()
+                    return
+                case .bleResolved(let response, let joiner):
+                    await applyBLEJoin(response: response, joiner: joiner)
+                    group.cancelAll()
+                    return
+                case .transient:
+                    // Loop — the other task may still resolve.
+                    continue
+                }
             }
         }
     }
 
+    /// Apply a BLE-derived JoinResponse: mint the local GroupSession,
+    /// stamp the joiner's ban hash, update AppState, navigate to the
+    /// dashboard. The actual member publish + memberJoined event use
+    /// the standard `emit` pipeline so cloud + BLE gossip both see
+    /// the new member.
+    private func applyBLEJoin(response: JoinResponse, joiner: User) async {
+        guard var group = response.toGroupSession() else { return }
+
+        // Ban gate at the joiner side too — defense in depth in case
+        // the responder skipped its check.
+        if appState.isLocalUserBanned(from: group) {
+            errorMessage = GroupServiceError.banned.localizedDescription
+            return
+        }
+
+        var me = joiner
+        me = appState.stampBanHash(me, for: group)
+        group.members.append(me)
+
+        appState.registerMembership(groupID: group.id, memberID: me.id)
+        appState.addOrUpdate(group: group)
+        appState.currentUser = me
+        appState.currentGroup = group
+        appState.path.append(.groupDashboard(groupID: group.id))
+
+        // Publish via standard pipeline. Cloud-side publish retries
+        // via heartbeat; BLE event gossip handles the offline case.
+        Task { [groupService = appState.groupService, me, group] in
+            try? await groupService.publish(user: me, in: group)
+        }
+        appState.emit(
+            .memberJoined(
+                memberID: me.id,
+                displayName: me.displayName,
+                avatarData: me.avatarData,
+                banHash: me.banHash
+            ),
+            in: group.id
+        )
+    }
+
     // MARK: - Inner attempt
 
-    private enum JoinAttemptResult {
+    private enum JoinAttemptResult: Sendable {
         case succeeded
         case hardError(message: String)
         case transient
+        /// BLE discovery returned a response — the calling code
+        /// constructs the local GroupSession from this and the
+        /// freshly-minted joiner User.
+        case bleResolved(JoinResponse, User)
     }
 
     private func attemptJoin(service: CloudKitServicing,
