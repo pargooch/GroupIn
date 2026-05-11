@@ -31,10 +31,14 @@ enum ICloudAccountStatus: Sendable, Equatable {
 
 @MainActor
 protocol CloudKitServicing: AnyObject {
-    func createGroup(named name: String,
-                     category: GroupCategory,
-                     ownerID: UUID,
-                     expiresAt: Date) async throws -> GroupSession
+    /// Persists a fully-constructed `GroupSession`. The caller is
+    /// expected to mint the GroupSession locally (via
+    /// `GroupSession.generateInviteCode` + a fresh UUID + the user-
+    /// supplied name/category/expiry) and then hand it here for
+    /// durable storage. Throws on transport / quota / schema errors —
+    /// AppState catches the throw and queues the save for retry so
+    /// group creation remains usable offline.
+    func saveGroup(_ group: GroupSession) async throws
 
     func joinGroup(inviteCode: String) async throws -> GroupSession
 
@@ -85,6 +89,13 @@ protocol CloudKitServicing: AnyObject {
     func removeMember(memberID: UUID,
                       fromGroup groupID: UUID) async throws -> GroupSession
 
+    /// A member voluntarily leaves the group. Deletes their member
+    /// record server-side without touching the banlist — they can
+    /// rejoin freely with the invite code. Distinct from
+    /// `removeMember`, which is owner-initiated and bans.
+    func leaveGroup(groupID: UUID,
+                    memberID: UUID) async throws
+
     /// Owner reverses a ban. The entry is removed from the group's
     /// banlist; the previously-banned user can now rejoin with the
     /// invite code as if they'd never been removed.
@@ -104,4 +115,41 @@ protocol CloudKitServicing: AnyObject {
     /// so AppState can put up a "sign in to iCloud" banner before any
     /// group action ever fails.
     func iCloudAccountStatus() async -> ICloudAccountStatus
+
+    // MARK: - Event log (Path C)
+
+    /// Append a single event to the group's append-only log. Events
+    /// are immutable once written — corrections are themselves new
+    /// events (e.g. `memberUnbanned` cancels `memberRemoved`).
+    func appendEvent(_ event: Event) async throws
+
+    /// Fetch all events for a group strictly newer than `cursor`. Used
+    /// for cold-start replay (cursor = nil → entire log) and for
+    /// incremental sync after a silent push lands. Caller sorts and
+    /// folds the result via `EventReducer`.
+    func fetchEvents(forGroupID groupID: UUID,
+                     since cursor: EventCursor?) async throws -> [Event]
+
+    /// Fetch a paginated batch of events strictly **older** than
+    /// `cursor`, capped at `limit`. Used for scroll-to-top history
+    /// loading: the UI requests "30 older than what I have now,"
+    /// gets that batch, and updates its oldest-local-cursor. If
+    /// `cursor` is nil, returns the most recent `limit` events
+    /// (first-open seed). When the returned count is less than
+    /// `limit`, we've reached the start of the group's history.
+    func fetchEvents(forGroupID groupID: UUID,
+                     olderThan cursor: EventCursor?,
+                     limit: Int) async throws -> [Event]
+
+    /// Register a CloudKit silent push subscription for new events in
+    /// this group. Fires on Event record creation; AppState's push
+    /// handler consumes it and triggers an incremental fetch.
+    /// Separate from `subscribeToPresenceUpdates` — moderation events
+    /// shouldn't share a notification channel with high-frequency
+    /// presence updates so we can tune throttling independently.
+    func subscribeToEvents(groupID: UUID) async throws
+
+    /// Tear down the Event subscription. Called from
+    /// `reconcileTrackingLifecycle` when a group leaves `myGroups`.
+    func unsubscribeFromEvents(groupID: UUID) async throws
 }

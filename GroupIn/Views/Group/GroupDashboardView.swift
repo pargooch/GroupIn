@@ -18,6 +18,7 @@ struct GroupDashboardView: View {
     @State private var showsChat = false
     @State private var showsInviteQR = false
     @State private var memberToRemove: User?
+    @State private var confirmingLeaveGroup = false
 
     init(viewModel: GroupDashboardViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -75,6 +76,34 @@ struct GroupDashboardView: View {
             } message: {
                 Text("The group owner removed you. Ask them to invite you again if you'd like to rejoin.")
             }
+            // Surfaces when a refresh discovers the active group was
+            // hard-deleted server-side (owner pressed Delete, or it
+            // expired and was cleaned up).
+            .alert(
+                "\(appState.groupDeletedNotice ?? "This group") was deleted",
+                isPresented: Binding(
+                    get: { appState.groupDeletedNotice != nil },
+                    set: { if !$0 { appState.groupDeletedNotice = nil } }
+                )
+            ) {
+                Button("OK") { appState.groupDeletedNotice = nil }
+            } message: {
+                Text("The group's owner deleted it. It's been removed from your list.")
+            }
+            // Leave-this-group confirmation. Fired by the destructive
+            // button in the dashboard's group section.
+            .alert(
+                "Leave \(viewModel.group?.name ?? "this group")?",
+                isPresented: $confirmingLeaveGroup
+            ) {
+                Button("Cancel", role: .cancel) {}
+                Button("Leave", role: .destructive) {
+                    guard let groupID = viewModel.group?.id else { return }
+                    Task { await appState.removeMyselfFromGroup(groupID) }
+                }
+            } message: {
+                Text("You'll be removed from this group and stop sharing your location with its members. You can rejoin later with the invite code.")
+            }
     }
 
     @ViewBuilder
@@ -108,6 +137,7 @@ struct GroupDashboardView: View {
             }
             messagesSection
             safetySection
+            leaveGroupSection(group: group)
         }
         // Pull-to-refresh — forces a CloudKit fetch on demand so the
         // user doesn't have to wait for the 10s polling tick or a
@@ -244,6 +274,32 @@ struct GroupDashboardView: View {
         .accessibilityLabel("Fit all members on map")
     }
 
+    /// Non-owner-only "Leave Group" action. Owners can't appear here
+    /// because for them the right verb is "Delete group entirely,"
+    /// which lives as a swipe action on Home. Keeping the button at
+    /// the bottom of the dashboard matches iOS Settings convention —
+    /// destructive actions hide at the foot of the screen so users
+    /// don't tap them on the way past.
+    @ViewBuilder
+    private func leaveGroupSection(group: GroupSession) -> some View {
+        if !viewModel.isOwner {
+            Section {
+                Button(role: .destructive) {
+                    confirmingLeaveGroup = true
+                } label: {
+                    HStack {
+                        Spacer()
+                        Label("Leave Group", systemImage: "rectangle.portrait.and.arrow.right")
+                            .labelStyle(.titleAndIcon)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .accessibilityHint("Removes you from this group and stops sharing your location with its members")
+            }
+        }
+    }
+
     /// Owner-only banlist UI. Hidden when the group has no banned
     /// members so the dashboard doesn't carry empty sections. Each
     /// row offers an Unban button that re-opens the group to the
@@ -340,13 +396,14 @@ struct GroupDashboardView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
-                // "Done" — closes this dashboard and returns home. The
-                // user stays a member of the group; sharing keeps
-                // running in the background. Removing yourself from
-                // the group entirely is a separate swipe-delete action
-                // on the Home screen's group list.
+                // "Done" — pops the dashboard back to Home without
+                // touching the tracking stack. Sharing keeps running
+                // (location, beacon, heartbeat, push subscription
+                // are all driven by myGroups now, not currentGroup).
+                // Explicit leave / delete happens via the Leave Group
+                // button below or swipe-delete on Home.
                 Button("Done") {
-                    appState.leaveGroup()
+                    appState.closeDashboard()
                 }
                 .fontWeight(.semibold)
                 .accessibilityHint("Closes this group view and returns home. You stay a member.")
@@ -683,14 +740,50 @@ struct GroupDashboardView: View {
                             now: Date) -> some View {
         Map(position: cameraBinding) {
             ForEach(group.members) { member in
-                if let coord = member.coordinate {
+                // `renderablePosition` returns the same coordinate but
+                // with provenance baked in — staleGPS degradation, the
+                // accuracy bubble already inflated for old fixes, etc.
+                // The pin and accuracy ring both read from this single
+                // source of truth so they can't disagree.
+                if let estimate = member.renderablePosition(now: now),
+                   estimate.source != .hypothetical {
+                    // Hypothetical positions don't render on the map —
+                    // they don't have meaningful real-world coordinates.
+                    // The member list still surfaces them with a "GPS
+                    // unavailable" status so users know who's indoor.
+                    let coord = estimate.coordinate.clLocation
                     let status = PresenceStatus(
                         lastSeen: member.lastSeen,
                         hasFix: true,
                         now: now
                     )
-                    Annotation(member.displayName, coordinate: coord.clLocation) {
-                        memberMapPin(member: member, status: status)
+                    let memberColor = Color.memberColor(for: member.id)
+
+                    // Accuracy bubble — only worth drawing when it
+                    // covers more than ~20m. Below that it's smaller
+                    // than the pin and adds visual noise.
+                    //   • .gps         → faint solid ring
+                    //   • .staleGPS    → darker solid ring (time-aged)
+                    //   • .deadReckoning → dashed ring + warmer tint
+                    //     so the "footstep estimate" reads distinct
+                    //     from a real (stale) GPS fix.
+                    if estimate.accuracy > 20 {
+                        let isStale = estimate.source != .gps
+                        let isDR = estimate.source == .deadReckoning
+                        MapCircle(center: coord, radius: estimate.accuracy)
+                            .foregroundStyle(memberColor.opacity(isStale ? 0.18 : 0.08))
+                            .stroke(
+                                memberColor.opacity(0.5),
+                                style: StrokeStyle(
+                                    lineWidth: 1,
+                                    dash: isDR ? [4, 3] : []
+                                )
+                            )
+                    }
+                    Annotation(member.displayName, coordinate: coord) {
+                        memberMapPin(member: member,
+                                     status: status,
+                                     source: estimate.source)
                     }
                 }
             }
@@ -698,9 +791,16 @@ struct GroupDashboardView: View {
     }
 
     @ViewBuilder
-    private func memberMapPin(member: User, status: PresenceStatus) -> some View {
+    private func memberMapPin(member: User,
+                              status: PresenceStatus,
+                              source: PositionSource) -> some View {
         let isFocused = viewModel.focusedMemberID == member.id
         let color = Color.memberColor(for: member.id)
+        // Non-GPS sources render slightly faded so the user has a
+        // glance-level signal that "this dot isn't a fresh fix."
+        // PresenceStatus already fades by age; this layers a source
+        // signal on top so the two cues compound.
+        let sourceOpacity: Double = (source == .gps) ? 1.0 : 0.65
 
         ZStack {
             // Direction indicator (Google Maps style) — only when the
@@ -746,7 +846,7 @@ struct GroupDashboardView: View {
                        size: 32,
                        tint: color)
         }
-        .opacity(status.mapOpacity)
+        .opacity(status.mapOpacity * sourceOpacity)
         .animation(.smooth, value: isFocused)
         .accessibilityLabel("\(member.displayName), \(status.label)")
     }

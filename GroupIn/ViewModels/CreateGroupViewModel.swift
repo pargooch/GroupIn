@@ -75,55 +75,103 @@ final class CreateGroupViewModel {
         useCustomDate ? customExpiresAt : .now.addingTimeInterval(duration.seconds)
     }
 
+    /// Offline-first group creation.
+    ///
+    /// Generates the `GroupSession` in-process — UUID, invite code, all
+    /// of it — without a network call. Local state updates and the
+    /// user lands on the dashboard immediately. The CloudKit save is
+    /// dispatched in the background; if it fails the save goes into
+    /// `pendingGroupSaves` and the retry loop drains it once
+    /// connectivity returns. From the user's perspective there's no
+    /// "tap, wait, hope CloudKit responds" — group creation is
+    /// instant whether they're online or in airplane mode.
     func createGroup() async {
         guard canSubmit else { return }
         isSubmitting = true
         errorMessage = nil
         defer { isSubmitting = false }
 
-        do {
-            let service = appState.groupService
-            var me = appState.makeMembership()
-            let expiresAt = resolvedExpiry
+        let trimmedName = groupName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            errorMessage = "Please enter a group name."
+            return
+        }
 
-            let group = try await service.createGroup(
-                named: groupName,
-                category: category,
-                ownerID: me.id,
-                expiresAt: expiresAt
-            )
-            // Stamp the per-group ban hash now that we know the
-            // invite code. Persisting it on the User record means
-            // the owner has it on hand for their own future removal
-            // operations (the owner can't ban themselves, but the
-            // schema is uniform across roles).
-            me = appState.stampBanHash(me, for: group)
+        var me = appState.makeMembership()
+        let expiresAt = resolvedExpiry
 
-            // Navigate immediately — the publish runs in the
-            // background so the user doesn't sit on the create form
-            // waiting for the third network roundtrip. Heartbeat
-            // re-publishes within ~20 s if the initial write loses
-            // a race, so members in the cloud see the owner reliably.
-            var withCreator = group
-            withCreator.members.append(me)
+        // Build the GroupSession entirely in-process. No service call,
+        // no awaiting — local creation is synchronous and always
+        // succeeds. The persisted CloudKit save is a separate concern
+        // that AppState handles via its retry queue.
+        let creationTime = Date()
+        let group = GroupSession(
+            id: UUID(),
+            name: trimmedName,
+            inviteCode: GroupSession.generateInviteCode(),
+            category: category,
+            ownerID: me.id,
+            expiresAt: expiresAt,
+            createdAt: creationTime
+        )
 
-            appState.registerMembership(groupID: withCreator.id, memberID: me.id)
-            appState.addOrUpdate(group: withCreator)
-            appState.currentUser = me
-            appState.currentGroup = withCreator
-            appState.path.append(.groupDashboard(groupID: withCreator.id))
+        // Stamp the per-group ban hash now that we know the invite
+        // code. Persisting it on the User record means the owner has
+        // it on hand for their own future removal operations.
+        me = appState.stampBanHash(me, for: group)
 
-            Task { [service, me, withCreator] in
-                try? await service.publish(user: me, in: withCreator)
-            }
+        // Update local state immediately — group appears in
+        // `myGroups`, membership map is registered, dashboard route
+        // is pushed. The user is already at the dashboard by the
+        // time the next line runs.
+        var withCreator = group
+        withCreator.members.append(me)
+        appState.registerMembership(groupID: withCreator.id, memberID: me.id)
+        appState.addOrUpdate(group: withCreator)
+        appState.currentUser = me
+        appState.currentGroup = withCreator
+        appState.path.append(.groupDashboard(groupID: withCreator.id))
 
-            // Fire the permission prompt + schedule T-30 reminder.
-            // Detached so navigation isn't blocked by the system prompt.
-            Task { [appState, withCreator] in
-                await appState.registerNotifications(for: withCreator)
-            }
-        } catch {
-            errorMessage = error.localizedDescription
+        // Hand the GroupSession to AppState for durable persistence.
+        // Immediate attempt + retry-queue fallback all live in
+        // `dispatchGroupSave` — we never await it from here so this
+        // remains a pure local-side function.
+        appState.dispatchGroupSave(withCreator)
+
+        // Initial User publish — heartbeat will retry on its 20s
+        // cadence if this attempt fails, so we just fire-and-forget.
+        // No need for a separate retry queue.
+        Task { [groupService = appState.groupService, me, withCreator] in
+            try? await groupService.publish(user: me, in: withCreator)
+        }
+
+        // Seed the event log via the standard `emit` path so each
+        // event flows through `pendingEmits` retry + BLE gossip. The
+        // 1ms gap between the two events keeps them in the right
+        // order during reducer replay.
+        appState.emit(
+            .groupCreated(
+                name: withCreator.name,
+                inviteCode: withCreator.inviteCode,
+                category: withCreator.category,
+                expiresAt: withCreator.expiresAt
+            ),
+            in: withCreator.id
+        )
+        appState.emit(
+            .memberJoined(
+                memberID: me.id,
+                displayName: me.displayName,
+                avatarData: me.avatarData,
+                banHash: me.banHash
+            ),
+            in: withCreator.id
+        )
+
+        // Permission prompt + T-30 expiry reminder. Detached so the
+        // system prompt doesn't block navigation.
+        Task { [appState, withCreator] in
+            await appState.registerNotifications(for: withCreator)
         }
     }
 }

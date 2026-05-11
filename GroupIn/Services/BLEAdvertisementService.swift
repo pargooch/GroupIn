@@ -40,6 +40,13 @@ protocol BLEPresenceServicing: AnyObject {
     /// hash; only messages matching the active group's hash arrive.
     var chatMessages: AsyncStream<ChatMessage> { get }
 
+    /// Incoming `Event` payloads from in-range peers — the BLE-side
+    /// of the event log gossip. AppState applies them through the
+    /// reducer just like CloudKit-fetched events. Filtering by group
+    /// happens at the consumer (events carry their own groupID, and
+    /// only one group at a time is "active" for BLE advertising).
+    var events: AsyncStream<Event> { get }
+
     /// Stream of diagnostics about the peripheral side of the BLE pipe:
     /// how many remote centrals are connected to us, how many have
     /// subscribed to chat. Useful for surfacing "no one's listening"
@@ -51,6 +58,12 @@ protocol BLEPresenceServicing: AnyObject {
     func stop()
     /// Push a chat message to all subscribed central peers.
     func send(chatMessage: ChatMessage)
+
+    /// Broadcast a single event over the events characteristic.
+    /// Caller is responsible for cursor-based gating (deciding
+    /// whether anyone in range needs it) and for calling
+    /// `Event.strippedForBLE()` if the payload has large blobs.
+    func broadcastEvent(_ event: Event)
 }
 
 struct BLEDiagnostics: Sendable, Equatable {
@@ -81,6 +94,12 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// shape; we share the same GroupIn service.
     static let chatCharacteristicUUID = CBUUID(string: "A5B7E1C2-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
 
+    /// Characteristic UUID for JSON-encoded `Event` payloads — the
+    /// peer-to-peer gossip channel for the unified event log. Same
+    /// read+notify pattern as presence/chat; receivers fold incoming
+    /// events through the reducer and dedup via their own cursor.
+    static let eventsCharacteristicUUID = CBUUID(string: "A5B7E1C3-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
+
     /// iBeacon UUID for region monitoring. Different from the BLE service
     /// UUID because iBeacon advertisements use a manufacturer-data format
     /// while BLE service advertisements use the service-UUID list — iOS
@@ -93,10 +112,12 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     let peerUpdates: AsyncStream<PeerPresence>
     let rssiUpdates: AsyncStream<RSSIReading>
     let chatMessages: AsyncStream<ChatMessage>
+    let events: AsyncStream<Event>
     let diagnostics: AsyncStream<BLEDiagnostics>
     private nonisolated let peerContinuation: AsyncStream<PeerPresence>.Continuation
     private nonisolated let rssiContinuation: AsyncStream<RSSIReading>.Continuation
     private nonisolated let chatContinuation: AsyncStream<ChatMessage>.Continuation
+    private nonisolated let eventContinuation: AsyncStream<Event>.Continuation
     private nonisolated let diagnosticsContinuation: AsyncStream<BLEDiagnostics>.Continuation
 
     private var currentDiagnostics = BLEDiagnostics(
@@ -113,9 +134,20 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
 
     private var presenceCharacteristic: CBMutableCharacteristic?
     private var chatCharacteristic: CBMutableCharacteristic?
+    private var eventsCharacteristic: CBMutableCharacteristic?
     private var advertisedService: CBMutableService?
     private var serviceAdded: Bool = false
     private var lastChatData: Data?
+    /// Most recently broadcast event payload, exposed so a central
+    /// connecting later can read the latest single event we have. The
+    /// event log on CloudKit + the cursor-mismatch push are how peers
+    /// catch up on history; this just keeps the BLE characteristic
+    /// from looking empty on initial read.
+    private var lastEventData: Data?
+
+    /// Outbox for event-batch updates that hit a full BLE transmission
+    /// queue. Same pattern as `pendingChatUpdates`.
+    private var pendingEventUpdates: [Data] = []
 
     /// Outbox for chat updates that hit a full BLE transmission queue.
     /// `peripheralManager.updateValue` returns false when iOS can't
@@ -156,14 +188,17 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         let (peerStream, peerCont) = AsyncStream.makeStream(of: PeerPresence.self)
         let (rssiStream, rssiCont) = AsyncStream.makeStream(of: RSSIReading.self)
         let (chatStream, chatCont) = AsyncStream.makeStream(of: ChatMessage.self)
+        let (eventStream, eventCont) = AsyncStream.makeStream(of: Event.self)
         let (diagStream, diagCont) = AsyncStream.makeStream(of: BLEDiagnostics.self)
         self.peerUpdates = peerStream
         self.rssiUpdates = rssiStream
         self.chatMessages = chatStream
+        self.events = eventStream
         self.diagnostics = diagStream
         self.peerContinuation = peerCont
         self.rssiContinuation = rssiCont
         self.chatContinuation = chatCont
+        self.eventContinuation = eventCont
         self.diagnosticsContinuation = diagCont
         super.init()
         self.centralManager = CBCentralManager(delegate: self, queue: nil)
@@ -196,6 +231,9 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         advertisedService = nil
         presenceCharacteristic = nil
         chatCharacteristic = nil
+        eventsCharacteristic = nil
+        lastEventData = nil
+        pendingEventUpdates.removeAll()
         beginScanIfReady()
         beginAdvertisingIfReady()
     }
@@ -358,11 +396,18 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             value: nil,
             permissions: [.readable]
         )
+        let eventsChar = CBMutableCharacteristic(
+            type: Self.eventsCharacteristicUUID,
+            properties: [.read, .notify],
+            value: nil,
+            permissions: [.readable]
+        )
         let svc = CBMutableService(type: Self.serviceUUID, primary: true)
-        svc.characteristics = [presence, chat]
+        svc.characteristics = [presence, chat, eventsChar]
         peripheralManager.add(svc)
         presenceCharacteristic = presence
         chatCharacteristic = chat
+        eventsCharacteristic = eventsChar
         advertisedService = svc
         serviceAdded = true
     }
@@ -372,6 +417,22 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         lastChatData = data
         pendingChatUpdates.append(data)
         drainChatQueue()
+    }
+
+    /// Broadcast a single Event to all subscribed centrals over the
+    /// events characteristic. Caller is responsible for cursor-based
+    /// filtering (deciding whether anyone needs it) and for stripping
+    /// oversized fields (avatarData) via `Event.strippedForBLE()`.
+    ///
+    /// Per-event encoding (not batched) keeps payload size predictable
+    /// and avoids the BLE MTU fragmentation problem entirely for the
+    /// shapes we currently emit. If a future event type grows beyond
+    /// ~150 encoded bytes, we'll need real fragmentation here.
+    func broadcastEvent(_ event: Event) {
+        guard let data = try? JSONEncoder().encode(event) else { return }
+        lastEventData = data
+        pendingEventUpdates.append(data)
+        drainEventQueue()
     }
 
     /// Drain pending chat updates through `peripheralManager.updateValue`.
@@ -388,6 +449,25 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             )
             if delivered {
                 pendingChatUpdates.removeFirst()
+            } else {
+                return
+            }
+        }
+    }
+
+    /// Same drain pattern as chat — push queued events through
+    /// `updateValue`, stop on backpressure. Resumed from
+    /// `peripheralManagerIsReady` when iOS has room again.
+    private func drainEventQueue() {
+        guard let char = eventsCharacteristic else { return }
+        while let next = pendingEventUpdates.first {
+            let delivered = peripheralManager.updateValue(
+                next,
+                for: char,
+                onSubscribedCentrals: nil
+            )
+            if delivered {
+                pendingEventUpdates.removeFirst()
             } else {
                 return
             }
@@ -508,7 +588,8 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                 // the chat characteristic was never discovered.
                 peripheral.discoverCharacteristics(
                     [Self.presenceCharacteristicUUID,
-                     Self.chatCharacteristicUUID],
+                     Self.chatCharacteristicUUID,
+                     Self.eventsCharacteristicUUID],
                     for: service
                 )
             }
@@ -532,6 +613,15 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                     // there's no concept of "current chat state," only a
                     // stream of new messages from this point onward.
                     peripheral.setNotifyValue(true, for: char)
+                case Self.eventsCharacteristicUUID:
+                    // Events: read once so we pick up the most-recent
+                    // event the peer last broadcast (which is what's
+                    // sitting in their characteristic's last value),
+                    // then subscribe for the rest pushed via notify.
+                    // The cursor-mismatch push from AppState fills in
+                    // any older missing events too.
+                    peripheral.readValue(for: char)
+                    peripheral.setNotifyValue(true, for: char)
                 default:
                     break
                 }
@@ -551,10 +641,23 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                 self.handlePresenceData(data, from: peripheral)
             case Self.chatCharacteristicUUID:
                 self.handleChatData(data)
+            case Self.eventsCharacteristicUUID:
+                self.handleEventData(data)
             default:
                 break
             }
         }
+    }
+
+    private func handleEventData(_ data: Data) {
+        guard let event = try? JSONDecoder().decode(Event.self, from: data) else {
+            return
+        }
+        // Yield the event up to AppState's gossip consumer. Dedup
+        // happens there — comparing against the local event log so
+        // already-seen events don't re-trigger reducer application
+        // or onward gossip.
+        eventContinuation.yield(event)
     }
 
     private func handleChatData(_ data: Data) {
@@ -580,9 +683,10 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
 
     nonisolated func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
         // The transmission queue has space again. Resume any chat
-        // messages we couldn't push earlier.
+        // messages and event broadcasts we couldn't push earlier.
         Task { @MainActor [weak self] in
             self?.drainChatQueue()
+            self?.drainEventQueue()
         }
     }
 
@@ -658,6 +762,15 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
                     request.value = Data()
                     peripheral.respond(to: request, withResult: .success)
                 }
+            case Self.eventsCharacteristicUUID:
+                // Hand back the most recently broadcast event so a
+                // central connecting mid-stream gets *something* on
+                // initial read. The full catch-up flows through the
+                // cursor-mismatch push from AppState — there's no
+                // notion of "the current event," only "the latest
+                // event we happen to have broadcast."
+                request.value = self.lastEventData ?? Data()
+                peripheral.respond(to: request, withResult: .success)
             default:
                 peripheral.respond(to: request, withResult: .attributeNotFound)
             }

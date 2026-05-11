@@ -74,6 +74,16 @@ struct GroupSession: Identifiable, Hashable, Codable {
 
     func isOwner(_ memberID: UUID) -> Bool { ownerID == memberID }
 
+    /// Random invite code. Lifted out of the CloudKit service so the
+    /// offline-first creation path (CreateGroupViewModel) can mint a
+    /// complete GroupSession in-process without a CloudKit dependency.
+    /// Alphabet excludes ambiguous characters (`0/O`, `1/I`) so the
+    /// code is easier to share verbally.
+    static func generateInviteCode(length: Int = 6) -> String {
+        let alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        return String((0..<length).map { _ in alphabet.randomElement()! })
+    }
+
     /// True if `memberID` has accepted the current pending extension
     /// (or is the owner, who's an implicit accept).
     func hasAcceptedExtension(_ memberID: UUID) -> Bool {

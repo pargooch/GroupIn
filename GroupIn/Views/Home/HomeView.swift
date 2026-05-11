@@ -46,6 +46,7 @@ struct HomeView: View {
                     emptyGroupsState
                 } else {
                     ForEach(appState.myGroups) { group in
+                        let isOwner = group.ownerID == appState.currentUser.id
                         Button {
                             appState.open(group: group)
                         } label: {
@@ -53,10 +54,22 @@ struct HomeView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityHint("Opens group \(group.name)")
-                    }
-                    .onDelete { indexSet in
-                        for index in indexSet {
-                            appState.remove(group: appState.myGroups[index])
+                        // Per-row swipe label: owners delete the whole
+                        // group (cascade removes members server-side);
+                        // non-owners leave (their member record alone
+                        // is removed, others stay intact). Wording
+                        // matches the verb that actually happens.
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                appState.remove(group: group)
+                            } label: {
+                                Label(
+                                    isOwner ? "Delete" : "Leave",
+                                    systemImage: isOwner
+                                        ? "trash"
+                                        : "rectangle.portrait.and.arrow.right"
+                                )
+                            }
                         }
                     }
                 }
@@ -115,6 +128,24 @@ struct HomeView: View {
                 title: "Bluetooth is off",
                 body: "Turn Bluetooth on so GroupIn can find nearby members and exchange location offline.",
                 tint: .orange
+            ))
+        }
+        // Pending-uploads indicator: when CloudKit is unreachable
+        // (offline, schema mismatch, account issues), groups created
+        // and events emitted locally accumulate in the retry queues.
+        // The user sees their groups + chat work normally — this
+        // banner is the honest signal that some of it hasn't reached
+        // the cloud yet.
+        let pending = appState.pendingUploadCount
+        if pending > 0 {
+            banners.append(StatusBanner(
+                id: "pending",
+                icon: "arrow.up.circle.dotted",
+                title: pending == 1
+                    ? "1 item waiting to sync"
+                    : "\(pending) items waiting to sync",
+                body: "GroupIn keeps working offline. We'll upload your changes the moment iCloud is reachable again.",
+                tint: .blue
             ))
         }
         return banners

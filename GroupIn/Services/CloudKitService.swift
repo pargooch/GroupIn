@@ -94,7 +94,7 @@ private func ckErrorCodeName(_ code: CKError.Code) -> String {
     case .serverResponseLost:      return "serverResponseLost"
     case .assetNotAvailable:       return "assetNotAvailable"
     case .accountTemporarilyUnavailable: return "accountTemporarilyUnavailable"
-    @unknown default:              return "unknown(\(code.rawValue))"
+    default:                       return "unknown(\(code.rawValue))"
     }
 }
 
@@ -110,27 +110,32 @@ final class CloudKitService: CloudKitServicing {
 
     // MARK: - Create / Join
 
-    func createGroup(named name: String,
-                     category: GroupCategory,
-                     ownerID: UUID,
-                     expiresAt: Date) async throws -> GroupSession {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw GroupServiceError.invalidName }
-
-        let group = GroupSession(
-            name: trimmed,
-            inviteCode: Self.generateInviteCode(),
-            category: category,
-            ownerID: ownerID,
-            expiresAt: expiresAt
-        )
-
+    func saveGroup(_ group: GroupSession) async throws {
+        // Caller owns the GroupSession's identity (UUID + invite
+        // code) — we just persist it. This separation is what lets
+        // CreateGroupViewModel build the session locally, navigate
+        // the user to the dashboard immediately, and queue this
+        // save for retry if CloudKit is unreachable.
         let recordID = CKRecord.ID(recordName: group.id.uuidString)
+
+        // Use modifyRecords with `.allKeys` so retries are idempotent:
+        // if the record already exists from an earlier attempt,
+        // CloudKit overwrites it with the same content rather than
+        // failing with a serverRecordChanged conflict. Group creation
+        // is a one-shot write — we're not racing other writers.
         let record = CKRecord(recordType: GroupSession.recordType, recordID: recordID)
         group.writeTo(record: record)
 
-        try await save(record)
-        return group
+        do {
+            _ = try await database.modifyRecords(
+                saving: [record],
+                deleting: [],
+                savePolicy: .allKeys,
+                atomically: true
+            )
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
     }
 
     func joinGroup(inviteCode: String) async throws -> GroupSession {
@@ -433,6 +438,21 @@ final class CloudKitService: CloudKitServicing {
         return try await groupSession(from: groupRecord)
     }
 
+    func leaveGroup(groupID: UUID,
+                    memberID: UUID) async throws {
+        // Voluntary leave: delete the caller's member record without
+        // writing to the banlist. The user can rejoin with the invite
+        // code as if they'd never been a member.
+        let memberRecordID = CKRecord.ID(recordName: memberID.uuidString)
+        do {
+            _ = try await database.deleteRecord(withID: memberRecordID)
+        } catch let ckError as CKError where ckError.code == .unknownItem {
+            // Already gone — idempotent.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
     func unbanMember(banHash: String,
                      fromGroup groupID: UUID) async throws -> GroupSession {
         let groupRecordID = CKRecord.ID(recordName: groupID.uuidString)
@@ -501,6 +521,197 @@ final class CloudKitService: CloudKitServicing {
         } catch {
             return nil
         }
+    }
+
+    // MARK: - Event log
+
+    func appendEvent(_ event: Event) async throws {
+        let recordID = CKRecord.ID(recordName: event.id.uuidString)
+        let groupRecordID = CKRecord.ID(recordName: event.groupID.uuidString)
+
+        let record = CKRecord(recordType: Event.recordType, recordID: recordID)
+        event.writeTo(record: record, groupRecordID: groupRecordID)
+
+        // `.allKeys` — events are immutable, never updated after the
+        // initial write, so we want create-only semantics. CloudKit
+        // returns `.serverRecordChanged` on an attempted overwrite of
+        // an existing record, which we treat as success (idempotent
+        // appends from a retry don't double-write).
+        do {
+            _ = try await database.modifyRecords(
+                saving: [record],
+                deleting: [],
+                savePolicy: .allKeys,
+                atomically: true
+            )
+        } catch let ckError as CKError where ckError.code == .serverRecordChanged {
+            // Event with this ID already exists — gossip retry, treat
+            // as success. The original write already landed.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
+    func fetchEvents(forGroupID groupID: UUID,
+                     since cursor: EventCursor?) async throws -> [Event] {
+        let groupRef = CKRecord.Reference(
+            recordID: CKRecord.ID(recordName: groupID.uuidString),
+            action: .none
+        )
+
+        let predicate: NSPredicate
+        if let cursor {
+            // CloudKit predicates compare Date with `>`. The UUID
+            // tiebreaker for events at the same millisecond is
+            // applied client-side after the fetch — usually a no-op
+            // since two events rarely share a timestamp.
+            predicate = NSPredicate(
+                format: "groupID == %@ AND createdAt > %@",
+                groupRef, cursor.createdAt as NSDate
+            )
+        } else {
+            predicate = NSPredicate(format: "groupID == %@", groupRef)
+        }
+
+        let query = CKQuery(recordType: Event.recordType, predicate: predicate)
+        query.sortDescriptors = [
+            NSSortDescriptor(key: "createdAt", ascending: true)
+        ]
+
+        var events: [Event] = []
+        var queryCursor: CKQueryOperation.Cursor?
+
+        // Iterate cursor pages so large logs sync completely. First
+        // iteration is the regular query; subsequent ones continue
+        // from the returned cursor.
+        do {
+            let firstResult = try await database.records(matching: query)
+            events.append(contentsOf: extractEvents(from: firstResult.matchResults))
+            queryCursor = firstResult.queryCursor
+
+            while let next = queryCursor {
+                let nextResult = try await database.records(continuingMatchFrom: next)
+                events.append(contentsOf: extractEvents(from: nextResult.matchResults))
+                queryCursor = nextResult.queryCursor
+            }
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+
+        // Client-side filter on the UUID tiebreaker for any events
+        // sharing the cursor's exact createdAt. The CloudKit predicate
+        // uses strict `>` on Date, so we don't need this for the
+        // common case — only the millisecond-collision edge case.
+        if let cursor {
+            events.removeAll { event in
+                event.createdAt == cursor.createdAt
+                    && event.id.uuidString <= cursor.id.uuidString
+            }
+        }
+
+        return events
+    }
+
+    func fetchEvents(forGroupID groupID: UUID,
+                     olderThan cursor: EventCursor?,
+                     limit: Int) async throws -> [Event] {
+        let groupRef = CKRecord.Reference(
+            recordID: CKRecord.ID(recordName: groupID.uuidString),
+            action: .none
+        )
+
+        let predicate: NSPredicate
+        if let cursor {
+            predicate = NSPredicate(
+                format: "groupID == %@ AND createdAt < %@",
+                groupRef, cursor.createdAt as NSDate
+            )
+        } else {
+            predicate = NSPredicate(format: "groupID == %@", groupRef)
+        }
+
+        let query = CKQuery(recordType: Event.recordType, predicate: predicate)
+        // Newest-first so the limit clips the oldest events from the
+        // tail, not the most recent. UI re-sorts ascending for display
+        // but the network fetch must give us the latest N to honor
+        // the "scroll-to-top loads older" pagination semantics.
+        query.sortDescriptors = [
+            NSSortDescriptor(key: "createdAt", ascending: false)
+        ]
+
+        do {
+            let result = try await database.records(
+                matching: query,
+                resultsLimit: limit
+            )
+            var events = extractEvents(from: result.matchResults)
+            // Client-side UUID tiebreak for events sharing the exact
+            // boundary timestamp. The CloudKit predicate uses strict
+            // `<` on Date so this only matters when two events landed
+            // in the same millisecond as the cursor.
+            if let cursor {
+                events.removeAll { event in
+                    event.createdAt == cursor.createdAt
+                        && event.id.uuidString >= cursor.id.uuidString
+                }
+            }
+            return events
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
+    func subscribeToEvents(groupID: UUID) async throws {
+        let groupRecordID = CKRecord.ID(recordName: groupID.uuidString)
+        let groupRef = CKRecord.Reference(recordID: groupRecordID, action: .none)
+        let predicate = NSPredicate(format: "groupID == %@", groupRef)
+
+        let subscriptionID = Self.eventSubscriptionID(for: groupID)
+        let subscription = CKQuerySubscription(
+            recordType: Event.recordType,
+            predicate: predicate,
+            subscriptionID: subscriptionID,
+            options: [.firesOnRecordCreation]
+        )
+
+        let info = CKSubscription.NotificationInfo()
+        info.shouldSendContentAvailable = true
+        subscription.notificationInfo = info
+
+        do {
+            _ = try await database.save(subscription)
+        } catch let ckError as CKError where ckError.code == .serverRejectedRequest {
+            // Most common cause: already registered. CloudKit keeps
+            // subscriptions across launches, so this is fine — our
+            // re-registration is just a confirmation.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
+    func unsubscribeFromEvents(groupID: UUID) async throws {
+        let subscriptionID = Self.eventSubscriptionID(for: groupID)
+        do {
+            _ = try await database.deleteSubscription(withID: subscriptionID)
+        } catch let ckError as CKError where ckError.code == .unknownItem {
+            // Already gone — idempotent.
+        } catch let ckError as CKError {
+            throw mapCKError(ckError)
+        }
+    }
+
+    /// Helper: pull successful Event decodes out of a query result.
+    private func extractEvents(
+        from matchResults: [(CKRecord.ID, Result<CKRecord, Error>)]
+    ) -> [Event] {
+        matchResults.compactMap { _, recordResult in
+            guard case .success(let record) = recordResult else { return nil }
+            return Event(record: record)
+        }
+    }
+
+    private static func eventSubscriptionID(for groupID: UUID) -> String {
+        "events-\(groupID.uuidString)"
     }
 
     // MARK: - Account preflight
@@ -608,10 +819,4 @@ final class CloudKitService: CloudKitServicing {
         return nil
     }
 
-    // MARK: - Invite codes
-
-    private static func generateInviteCode(length: Int = 6) -> String {
-        let alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-        return String((0..<length).map { _ in alphabet.randomElement()! })
-    }
 }

@@ -10,10 +10,25 @@
 import Foundation
 import CoreLocation
 
+/// One GPS fix carrying everything Path B needs to record provenance:
+/// not just the latitude/longitude but how confident CoreLocation was
+/// in the reading and exactly when it was taken. Replaces the old
+/// "stream of bare Coordinates" — consumers can no longer accidentally
+/// lose track of accuracy by treating two fixes as equivalent.
+struct LocationFix: Sendable {
+    let coordinate: Coordinate
+    /// Horizontal accuracy in meters (1-sigma). Mirrors
+    /// `CLLocation.horizontalAccuracy`. Always > 0 when the fix is
+    /// valid; CoreLocation uses negative values to signal an invalid
+    /// reading and we filter those out before yielding.
+    let accuracy: Double
+    let timestamp: Date
+}
+
 @MainActor
 protocol LocationServicing: AnyObject {
     var authorizationStatus: CLAuthorizationStatus { get }
-    var locationUpdates: AsyncStream<Coordinate> { get }
+    var locationUpdates: AsyncStream<LocationFix> { get }
     var headingUpdates: AsyncStream<Double> { get }
     var authorizationUpdates: AsyncStream<CLAuthorizationStatus> { get }
     func requestAuthorization()
@@ -30,11 +45,11 @@ protocol LocationServicing: AnyObject {
 final class LocationService: NSObject, LocationServicing, CLLocationManagerDelegate {
     private let manager: CLLocationManager
 
-    let locationUpdates: AsyncStream<Coordinate>
+    let locationUpdates: AsyncStream<LocationFix>
     let headingUpdates: AsyncStream<Double>
     let authorizationUpdates: AsyncStream<CLAuthorizationStatus>
 
-    private nonisolated let locationContinuation: AsyncStream<Coordinate>.Continuation
+    private nonisolated let locationContinuation: AsyncStream<LocationFix>.Continuation
     private nonisolated let headingContinuation: AsyncStream<Double>.Continuation
     private nonisolated let authContinuation: AsyncStream<CLAuthorizationStatus>.Continuation
 
@@ -43,7 +58,7 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
     }
 
     override init() {
-        let (locStream, locCont) = AsyncStream.makeStream(of: Coordinate.self)
+        let (locStream, locCont) = AsyncStream.makeStream(of: LocationFix.self)
         let (hdgStream, hdgCont) = AsyncStream.makeStream(of: Double.self)
         let (authStream, authCont) = AsyncStream.makeStream(of: CLAuthorizationStatus.self)
         self.locationUpdates = locStream
@@ -121,9 +136,19 @@ final class LocationService: NSObject, LocationServicing, CLLocationManagerDeleg
     nonisolated func locationManager(_ manager: CLLocationManager,
                                      didUpdateLocations locations: [CLLocation]) {
         guard let last = locations.last else { return }
+        // CoreLocation reports negative `horizontalAccuracy` for
+        // invalid fixes. Filter those out — a bad fix with bogus
+        // accuracy is worse than no fix at all, because it'd be
+        // recorded with provenance = .gps and treated as truth.
+        guard last.horizontalAccuracy > 0 else { return }
         let coord = Coordinate(latitude: last.coordinate.latitude,
                                longitude: last.coordinate.longitude)
-        locationContinuation.yield(coord)
+        let fix = LocationFix(
+            coordinate: coord,
+            accuracy: last.horizontalAccuracy,
+            timestamp: last.timestamp
+        )
+        locationContinuation.yield(fix)
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager,

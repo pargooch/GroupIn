@@ -123,6 +123,28 @@ extension User {
         let nearbyToken = record["nearbyToken"] as? Data
         let banHash = record["banHash"] as? String
 
+        // Provenance fields — all optional, decode defensively. Old
+        // records (pre-Path-B) have only lat/lon, no source. The
+        // User model's `positionEstimate` accessor falls back to
+        // `.gps` with a high default accuracy in that case.
+        let accuracy = record["positionAccuracy"] as? Double
+        let positionSource = (record["positionSource"] as? String)
+            .flatMap(PositionSource.init(rawValue:))
+        let positionAnchorAt = record["positionAnchorAt"] as? Date
+        let positionSourcePeerID = (record["positionSourcePeerID"] as? String)
+            .flatMap(UUID.init(uuidString:))
+
+        // Event cursor (Path C.4.2) — what this member has
+        // acknowledged locally. Drives delivery-dot rendering for
+        // other members. Both fields optional and decoded defensively;
+        // either missing → no usable cursor → treated as "unknown."
+        let cursorDate = record["eventCursorCreatedAt"] as? Date
+        let cursorID = (record["eventCursorID"] as? String)
+            .flatMap(UUID.init(uuidString:))
+        let eventCursor = (cursorDate != nil && cursorID != nil)
+            ? EventCursor(createdAt: cursorDate!, id: cursorID!)
+            : nil
+
         self.init(id: id,
                   displayName: displayName,
                   avatarData: avatarData,
@@ -130,7 +152,12 @@ extension User {
                   coordinate: coordinate,
                   heading: heading,
                   nearbyToken: nearbyToken,
-                  banHash: banHash)
+                  banHash: banHash,
+                  accuracy: accuracy,
+                  positionSource: positionSource,
+                  positionAnchorAt: positionAnchorAt,
+                  positionSourcePeerID: positionSourcePeerID,
+                  eventCursor: eventCursor)
     }
 
     /// Mutates the record's fields. Caller is responsible for `database.save`.
@@ -152,5 +179,20 @@ extension User {
         record["heading"] = heading
         record["nearbyToken"] = nearbyToken
         record["banHash"] = banHash
+
+        // Provenance — write only when populated so legacy records
+        // don't accumulate nil fields, keeping CloudKit storage tidy
+        // and the schema additions opt-in until the first write from
+        // a Path-B-aware client.
+        record["positionAccuracy"] = accuracy
+        record["positionSource"] = positionSource?.rawValue
+        record["positionAnchorAt"] = positionAnchorAt
+        record["positionSourcePeerID"] = positionSourcePeerID?.uuidString
+
+        // Event cursor — published on every heartbeat so other
+        // members can resolve delivery status for their outgoing
+        // events. Same opt-in semantics as the provenance fields.
+        record["eventCursorCreatedAt"] = eventCursorCreatedAt
+        record["eventCursorID"] = eventCursorID?.uuidString
     }
 }

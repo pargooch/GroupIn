@@ -72,41 +72,101 @@ final class AppState {
     /// membershipByGroupID`; not persisted directly since `currentGroup`
     /// is already the canonical source of member data.
     var currentUser: User
+    /// The group whose dashboard the user is currently viewing. Used
+    /// for UI focus only — **tracking lifecycle is driven by `myGroups`,
+    /// not this property.** Closing the dashboard via Done leaves this
+    /// set (so reopening is instant); only an explicit leave/delete
+    /// or a banned/deleted notice clears it.
     var currentGroup: GroupSession? {
-        didSet {
-            persistCurrentGroup()
-            // Find My / Live Location-style: location flows for the
-            // duration of group membership, not just while the dashboard
-            // is on screen. Lock the phone, navigate Home, drop the app
-            // into background — sharing keeps going until you Leave.
-            // iBeacon region monitoring follows the same lifecycle so we
-            // can wake on peer proximity even when the app is closed.
-            switch (oldValue, currentGroup) {
-            case (nil, .some(let group)):
-                startLocationTracking()
-                startBeaconMonitoring()
-                startPresenceHeartbeat()
-                Task { [groupService = self.groupService, groupID = group.id] in
-                    try? await groupService.subscribeToPresenceUpdates(groupID: groupID)
-                }
-            case (.some(let oldGroup), nil):
-                stopLocationTracking()
-                stopBeaconMonitoring()
-                stopPresenceHeartbeat()
-                Task { [groupService = self.groupService, groupID = oldGroup.id] in
-                    try? await groupService.unsubscribeFromPresenceUpdates(groupID: groupID)
-                }
-            default:
-                break
-            }
-        }
+        didSet { persistCurrentGroup() }
     }
+
+    /// Authoritative list of groups the user is a member of. Tracking
+    /// (location, beacons, heartbeat) starts when this becomes
+    /// non-empty and stops when it goes back to empty. Per-group
+    /// CloudKit subscriptions are added/removed based on the diff
+    /// between the previous and new list, so receiving silent pushes
+    /// for a group follows membership instead of dashboard focus.
     var myGroups: [GroupSession] = [] {
-        didSet { persistMyGroups() }
+        didSet {
+            persistMyGroups()
+            reconcileTrackingLifecycle(previous: oldValue, current: myGroups)
+        }
     }
     private(set) var membershipByGroupID: [UUID: UUID] = [:] {
         didSet { persistMembershipMap() }
     }
+
+    /// Per-group event cursor — the `(createdAt, id)` of the newest
+    /// event we've applied locally. Sync resumes from here on every
+    /// CloudKit push or pull-to-refresh. Persisted to UserDefaults so
+    /// cold starts don't replay the whole log from scratch.
+    private var eventCursors: [UUID: EventCursor] = [:] {
+        didSet { persistEventCursors() }
+    }
+
+    /// Per-group "oldest local event" cursor — used for paginated
+    /// scroll-to-top history loading. The UI calls
+    /// `loadOlderEvents(for:)` and we fetch `Self.timelinePageSize`
+    /// events older than this, prepend to the local store, and update
+    /// this cursor to the oldest of the new batch. Nil means we
+    /// haven't loaded any events yet for this group.
+    private var oldestEventCursors: [UUID: EventCursor] = [:] {
+        didSet { persistOldestEventCursors() }
+    }
+
+    /// Set of groups where we've fetched an "older" batch that came
+    /// back with fewer than the page size — meaning we've reached the
+    /// start of the group's recorded history. The timeline UI uses
+    /// this to show a "Start of group" marker and stop firing more
+    /// load-older requests.
+    private(set) var groupsAtStartOfHistory: Set<UUID> = []
+
+    /// Locally-persisted event log per group. Populated by every event
+    /// ingestion path: local emits, CloudKit forward sync, CloudKit
+    /// older-batch fetches, BLE gossip. The timeline UI reads from
+    /// here exclusively — never directly from the CloudKit service —
+    /// so it works offline and renders instantly from cache.
+    private(set) var eventsByGroup: [UUID: [Event]] = [:] {
+        didSet { persistEventsByGroup() }
+    }
+
+    /// Page size for paginated `loadOlderEvents(for:)`. Returning
+    /// fewer than this in a batch marks the start of the group's
+    /// history.
+    private static let timelinePageSize = 30
+
+    /// Delivery status for events the local user authored — drives
+    /// the WhatsApp-style ⏰/✓/✓✓ dot on outgoing chat bubbles.
+    /// Persisted so the UI doesn't lose state across app launches.
+    /// Only mutated through `advanceDelivery(_:to:)` which enforces
+    /// the never-go-backwards rule.
+    private var eventDeliveryByID: [UUID: EventDeliveryStatus] = [:] {
+        didSet { persistEventDelivery() }
+    }
+
+    /// Persisted retry queue for events whose CloudKit append failed.
+    /// Drained by `retryEmitTask` on an exponential-backoff schedule;
+    /// also retried opportunistically on every successful sync (since
+    /// "sync succeeded" implies CloudKit is reachable). Restored on
+    /// app launch so an unflushed event survives a force-quit.
+    private var pendingEmits: [PendingEmit] = [] {
+        didSet { persistPendingEmits() }
+    }
+    /// Persisted retry queue for `saveGroup` calls that failed —
+    /// covers the offline-first group creation path. Same drain
+    /// cadence and backoff schedule as `pendingEmits`. The user can
+    /// create a group with no network, navigate to its dashboard,
+    /// chat with anyone in BLE range; the CloudKit upload happens
+    /// in the background once a connection returns.
+    private var pendingGroupSaves: [PendingGroupSave] = [] {
+        didSet { persistPendingGroupSaves() }
+    }
+    private var retryEmitTask: Task<Void, Never>?
+    /// Tick interval for the retry task. We wake on this cadence and
+    /// drain any pending emits / group saves whose `nextRetryAt` has
+    /// passed.
+    private static let retryTickInterval: TimeInterval = 5
     var path: [AppRoute] = []
 
     var locationAuthorizationStatus: CLAuthorizationStatus = .notDetermined
@@ -129,6 +189,13 @@ final class AppState {
     /// clear explanation. Cleared after the alert is acknowledged.
     var bannedFromGroupName: String?
 
+    /// Set when a refresh discovers the active group was hard-deleted
+    /// server-side (owner pressed Delete, or it expired and was
+    /// cleaned up). The dashboard's modifier surfaces a one-time
+    /// "this group was deleted" alert and pops back to Home. Cleared
+    /// after the alert is dismissed.
+    var groupDeletedNotice: String?
+
     /// True when the device has internet (any path satisfied).
     /// Driven by NWPathMonitor.
     var isOnline: Bool = true
@@ -145,6 +212,7 @@ final class AppState {
     let beaconMonitor: BeaconMonitorService
     let motionService: MotionActivityServicing
     let uwbSessionService: UWBSessionServicing
+    let deadReckoningService: DeadReckoningServicing
 
     private let defaults: UserDefaults
     private var networkMonitor: NetworkMonitor?
@@ -192,6 +260,33 @@ final class AppState {
     private var bleDiagnosticsTask: Task<Void, Never>?
     private var iCloudAccountChangeTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
+    private var bleEventTask: Task<Void, Never>?
+    private var deadReckoningTask: Task<Void, Never>?
+
+    /// Timestamp of the most recent fresh GPS fix. The DR consumer
+    /// uses this to decide whether to apply DR estimates (only when
+    /// the GPS has gone stale, ~30s+ since last fix).
+    private var lastGPSFixAt: Date?
+
+    /// True once we've received at least one GPS fix during this app
+    /// session. Used by the B.2.2 hypothetical-source publishing
+    /// path — if we *never* had GPS this session, our own position
+    /// publishes as `.hypothetical` so other members render us
+    /// distinctly.
+    private var hasEverHadGPSThisSession: Bool = false
+
+    /// GPS staleness threshold for switching to DR. Below this, fresh
+    /// GPS wins; above it, DR fills in until the next fix arrives.
+    private static let gpsStaleAfter: TimeInterval = 30
+
+    /// Last-known event cursor for each in-range BLE peer. Populated
+    /// from PeerPresence broadcasts as they arrive; dropped when a
+    /// peer disconnects (no TTL — broadcasts only reach currently-
+    /// subscribed centrals, so stale cursors give no benefit).
+    /// Used to decide whether a new event needs to be broadcast at
+    /// all: if every tracked peer is already at or ahead of an
+    /// event's cursor, we skip the BLE write.
+    private var peerCursors: [UUID: EventCursor] = [:]
     private static let heartbeatInterval: TimeInterval = 20
     /// Threshold under which the heartbeat skips work — if a real GPS
     /// fix updated `lastSeen` recently, no need to pile on extra writes.
@@ -201,6 +296,12 @@ final class AppState {
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
     private static let myGroupsKey = "GroupIn.AppState.myGroups"
     private static let membershipMapKey = "GroupIn.AppState.membershipMap"
+    private static let eventCursorsKey = "GroupIn.AppState.eventCursors"
+    private static let oldestEventCursorsKey = "GroupIn.AppState.oldestEventCursors"
+    private static let eventsByGroupKey = "GroupIn.AppState.eventsByGroup"
+    private static let eventDeliveryKey = "GroupIn.AppState.eventDelivery"
+    private static let pendingEmitsKey = "GroupIn.AppState.pendingEmits"
+    private static let pendingGroupSavesKey = "GroupIn.AppState.pendingGroupSaves"
 
     var isInGroup: Bool { currentGroup != nil }
 
@@ -211,6 +312,7 @@ final class AppState {
          blePresenceService: BLEPresenceServicing? = nil,
          motionService: MotionActivityServicing? = nil,
          uwbSessionService: UWBSessionServicing? = nil,
+         deadReckoningService: DeadReckoningServicing? = nil,
          defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let resolvedProfile = localProfile ?? Self.loadLocalProfile(defaults: defaults)
@@ -230,8 +332,16 @@ final class AppState {
         self.beaconMonitor = BeaconMonitorService()
         self.motionService = motionService ?? MotionActivityService()
         self.uwbSessionService = uwbSessionService ?? UWBSessionService()
+        self.deadReckoningService = deadReckoningService
+            ?? DeadReckoningService(defaults: defaults)
 
         self.membershipByGroupID = Self.loadMembershipMap(defaults: defaults)
+        self.eventCursors = Self.loadEventCursors(defaults: defaults)
+        self.oldestEventCursors = Self.loadOldestEventCursors(defaults: defaults)
+        self.eventsByGroup = Self.loadEventsByGroup(defaults: defaults)
+        self.eventDeliveryByID = Self.loadEventDelivery(defaults: defaults)
+        self.pendingEmits = Self.loadPendingEmits(defaults: defaults)
+        self.pendingGroupSaves = Self.loadPendingGroupSaves(defaults: defaults)
 
         if let data = defaults.data(forKey: Self.myGroupsKey),
            let decoded = try? JSONDecoder().decode([GroupSession].self, from: data) {
@@ -259,24 +369,36 @@ final class AppState {
         startICloudAccountMonitor()
         startBLEDiagnosticsMonitor()
         loadLocalCloudUserID()
+        startEmitRetryLoop()
 
-        // didSet doesn't fire during init, so if we restored a group from
-        // persistence, kick off location explicitly. The user comes back
-        // to a phone that's been locked all night and sharing is already
-        // alive when they unlock — same as Find My.
-        if let group = currentGroup {
+        // didSet doesn't fire during init, so if we restored any
+        // memberships from persistence we need to kick off the
+        // tracking stack explicitly. The user unlocks a phone that's
+        // been quiet all night and sharing is already alive — same as
+        // Find My.
+        if !myGroups.isEmpty {
             startLocationTracking()
             startBeaconMonitoring()
             startPresenceHeartbeat()
-            // Re-confirm the CloudKit subscription on every launch — the
-            // CKDatabase persists subscriptions server-side, so this is
-            // a no-op if it's already there. Cheap insurance.
+            // Re-confirm the CloudKit subscription for every group on
+            // every launch — the CKDatabase persists subscriptions
+            // server-side, so duplicates are no-ops. Cheap insurance
+            // against a subscription getting dropped between launches.
             //
             // Using `self.groupService` explicitly because the init
             // parameter named `groupService` is the optional-arg form
             // and would shadow the property otherwise.
-            Task { [groupService = self.groupService, groupID = group.id] in
-                try? await groupService.subscribeToPresenceUpdates(groupID: groupID)
+            for restoredGroup in myGroups {
+                Task { [groupService = self.groupService, groupID = restoredGroup.id] in
+                    try? await groupService.subscribeToPresenceUpdates(groupID: groupID)
+                    try? await groupService.subscribeToEvents(groupID: groupID)
+                }
+                // Catch up on events that landed while the app was
+                // closed. Cursor-driven, so this is cheap on launch
+                // if not much changed.
+                Task { [weak self, groupID = restoredGroup.id] in
+                    await self?.syncEvents(for: groupID)
+                }
             }
         }
     }
@@ -331,6 +453,76 @@ final class AppState {
         beaconMonitor.stop()
     }
 
+    // MARK: - Tracking lifecycle reconciliation
+    //
+    // The user's membership in groups (`myGroups`) is what controls
+    // whether the location/beacon/heartbeat stack is alive. Foreground
+    // focus on a particular group (`currentGroup`) is purely a UI
+    // concern. Splitting these means:
+    //
+    //   • Tapping "Done" on the dashboard doesn't stop tracking — the
+    //     user is still a member, still publishing presence.
+    //   • Tracking only winds down when the user is in zero groups
+    //     (last membership left, or all expired). At that point the
+    //     blue background-location indicator disappears, which is the
+    //     correct UX signal.
+    //   • CloudKit subscriptions follow membership too, so silent
+    //     pushes for moderation/ban/expiry events still arrive while
+    //     the dashboard is closed.
+
+    private func reconcileTrackingLifecycle(previous: [GroupSession],
+                                            current: [GroupSession]) {
+        let previousIDs = Set(previous.map(\.id))
+        let currentIDs = Set(current.map(\.id))
+
+        let wasEmpty = previous.isEmpty
+        let isEmpty = current.isEmpty
+
+        // Whole-stack transitions: only fire when crossing the
+        // "any group" / "no groups" boundary, not on every membership
+        // tweak (members joining/leaving an existing group shouldn't
+        // bounce our local sensors).
+        if wasEmpty, !isEmpty {
+            startLocationTracking()
+            startBeaconMonitoring()
+            startPresenceHeartbeat()
+        } else if !wasEmpty, isEmpty {
+            stopLocationTracking()
+            stopBeaconMonitoring()
+            stopPresenceHeartbeat()
+        }
+
+        // Per-group subscription deltas — independent of the whole-
+        // stack transition. Subscribe for groups that just appeared,
+        // unsubscribe for groups that just left. Idempotent on the
+        // backend side: a duplicate subscribe is a no-op, a missing
+        // unsubscribe also a no-op.
+        let added = currentIDs.subtracting(previousIDs)
+        let removed = previousIDs.subtracting(currentIDs)
+        for groupID in added {
+            Task { [groupService = self.groupService, groupID] in
+                try? await groupService.subscribeToPresenceUpdates(groupID: groupID)
+                try? await groupService.subscribeToEvents(groupID: groupID)
+            }
+            // Catch up on any events that landed while we weren't
+            // subscribed — between the previous unsubscribe and this
+            // subscribe — by triggering an immediate event sync.
+            Task { [weak self, groupID] in
+                await self?.syncEvents(for: groupID)
+            }
+        }
+        for groupID in removed {
+            Task { [groupService = self.groupService, groupID] in
+                try? await groupService.unsubscribeFromPresenceUpdates(groupID: groupID)
+                try? await groupService.unsubscribeFromEvents(groupID: groupID)
+            }
+            // Drop the cursor too — if we ever rejoin this group, we
+            // want a fresh sync rather than picking up from where we
+            // left off (which could be wildly out of date).
+            eventCursors.removeValue(forKey: groupID)
+        }
+    }
+
     // MARK: - Presence heartbeat
     //
     // Without this, peers see us "go offline" after ~30 s of being still.
@@ -359,10 +551,8 @@ final class AppState {
     }
 
     private func tickHeartbeat() {
-        guard var group = currentGroup,
-              let idx = group.members.firstIndex(where: { $0.id == currentUser.id }) else {
-            return
-        }
+        guard !myGroups.isEmpty else { return }
+
         // Skip if a real location fix already kept us fresh — keeps the
         // CloudKit write rate from doubling when we're moving.
         let now = Date()
@@ -370,21 +560,75 @@ final class AppState {
             return
         }
 
-        var me = currentUser
-        me.lastSeen = now
-        currentUser = me
-        group.members[idx] = me
-        currentGroup = group
-        addOrUpdate(group: group)
+        // Local-self refresh so the live currentUser stays fresh for
+        // any UI bound to it.
+        var refreshedSelf = currentUser
+        refreshedSelf.lastSeen = now
+        currentUser = refreshedSelf
 
-        // Push directly — bypass `publishLocationIfNeeded`'s 10 s throttle
-        // since the heartbeat is itself the cadence we want.
-        lastLocationPublishAt = now
-        let snapshot = me
-        let groupSnapshot = group
-        Task { [groupService = self.groupService, snapshot, groupSnapshot] in
-            try? await groupService.publish(user: snapshot, in: groupSnapshot)
+        // Refresh and re-publish a per-group user record for every
+        // membership. Each group has its own User.id (per-group UUID),
+        // so we mint a fresh User for each group using that group's
+        // membership ID. `User.id` is a `let`, hence the construction
+        // via init rather than mutation.
+        for group in myGroups {
+            guard let myID = membershipByGroupID[group.id] else { continue }
+
+            var perGroupSelf = User(
+                id: myID,
+                displayName: refreshedSelf.displayName,
+                avatarData: refreshedSelf.avatarData,
+                lastSeen: refreshedSelf.lastSeen,
+                coordinate: refreshedSelf.coordinate,
+                heading: refreshedSelf.heading,
+                nearbyToken: refreshedSelf.nearbyToken,
+                banHash: nil,
+                eventCursor: eventCursors[group.id]
+            )
+            // Use the existing on-record banHash for this group if any,
+            // otherwise stamp a fresh one. Older memberships created
+            // before the ban feature shipped pick the hash up on the
+            // first heartbeat.
+            let storedHash = group.members.first(where: { $0.id == myID })?.banHash
+            perGroupSelf.banHash = storedHash
+                ?? stampBanHash(perGroupSelf, for: group).banHash
+
+            // Hypothetical-source tagging (B.2.2): if we've never had
+            // GPS during this app session, our heartbeat advertises
+            // `.hypothetical` so other members render us with the
+            // indoor / no-coords styling instead of pretending we
+            // have a real fix. Once GPS lands the location consumer
+            // overwrites this with `.gps` (or `.deadReckoning`).
+            if !hasEverHadGPSThisSession {
+                perGroupSelf.positionSource = .hypothetical
+                perGroupSelf.positionAnchorAt = nil
+                perGroupSelf.accuracy = nil
+            }
+
+            // Patch the cached group + myGroups list in-place so the
+            // UI reflects the heartbeat before the network call lands.
+            var patched = group
+            if let idx = patched.members.firstIndex(where: { $0.id == myID }) {
+                patched.members[idx] = perGroupSelf
+            } else {
+                patched.members.append(perGroupSelf)
+            }
+            addOrUpdate(group: patched)
+            if currentGroup?.id == group.id {
+                currentGroup = patched
+            }
+
+            // Background write — fire-and-forget per group. We don't
+            // serialize because most of the cost is network latency
+            // and the writes are independent.
+            Task { [groupService = self.groupService, perGroupSelf, patched] in
+                try? await groupService.publish(user: perGroupSelf, in: patched)
+            }
         }
+
+        // Bypass the 10s `publishLocationIfNeeded` throttle since the
+        // heartbeat is itself the cadence we want.
+        lastLocationPublishAt = now
         broadcastBLEPresence()
     }
 
@@ -476,9 +720,20 @@ final class AppState {
             for await _ in AppDelegate.pushStream {
                 guard let self else { return }
                 await self.refreshCurrentGroup()
+                // Pull any new events that arrived for the active
+                // group. The push could be for either a Member record
+                // change (presence) or an Event record creation —
+                // we don't currently distinguish, so we run both
+                // sync paths every time.
+                if let activeID = self.currentGroup?.id {
+                    await self.syncEvents(for: activeID)
+                }
                 try? await Task.sleep(for: .seconds(3))
                 guard !Task.isCancelled else { return }
                 await self.refreshCurrentGroup()
+                if let activeID = self.currentGroup?.id {
+                    await self.syncEvents(for: activeID)
+                }
             }
         }
     }
@@ -668,22 +923,26 @@ final class AppState {
     func remove(group: GroupSession) {
         let isOwner = group.ownerID == currentUser.id
 
-        myGroups.removeAll { $0.id == group.id }
-        membershipByGroupID.removeValue(forKey: group.id)
-        if currentGroup?.id == group.id {
-            currentGroup = nil
-        }
-        Task { [notificationService, groupID = group.id] in
-            await notificationService.cancelAll(for: groupID)
-        }
-
-        // Owner-initiated cloud delete. Non-owners can't authoritatively
-        // delete the group server-side; they just leave their member
-        // record behind for the natural expiry to clean up. Owners get
-        // the group + member cascade removed from CloudKit.
         if isOwner {
+            // Owner-initiated hard delete — drop the group + cascade
+            // delete its members server-side, then clear local state.
+            myGroups.removeAll { $0.id == group.id }
+            membershipByGroupID.removeValue(forKey: group.id)
+            if currentGroup?.id == group.id {
+                currentGroup = nil
+            }
+            Task { [notificationService, groupID = group.id] in
+                await notificationService.cancelAll(for: groupID)
+            }
             Task { [groupService = self.groupService, groupID = group.id] in
                 try? await groupService.deleteGroup(groupID: groupID)
+            }
+        } else {
+            // Non-owner — route through the voluntary-leave path so
+            // the member record is actually removed from CloudKit
+            // and other members stop seeing a ghost membership.
+            Task { [groupID = group.id] in
+                await self.removeMyselfFromGroup(groupID)
             }
         }
     }
@@ -701,8 +960,62 @@ final class AppState {
         }
     }
 
-    func leaveGroup() {
-        currentGroup = nil
+    /// Pops the dashboard back to Home **without** tearing down any
+    /// tracking. The user remains a member of the group; location,
+    /// beacon monitoring, heartbeat, and CloudKit subscriptions all
+    /// keep running because they're scoped to `myGroups`. `currentGroup`
+    /// stays set so re-opening the same group is instant.
+    func closeDashboard() {
+        path.removeAll()
+    }
+
+    /// Voluntary leave. Deletes this device's member record from the
+    /// group server-side (without writing to the banlist — voluntary
+    /// leaves aren't bans), drops the group from local state, and
+    /// pops back to Home. Safe to call from anywhere; ownership is
+    /// checked upstream because owners delete the whole group, they
+    /// don't leave.
+    func removeMyselfFromGroup(_ groupID: UUID) async {
+        guard let memberID = membershipByGroupID[groupID],
+              let group = myGroups.first(where: { $0.id == groupID }) else { return }
+
+        // Emit the event first — even if the server-side delete
+        // below fails, other members will see we left via the event
+        // log on their next sync. The event log is the authoritative
+        // record of group changes; the User-record delete is just a
+        // cleanup detail.
+        emit(.memberLeft(memberID: memberID), in: groupID)
+
+        // Server-side delete. If it fails, we still tear down local
+        // state so the user doesn't get stuck with a ghost group —
+        // the server-side record will be cleaned up on the next
+        // refresh / by expiry.
+        do {
+            try await groupService.leaveGroup(groupID: groupID, memberID: memberID)
+        } catch {
+            // Swallow — the local teardown below is still the right
+            // user-facing outcome.
+        }
+
+        // Local teardown — drop the group from every cache that
+        // referenced it. This is the same shape as `remove(group:)`
+        // for the non-owner case, but kept as its own entry point so
+        // call sites can be specific about intent.
+        myGroups.removeAll { $0.id == groupID }
+        membershipByGroupID.removeValue(forKey: groupID)
+        if currentGroup?.id == groupID {
+            currentGroup = nil
+        }
+        // Drop per-peer transport / UWB caches scoped to ex-members.
+        for member in group.members where member.id != currentUser.id {
+            peerSources.removeValue(forKey: member.id)
+            uwbReadings.removeValue(forKey: member.id)
+        }
+        // Cancel any pending notifications for this group so the user
+        // isn't surprised by a stale "30 minutes left" reminder.
+        Task { [notificationService, groupID] in
+            await notificationService.cancelAll(for: groupID)
+        }
         path.removeAll()
     }
 
@@ -715,20 +1028,64 @@ final class AppState {
         guard let group = currentGroup,
               group.ownerID == currentUser.id,
               memberID != currentUser.id else { return }
-        do {
-            let updated = try await groupService.removeMember(
-                memberID: memberID, fromGroup: group.id
+
+        // Snapshot the kicked member's details so the event + banlist
+        // entry are complete regardless of subsequent state reads.
+        let kicked = group.members.first(where: { $0.id == memberID })
+        let displayName = kicked?.displayName ?? "Member"
+        let banHash = kicked?.banHash
+
+        // Offline-first: update local state immediately so the owner
+        // sees the kick happen instantly even with no network. The
+        // event log + cloud snapshot save are best-effort follow-ups.
+        var updated = group
+        updated.members.removeAll { $0.id == memberID }
+        if let hash = banHash,
+           !updated.bannedMembers.contains(where: { $0.banHash == hash }) {
+            updated.bannedMembers.append(BannedMember(
+                banHash: hash,
+                displayName: displayName,
+                bannedAt: .now
+            ))
+        }
+        currentGroup = updated
+        addOrUpdate(group: updated)
+
+        // Drop the now-stale per-peer tracking so the UI isn't
+        // briefly trying to render a member who's no longer in the
+        // list.
+        peerSources.removeValue(forKey: memberID)
+        uwbReadings.removeValue(forKey: memberID)
+
+        // Authoritative record of the kick — event log, retried via
+        // pendingEmits + BLE gossiped. Other devices reduce this
+        // event into their own state when it reaches them.
+        emit(.memberRemoved(
+            memberID: memberID,
+            displayName: displayName,
+            banHash: banHash
+        ), in: group.id)
+
+        // Cloud snapshot update — writes the new banlist arrays to
+        // the Group CKRecord so new joiners are rejected. Routed
+        // through `dispatchGroupSave` which retries on failure via
+        // pendingGroupSaves, so the cloud catches up whenever
+        // network returns.
+        dispatchGroupSave(updated)
+
+        // Best-effort delete of the kicked member's CKRecord. If this
+        // fails the record orphan-persists in CloudKit until the
+        // group itself is deleted (the .deleteSelf reference action
+        // cascades). The visible kick still works because:
+        //   • Other members see the `memberRemoved` event and reduce.
+        //   • Cloud Group record's banlist is updated via
+        //     dispatchGroupSave, so refresh filters re-add by hash.
+        //   • New joiners are rejected at the banlist gate.
+        // Privacy cleanup of the orphan record is a follow-up.
+        Task { [groupService, memberID, groupID = group.id] in
+            try? await groupService.removeMember(
+                memberID: memberID, fromGroup: groupID
             )
-            currentGroup = updated
-            addOrUpdate(group: updated)
-            // Drop the now-stale per-peer tracking so the UI isn't
-            // briefly trying to render a member who's no longer in
-            // the list.
-            peerSources.removeValue(forKey: memberID)
-            uwbReadings.removeValue(forKey: memberID)
-        } catch {
-            // Silent fail — next refresh will reconcile if the delete
-            // actually went through but the fetch errored.
         }
     }
 
@@ -744,6 +1101,7 @@ final class AppState {
             )
             currentGroup = updated
             addOrUpdate(group: updated)
+            emit(.memberUnbanned(banHash: banHash), in: group.id)
         } catch {
             // Silent retry next refresh.
         }
@@ -771,26 +1129,61 @@ final class AppState {
         if locationTask == nil {
             locationTask = Task { [weak self] in
                 guard let self else { return }
-                for await coordinate in self.locationService.locationUpdates {
+                for await fix in self.locationService.locationUpdates {
+                    // Stamp full provenance on every fresh fix:
+                    // source = .gps with the accuracy CoreLocation
+                    // reported. Downstream readers can degrade to
+                    // .staleGPS via `User.positionEstimate` when the
+                    // fix gets old.
                     var me = self.currentUser
-                    me.coordinate = coordinate
+                    me.coordinate = fix.coordinate
+                    me.accuracy = fix.accuracy
+                    me.positionSource = .gps
+                    me.positionAnchorAt = fix.timestamp
+                    me.positionSourcePeerID = nil
                     me.lastSeen = .now
                     self.currentUser = me
+
+                    // GPS-state bookkeeping for the DR / hypothetical
+                    // decision logic: remember when the latest fresh
+                    // fix landed, and note that we've had GPS at
+                    // least once this session.
+                    self.lastGPSFixAt = fix.timestamp
+                    self.hasEverHadGPSThisSession = true
+
+                    // Re-anchor the dead-reckoning service. Each fresh
+                    // GPS fix becomes the new anchor; the prior
+                    // pedometer window also feeds calibration of the
+                    // user's personal step length.
+                    self.deadReckoningService.reanchor(to: fix)
 
                     // Feed the gradient engine so the compass can fall
                     // back to RSSI-based bearing when GPS isn't viable.
                     self.compassEngine.recordPosition(
-                        latitude: coordinate.latitude,
-                        longitude: coordinate.longitude
+                        latitude: fix.coordinate.latitude,
+                        longitude: fix.coordinate.longitude
                     )
 
+                    // Propagate the fresh provenance into the active
+                    // group's member entry as well. The per-group
+                    // membership UUIDs differ from `currentUser.id`
+                    // for multi-group setups, so look up via the
+                    // membership map and patch only the local cache;
+                    // the publish path below handles every group.
                     if var group = self.currentGroup,
-                       let idx = group.members.firstIndex(where: { $0.id == me.id }) {
-                        group.members[idx] = me
+                       let myID = self.membershipByGroupID[group.id],
+                       let idx = group.members.firstIndex(where: { $0.id == myID }) {
+                        var perGroup = group.members[idx]
+                        perGroup.coordinate = fix.coordinate
+                        perGroup.accuracy = fix.accuracy
+                        perGroup.positionSource = .gps
+                        perGroup.positionAnchorAt = fix.timestamp
+                        perGroup.lastSeen = me.lastSeen
+                        group.members[idx] = perGroup
                         self.currentGroup = group
                         self.addOrUpdate(group: group)
 
-                        self.publishLocationIfNeeded(member: me, in: group)
+                        self.publishLocationIfNeeded(member: perGroup, in: group)
                         self.broadcastBLEPresence()
                     }
                 }
@@ -816,6 +1209,13 @@ final class AppState {
                     me.heading = smoothed
                     self.currentUser = me
 
+                    // Feed DR so step-projection uses the latest
+                    // compass direction. Heading updates are far
+                    // more frequent than pedometer ticks, so this
+                    // keeps the projected vector aligned with the
+                    // user's actual motion.
+                    self.deadReckoningService.updateHeading(smoothed)
+
                     // Mirror into the active group's local member entry so
                     // the local pin's cone updates immediately. Heading is
                     // also picked up by the next BLE/CloudKit broadcast
@@ -828,6 +1228,58 @@ final class AppState {
                 }
             }
         }
+
+        if deadReckoningTask == nil {
+            deadReckoningTask = Task { [weak self] in
+                guard let self else { return }
+                for await estimate in self.deadReckoningService.positionUpdates {
+                    self.applyDeadReckoning(estimate)
+                }
+            }
+        }
+    }
+
+    /// Apply a DR estimate to local state — but only when GPS is
+    /// stale. While fresh GPS is firing we ignore DR (the GPS path
+    /// already covers us with better data and freshly-anchored
+    /// provenance). The check is on `lastGPSFixAt` rather than the
+    /// in-memory User's `lastSeen` because the heartbeat refreshes
+    /// `lastSeen` even when no new GPS arrived.
+    private func applyDeadReckoning(_ estimate: PositionEstimate) {
+        let now = Date()
+        let lastFix = lastGPSFixAt ?? .distantPast
+        guard now.timeIntervalSince(lastFix) > Self.gpsStaleAfter else { return }
+
+        var me = currentUser
+        me.coordinate = estimate.coordinate
+        me.accuracy = estimate.accuracy
+        me.positionSource = .deadReckoning
+        me.positionAnchorAt = estimate.anchorAt
+        me.lastSeen = estimate.computedAt
+        currentUser = me
+
+        // Patch the active group's member entry + push the next
+        // BLE/CloudKit broadcast so peers see the DR position
+        // immediately. The same per-group lookup as the GPS path —
+        // membershipByGroupID gives us the right member ID for
+        // multi-group setups.
+        guard var group = currentGroup,
+              let myID = membershipByGroupID[group.id],
+              let idx = group.members.firstIndex(where: { $0.id == myID }) else {
+            return
+        }
+        var perGroup = group.members[idx]
+        perGroup.coordinate = estimate.coordinate
+        perGroup.accuracy = estimate.accuracy
+        perGroup.positionSource = .deadReckoning
+        perGroup.positionAnchorAt = estimate.anchorAt
+        perGroup.lastSeen = me.lastSeen
+        group.members[idx] = perGroup
+        currentGroup = group
+        addOrUpdate(group: group)
+
+        publishLocationIfNeeded(member: perGroup, in: group)
+        broadcastBLEPresence()
     }
 
     /// Circular moving average over the last few heading samples. Plain
@@ -851,6 +1303,12 @@ final class AppState {
     func stopLocationTracking() {
         locationService.stopUpdating()
         motionService.stop()
+        deadReckoningService.stop()
+        // Reset session GPS state — leaving all groups means the next
+        // membership starts fresh. Without this, a second "join later"
+        // session would still think we'd had GPS at some point.
+        hasEverHadGPSThisSession = false
+        lastGPSFixAt = nil
         // Ensure we're in best-accuracy mode for the next session;
         // otherwise a stale "stationary" decision could carry over.
         locationService.adjustForMotion(stationary: false)
@@ -898,6 +1356,50 @@ final class AppState {
             }
         }
 
+        if bleEventTask == nil {
+            bleEventTask = Task { [weak self] in
+                guard let self else { return }
+                for await event in self.blePresenceService.events {
+                    self.handleGossipedEvent(event)
+                }
+            }
+        }
+    }
+
+    /// Apply an event received from BLE gossip. Idempotent: events
+    /// we already have advance no state. Events for groups we aren't
+    /// a member of are dropped (you're not supposed to receive them,
+    /// but BLE traffic could theoretically cross over). For events
+    /// we don't have, we append locally, fold into state, and re-
+    /// gossip to any in-range peers that are still behind — that's
+    /// the transitive relay that makes D→C→B reach B even when only
+    /// A originally had the event.
+    private func handleGossipedEvent(_ event: Event) {
+        // Drop events for groups we don't belong to.
+        guard myGroups.contains(where: { $0.id == event.groupID }) else {
+            return
+        }
+        // Dedup at the log level — `ingestEvent` would do this too,
+        // but checking here saves the reducer + downstream calls.
+        if let existing = eventsByGroup[event.groupID],
+           existing.contains(where: { $0.id == event.id }) {
+            return
+        }
+        // Fold into state via the reducer (which also calls
+        // `ingestEvent` to update the local log and cursors).
+        applyEvents([event], to: event.groupID)
+
+        // Mirror to CloudKit so the event has a durable home too —
+        // safe to call even if it landed there originally (the
+        // appendEvent path is idempotent on event ID).
+        Task { [groupService = self.groupService, event] in
+            try? await groupService.appendEvent(event)
+        }
+
+        // Re-broadcast onward — closes the relay loop so a third
+        // peer in range gets it through us. Cursor-gated, so we
+        // skip if everyone we can reach is already caught up.
+        broadcastEventIfPeersBehind(event)
     }
 
     func stopBLEPresence() {
@@ -928,13 +1430,11 @@ final class AppState {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard let group = currentGroup else { return }
-        let message = ChatMessage(
-            groupHash: PeerPresence.groupHash(forInviteCode: group.inviteCode),
-            senderID: currentUser.id,
-            text: trimmed
-        )
-        appendChat(message)
-        blePresenceService.send(chatMessage: message)
+        // Chat-as-event: emit a `.chatMessage` event through the
+        // standard pipeline. Local appending of the event + CloudKit
+        // append + BLE gossip all happen via `emit(...)`. The
+        // legacy ephemeral chat path is no longer used for sends.
+        emit(.chatMessage(text: trimmed), in: group.id)
     }
 
     private func appendChat(_ message: ChatMessage) {
@@ -947,13 +1447,21 @@ final class AppState {
     }
 
     private func makeLocalPresence(for group: GroupSession) -> PeerPresence {
-        PeerPresence(
+        // Use the per-group membership ID, not `currentUser.id` (which
+        // is keyed by whatever group is currently in focus). Receivers
+        // match on the per-group ID when merging via `mergeBLEPeer`.
+        let memberID = membershipByGroupID[group.id] ?? currentUser.id
+        return PeerPresence(
             groupHash: PeerPresence.groupHash(forInviteCode: group.inviteCode),
-            memberID: currentUser.id,
+            memberID: memberID,
             latitude: currentUser.coordinate?.latitude,
             longitude: currentUser.coordinate?.longitude,
             heading: currentUser.heading,
-            lastSeen: currentUser.lastSeen
+            lastSeen: currentUser.lastSeen,
+            accuracy: currentUser.accuracy,
+            positionSource: currentUser.positionSource?.rawValue,
+            positionAnchorAt: currentUser.positionAnchorAt,
+            eventCursor: eventCursors[group.id]
         )
     }
 
@@ -985,8 +1493,38 @@ final class AppState {
             group.members[idx].coordinate = Coordinate(latitude: lat, longitude: lon)
         }
         group.members[idx].heading = peer.heading
+        // Pull provenance off the BLE payload so locally-received
+        // positions render with the same accuracy bubble + source
+        // styling as CloudKit-fetched ones. Unknown raw-source
+        // strings decode to nil and the UI treats nil as `.gps`.
+        group.members[idx].accuracy = peer.accuracy
+        group.members[idx].positionSource = peer.positionSource
+            .flatMap(PositionSource.init(rawValue:))
+        group.members[idx].positionAnchorAt = peer.positionAnchorAt
+        // Copy the BLE-arrived event cursor onto the member's User
+        // struct too — drives delivery-dot rendering. The CKRecord
+        // mirror happens via heartbeat republish; this in-memory
+        // copy makes the dot promotion responsive instead of waiting
+        // for the next CloudKit fetch.
+        group.members[idx].eventCursorCreatedAt = peer.eventCursorCreatedAt
+        group.members[idx].eventCursorID = peer.eventCursorID
         currentGroup = group
         addOrUpdate(group: group)
+
+        // Cursor update may have caught a peer up to one of our
+        // outgoing events — promote the delivery status if so.
+        reevaluateDeliveryStatus(for: group.id)
+
+        // Event-log gossip — track the peer's cursor and, if they're
+        // behind us, push the events they're missing right away. This
+        // is the cursor-mismatch path: a peer with no time gate gets
+        // every event newer than theirs.
+        if let peerCursor = peer.eventCursor {
+            peerCursors[peer.memberID] = peerCursor
+            Task { [weak self, groupID = group.id, peerCursor] in
+                await self?.pushEventsNewer(than: peerCursor, in: groupID)
+            }
+        }
     }
 
     /// Throttled CloudKit publish: at most once every `publishInterval`
@@ -1032,13 +1570,441 @@ final class AppState {
     /// progress indicator at the right moment.
     func refreshCurrentGroupManually() async {
         await refreshCurrentGroup()
+        if let group = currentGroup {
+            await syncEvents(for: group.id)
+        }
+    }
+
+    // MARK: - Event log integration
+
+    /// Fire-and-forget event emission. The event is appended to the
+    /// group's CloudKit log in the background **and** broadcast over
+    /// BLE to any in-range peers whose cursors are behind the new
+    /// event. If the CloudKit append fails the BLE gossip path still
+    /// delivers to nearby peers; if BLE fails (no peers in range) the
+    /// CloudKit path still delivers when peers come back online.
+    /// Belt and suspenders.
+    func emit(_ payload: EventPayload, in groupID: UUID) {
+        // For chat-specific payloads we want the author to be the
+        // per-group membership ID, not whichever id `currentUser`
+        // happens to carry. Other payload types use the same value
+        // since they're always emitted in the active-group context
+        // (where currentUser.id matches the per-group ID anyway).
+        let authorID = membershipByGroupID[groupID] ?? currentUser.id
+
+        let event = Event(
+            groupID: groupID,
+            authorID: authorID,
+            payload: payload
+        )
+
+        // Append to the local event log right away so the timeline UI
+        // reflects the emission instantly. Also advances the latest
+        // cursor — we authored this event, we definitely "know" it.
+        ingestEvent(event)
+
+        // Delivery tracking starts at .pending. The CloudKit task
+        // below advances to .cloud on success; the sync paths advance
+        // to .delivered once every other member's cursor is past it.
+        advanceDelivery(event.id, to: .pending)
+
+        // CloudKit append — try once optimistically. On failure,
+        // enqueue for the retry task which drains on exponential
+        // backoff. The persisted queue survives force-quit so an
+        // event sent while offline still propagates on next launch.
+        Task { [weak self, event] in
+            guard let self else { return }
+            let succeeded = await self.attemptCloudEmit(event)
+            if !succeeded {
+                self.enqueueRetry(event)
+            }
+        }
+
+        // BLE gossip — broadcast if any tracked peer is behind.
+        broadcastEventIfPeersBehind(event)
+    }
+
+    /// One-shot CloudKit append attempt with delivery-status
+    /// bookkeeping. Returns true on success so the caller can
+    /// decide whether to enqueue for retry. Used by both the
+    /// optimistic `emit` path and the retry-loop drain.
+    private func attemptCloudEmit(_ event: Event) async -> Bool {
+        do {
+            try await groupService.appendEvent(event)
+            advanceDelivery(event.id, to: .cloud)
+            // After cloud-append, our own cursor on the per-group
+            // User record won't reflect this event until the next
+            // heartbeat. Push a delivery re-evaluation just in case
+            // other members already happen to be ahead.
+            reevaluateDeliveryStatus(for: event.groupID)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Add an event to the persisted retry queue. Idempotent — a
+    /// re-enqueue of the same event ID is a no-op (the existing
+    /// entry's backoff is what matters). First retry attempt fires
+    /// 5 seconds from now.
+    private func enqueueRetry(_ event: Event) {
+        guard !pendingEmits.contains(where: { $0.event.id == event.id }) else {
+            return
+        }
+        let entry = PendingEmit(
+            event: event,
+            retryCount: 0,
+            nextRetryAt: Date().addingTimeInterval(PendingEmit.backoff(after: 0))
+        )
+        pendingEmits.append(entry)
+    }
+
+    /// Long-lived retry loop. Wakes every `retryTickInterval`, drains
+    /// any pending emits / group saves whose `nextRetryAt` has passed.
+    /// On success the entry is removed; on failure it's bumped (retry
+    /// count + next retry rescheduled per exponential backoff,
+    /// capped at 60s). No max-attempt limit — CloudKit will
+    /// eventually come back.
+    private func startEmitRetryLoop() {
+        guard retryEmitTask == nil else { return }
+        retryEmitTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.retryTickInterval))
+                guard let self else { return }
+                await self.drainPendingGroupSaves()
+                await self.drainPendingEmits()
+            }
+        }
+    }
+
+    /// Offline-first group creation entry point. CreateGroupViewModel
+    /// calls this after building the GroupSession in-process and
+    /// updating local state. We try once immediately; on failure the
+    /// save goes into the persisted retry queue. The user is already
+    /// on the dashboard by then — they never feel the network round-
+    /// trip, success or fail.
+    func dispatchGroupSave(_ group: GroupSession) {
+        Task { [weak self, group] in
+            guard let self else { return }
+            let succeeded = await self.attemptGroupSave(group)
+            if !succeeded {
+                self.enqueueGroupSave(group)
+            }
+        }
+    }
+
+    private func attemptGroupSave(_ group: GroupSession) async -> Bool {
+        do {
+            try await groupService.saveGroup(group)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func enqueueGroupSave(_ group: GroupSession) {
+        // Idempotent on group ID — repeated dispatch of the same group
+        // doesn't pile up duplicate entries. If an entry already
+        // exists we leave its existing backoff state alone.
+        guard !pendingGroupSaves.contains(where: { $0.group.id == group.id }) else {
+            return
+        }
+        let entry = PendingGroupSave(
+            group: group,
+            retryCount: 0,
+            nextRetryAt: Date().addingTimeInterval(PendingGroupSave.backoff(after: 0))
+        )
+        pendingGroupSaves.append(entry)
+    }
+
+    private func drainPendingGroupSaves() async {
+        guard !pendingGroupSaves.isEmpty else { return }
+        let now = Date()
+        let dueIDs = pendingGroupSaves
+            .filter { $0.nextRetryAt <= now }
+            .map { $0.group.id }
+
+        for groupID in dueIDs {
+            guard let idx = pendingGroupSaves.firstIndex(where: { $0.group.id == groupID })
+            else { continue }
+            let entry = pendingGroupSaves[idx]
+            // Prefer the latest local snapshot of the group if we
+            // still have one — the user may have triggered other
+            // mutations (extension proposal, etc.) since the queue
+            // entry was minted. CloudKit can replay the whole record.
+            let current = myGroups.first(where: { $0.id == groupID }) ?? entry.group
+            let succeeded = await attemptGroupSave(current)
+            if succeeded {
+                pendingGroupSaves.removeAll { $0.group.id == groupID }
+            } else if let stillIdx = pendingGroupSaves.firstIndex(where: { $0.group.id == groupID }) {
+                pendingGroupSaves[stillIdx] = entry.bumpedRetry(now: Date())
+            }
+        }
+    }
+
+    private func drainPendingEmits() async {
+        guard !pendingEmits.isEmpty else { return }
+        let now = Date()
+        // Snapshot the due entries by ID — pendingEmits is mutated
+        // by attemptCloudEmit's downstream effects (delivery status
+        // updates, sync re-evaluation), so we iterate over a stable
+        // snapshot to avoid index drift.
+        let dueIDs = pendingEmits
+            .filter { $0.nextRetryAt <= now }
+            .map { $0.event.id }
+
+        for eventID in dueIDs {
+            guard let idx = pendingEmits.firstIndex(where: { $0.event.id == eventID })
+            else { continue }
+            let entry = pendingEmits[idx]
+            let succeeded = await attemptCloudEmit(entry.event)
+            if succeeded {
+                pendingEmits.removeAll { $0.event.id == eventID }
+            } else if let stillIdx = pendingEmits.firstIndex(where: { $0.event.id == eventID }) {
+                pendingEmits[stillIdx] = entry.bumpedRetry(now: Date())
+            }
+        }
+    }
+
+    /// Single ingestion point for every event we receive — local
+    /// emit, CloudKit forward sync, CloudKit older-batch fetch, BLE
+    /// gossip. Centralizing the append + cursor bookkeeping here
+    /// ensures the local log and both cursors stay consistent no
+    /// matter how the event arrived.
+    private func ingestEvent(_ event: Event) {
+        var log = eventsByGroup[event.groupID] ?? []
+        // Idempotent on event ID so duplicate gossip / re-syncs are
+        // free at this layer — the reducer is also idempotent, so
+        // this is just a cheap dedup before further work.
+        guard !log.contains(where: { $0.id == event.id }) else { return }
+        log.append(event)
+        eventsByGroup[event.groupID] = log
+
+        // Update both cursors. `latest` always moves forward to the
+        // newest known event. `oldest` moves backward to the oldest
+        // known — useful when the very first batch we ingest comes
+        // from `loadOlderEvents` (newest-first by service contract).
+        let prior = eventCursors[event.groupID]
+        if prior == nil || event.cursor > prior! {
+            eventCursors[event.groupID] = event.cursor
+        }
+        let priorOldest = oldestEventCursors[event.groupID]
+        if priorOldest == nil || event.cursor < priorOldest! {
+            oldestEventCursors[event.groupID] = event.cursor
+        }
+    }
+
+    /// Broadcast an event over BLE if at least one in-range peer's
+    /// cursor is older than the event. Skips the write if every
+    /// tracked peer is already caught up — saves bandwidth and
+    /// battery without losing any actual coverage (any peer that
+    /// arrives later will catch up via the cursor-mismatch path).
+    private func broadcastEventIfPeersBehind(_ event: Event) {
+        guard !peerCursors.isEmpty else { return }
+        let anyBehind = peerCursors.values.contains { peerCursor in
+            event.cursor > peerCursor
+        }
+        guard anyBehind else { return }
+        blePresenceService.broadcastEvent(event.strippedForBLE())
+    }
+
+    /// Paginated scroll-to-top history fetch. Called by the timeline
+    /// UI when the user scrolls past the oldest message on screen.
+    /// Pulls one page (`Self.timelinePageSize`) of events older than
+    /// our current oldest-local-cursor, ingests them locally, and
+    /// updates the cursor. If the batch comes back smaller than a
+    /// full page we've hit the start of the group's history and
+    /// record it so the UI can stop firing more requests.
+    func loadOlderEvents(for groupID: UUID) async {
+        // Already at the start — nothing more to load.
+        guard !groupsAtStartOfHistory.contains(groupID) else { return }
+
+        let cursor = oldestEventCursors[groupID]
+        let batch: [Event]
+        do {
+            batch = try await groupService.fetchEvents(
+                forGroupID: groupID,
+                olderThan: cursor,
+                limit: Self.timelinePageSize
+            )
+        } catch {
+            return
+        }
+
+        for event in batch {
+            ingestEvent(event)
+        }
+
+        // Less than a full page = start of history. Latch that so the
+        // UI doesn't keep re-asking on every scroll.
+        if batch.count < Self.timelinePageSize {
+            groupsAtStartOfHistory.insert(groupID)
+        }
+    }
+
+    /// Push every locally-known event newer than `cursor` for `groupID`
+    /// onto the BLE wire, in chronological order. Used by the cursor-
+    /// mismatch path: when a peer's presence arrives with an older
+    /// cursor, we shove the missing slice at them.
+    private func pushEventsNewer(than cursor: EventCursor, in groupID: UUID) async {
+        let events: [Event]
+        do {
+            events = try await groupService.fetchEvents(
+                forGroupID: groupID, since: cursor
+            )
+        } catch {
+            return
+        }
+        let sorted = events.sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt < rhs.createdAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        for event in sorted {
+            blePresenceService.broadcastEvent(event.strippedForBLE())
+        }
+    }
+
+    /// Pull all events newer than our cursor for `groupID`, fold them
+    /// into the active state, advance the cursor. Called on push,
+    /// on pull-to-refresh, and on cold launch via `replayEventsOnLaunch`.
+    /// Safe to call concurrently — idempotent at the reducer level.
+    private func syncEvents(for groupID: UUID) async {
+        let cursor = eventCursors[groupID]
+        let fetched: [Event]
+        do {
+            fetched = try await groupService.fetchEvents(
+                forGroupID: groupID, since: cursor
+            )
+        } catch {
+            // Silent — the next push or pull-to-refresh will retry.
+            return
+        }
+        guard !fetched.isEmpty else { return }
+
+        // Apply on top of whichever local snapshot is freshest. For
+        // the active group we use `currentGroup` so the UI updates in
+        // the same turn; for background groups we fold into the
+        // `myGroups` entry.
+        applyEvents(fetched, to: groupID)
+
+        // Advance the cursor to the newest event we just applied. Sort
+        // first because CloudKit's order isn't guaranteed under cursor
+        // pagination.
+        if let newest = fetched.max(by: { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt < rhs.createdAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }) {
+            eventCursors[groupID] = newest.cursor
+        }
+
+        // Cursor-gated re-broadcast of every event we just learned
+        // from CloudKit. This closes the gossip loop: a peer in BLE
+        // range but offline from CloudKit hears about events through
+        // us. The cursor check inside `broadcastEventIfPeersBehind`
+        // is what prevents first-sync flooding — if every nearby peer
+        // already has the event (their cursors are ahead of it), the
+        // broadcast is skipped.
+        for event in fetched {
+            broadcastEventIfPeersBehind(event)
+        }
+
+        // CloudKit fetch can include refreshed member User records,
+        // whose updated cursors might unlock delivery promotions for
+        // our outgoing events. Re-evaluate once at the end of the
+        // sync rather than per-event for batched efficiency.
+        reevaluateDeliveryStatus(for: groupID)
+
+        // Opportunistic retry: a successful sync means CloudKit is
+        // reachable. Bump every pending emit / group save's
+        // nextRetryAt to "now" so the next tick drains them
+        // immediately instead of waiting out the full exponential
+        // backoff. Saves the user 30-60s of waiting after a network
+        // blip resolves.
+        if !pendingEmits.isEmpty {
+            let now = Date()
+            pendingEmits = pendingEmits.map { entry in
+                PendingEmit(
+                    event: entry.event,
+                    retryCount: entry.retryCount,
+                    nextRetryAt: min(entry.nextRetryAt, now)
+                )
+            }
+        }
+        if !pendingGroupSaves.isEmpty {
+            let now = Date()
+            pendingGroupSaves = pendingGroupSaves.map { entry in
+                PendingGroupSave(
+                    group: entry.group,
+                    retryCount: entry.retryCount,
+                    nextRetryAt: min(entry.nextRetryAt, now)
+                )
+            }
+        }
+    }
+
+    /// Apply a batch of events to either `currentGroup` (if it matches
+    /// the targeted group ID) or the corresponding entry in `myGroups`.
+    /// Members and banlist updates flow through the existing newest-
+    /// wins merge so live position data on the User records doesn't
+    /// get clobbered by the event-derived snapshot.
+    private func applyEvents(_ events: [Event], to groupID: UUID) {
+        // Funnel every event through the central ingestion path so
+        // the local log and cursors stay in sync. Idempotent — no
+        // harm if some of these already landed via gossip first.
+        for event in events {
+            ingestEvent(event)
+        }
+
+        let target = currentGroup?.id == groupID
+            ? currentGroup
+            : myGroups.first(where: { $0.id == groupID })
+        guard let baseline = target else { return }
+
+        guard let folded = EventReducer.reduce(events, into: baseline) else {
+            return
+        }
+
+        // Merge: the reducer-derived snapshot carries authoritative
+        // membership + banlist + expiry, but local member records hold
+        // the freshest position/heading data. Patch the folded members
+        // with whichever copy has a newer `lastSeen`.
+        var merged = folded
+        for i in merged.members.indices {
+            let foldedMember = merged.members[i]
+            if let local = baseline.members.first(where: { $0.id == foldedMember.id }),
+               local.lastSeen > foldedMember.lastSeen {
+                merged.members[i] = local
+            }
+        }
+        // Carry the local invite code through — events don't always
+        // re-state it, but the existing snapshot does.
+        if merged.inviteCode.isEmpty {
+            merged.inviteCode = baseline.inviteCode
+        }
+
+        addOrUpdate(group: merged)
+        if currentGroup?.id == groupID {
+            currentGroup = merged
+        }
     }
 
     private func refreshCurrentGroup() async {
         guard let active = currentGroup else { return }
         do {
             guard var updated = try await groupService.fetchGroup(groupID: active.id) else {
-                // Server-side gone — let the expiry monitor handle removal.
+                // Server-side gone — the group was hard-deleted (owner
+                // pressed Delete on Home, or expiry cleanup ran). Drop
+                // it from local state immediately so we don't keep a
+                // ghost group on Home with stale data, and surface a
+                // one-time alert via the dashboard modifier so the
+                // user knows why their dashboard just popped.
+                let groupName = active.name
+                remove(group: active)
+                groupDeletedNotice = groupName
                 return
             }
             // Detect post-removal: if the owner kicked us, our banHash
@@ -1050,6 +2016,18 @@ final class AppState {
                 remove(group: updated)
                 bannedFromGroupName = groupName
                 return
+            }
+            // Banlist filter: CloudKit's `fetchMembers` returns every
+            // record that points at this group, including freshly-
+            // kicked members whose User CKRecord delete hasn't yet
+            // propagated. The Group record's `bannedMembers` is the
+            // authoritative list of who's been kicked — drop anyone
+            // whose `banHash` appears there so the dashboard doesn't
+            // briefly resurface a banned member after each refresh.
+            let bannedHashes = Set(updated.bannedMembers.map(\.banHash))
+            updated.members.removeAll { member in
+                guard let hash = member.banHash else { return false }
+                return bannedHashes.contains(hash)
             }
             // Newest-wins merge per member. Without this, an offline peer's
             // BLE-sourced fresh location gets clobbered every 10 s by the
@@ -1090,8 +2068,10 @@ final class AppState {
             // The merge is conservative — only members with a recent
             // `lastSeen` survive (60s), so genuinely-removed members
             // (record deleted server-side) aren't resurrected forever.
+            // `bannedHashes` is already in scope from the cloud-side
+            // member filter above — reuse it here for the same
+            // banlist-respecting purpose on the local-only merge.
             let cloudIDs = Set(updated.members.map(\.id))
-            let bannedHashes = Set(updated.bannedMembers.map(\.banHash))
             let staleCutoff = Date().addingTimeInterval(-60)
             for localMember in active.members where !cloudIDs.contains(localMember.id) {
                 if let hash = localMember.banHash, bannedHashes.contains(hash) {
@@ -1103,6 +2083,10 @@ final class AppState {
 
             currentGroup = updated
             addOrUpdate(group: updated)
+            // Member records came back from CloudKit with possibly
+            // updated event cursors — check whether any of our
+            // outgoing events can now be marked delivered.
+            reevaluateDeliveryStatus(for: updated.id)
         } catch {
             // Silent fail — keep last known good state, retry next tick.
         }
@@ -1147,6 +2131,7 @@ final class AppState {
         )
         addOrUpdate(group: updated)
         currentGroup = updated
+        emit(.extensionProposed(newExpiresAt: newExpiresAt), in: group.id)
     }
 
     /// Member accepts the active extension proposal on `currentGroup`.
@@ -1158,6 +2143,7 @@ final class AppState {
         )
         addOrUpdate(group: updated)
         currentGroup = updated
+        emit(.extensionAccepted(memberID: currentUser.id), in: group.id)
     }
 
     /// Returns whether the local user is the owner of the currently active group.
@@ -1191,14 +2177,28 @@ final class AppState {
                 let resolved = try await groupService.resolveExpiry(groupID: group.id)
                 if let resolved {
                     addOrUpdate(group: resolved)
+                    // Mark the expiry resolution in the event log so
+                    // peers that weren't in the accepted-extension list
+                    // can reconcile when they next sync. The new expiry
+                    // becomes the canonical one moving forward.
+                    if group.ownerID == currentUser.id {
+                        emit(.extensionResolved(newExpiresAt: resolved.expiresAt),
+                             in: group.id)
+                    }
                     if currentGroup?.id == group.id {
                         currentGroup = resolved
                         if let myID = membershipByGroupID[group.id],
                            let me = resolved.members.first(where: { $0.id == myID }) {
                             currentUser = me
                         } else {
-                            // I didn't accept — pop back to home.
-                            leaveGroup()
+                            // I didn't accept the extension by the
+                            // deadline — server-side cleanup excluded
+                            // me from the resolved group. Drop the
+                            // group locally and pop back to home.
+                            // `remove(group:)` will idempotently
+                            // re-issue the server-side delete on our
+                            // member record (no-op if already gone).
+                            remove(group: resolved)
                         }
                     }
                     // Reschedule reminder for the new expiry.
@@ -1239,6 +2239,156 @@ final class AppState {
         }
         if let data = try? JSONEncoder().encode(stringMap) {
             defaults.set(data, forKey: Self.membershipMapKey)
+        }
+    }
+
+    private func persistEventCursors() {
+        if let data = try? JSONEncoder().encode(eventCursors) {
+            defaults.set(data, forKey: Self.eventCursorsKey)
+        }
+    }
+
+    private static func loadEventCursors(defaults: UserDefaults) -> [UUID: EventCursor] {
+        guard let data = defaults.data(forKey: eventCursorsKey),
+              let decoded = try? JSONDecoder().decode([UUID: EventCursor].self, from: data)
+        else { return [:] }
+        return decoded
+    }
+
+    private func persistOldestEventCursors() {
+        if let data = try? JSONEncoder().encode(oldestEventCursors) {
+            defaults.set(data, forKey: Self.oldestEventCursorsKey)
+        }
+    }
+
+    private static func loadOldestEventCursors(defaults: UserDefaults) -> [UUID: EventCursor] {
+        guard let data = defaults.data(forKey: oldestEventCursorsKey),
+              let decoded = try? JSONDecoder().decode([UUID: EventCursor].self, from: data)
+        else { return [:] }
+        return decoded
+    }
+
+    private func persistEventsByGroup() {
+        if let data = try? JSONEncoder().encode(eventsByGroup) {
+            defaults.set(data, forKey: Self.eventsByGroupKey)
+        }
+    }
+
+    private static func loadEventsByGroup(defaults: UserDefaults) -> [UUID: [Event]] {
+        guard let data = defaults.data(forKey: eventsByGroupKey),
+              let decoded = try? JSONDecoder().decode([UUID: [Event]].self, from: data)
+        else { return [:] }
+        return decoded
+    }
+
+    private func persistEventDelivery() {
+        if let data = try? JSONEncoder().encode(eventDeliveryByID) {
+            defaults.set(data, forKey: Self.eventDeliveryKey)
+        }
+    }
+
+    private static func loadEventDelivery(defaults: UserDefaults) -> [UUID: EventDeliveryStatus] {
+        guard let data = defaults.data(forKey: eventDeliveryKey),
+              let decoded = try? JSONDecoder().decode([UUID: EventDeliveryStatus].self, from: data)
+        else { return [:] }
+        return decoded
+    }
+
+    private func persistPendingEmits() {
+        if let data = try? JSONEncoder().encode(pendingEmits) {
+            defaults.set(data, forKey: Self.pendingEmitsKey)
+        }
+    }
+
+    private static func loadPendingEmits(defaults: UserDefaults) -> [PendingEmit] {
+        guard let data = defaults.data(forKey: pendingEmitsKey),
+              let decoded = try? JSONDecoder().decode([PendingEmit].self, from: data)
+        else { return [] }
+        return decoded
+    }
+
+    private func persistPendingGroupSaves() {
+        if let data = try? JSONEncoder().encode(pendingGroupSaves) {
+            defaults.set(data, forKey: Self.pendingGroupSavesKey)
+        }
+    }
+
+    private static func loadPendingGroupSaves(defaults: UserDefaults) -> [PendingGroupSave] {
+        guard let data = defaults.data(forKey: pendingGroupSavesKey),
+              let decoded = try? JSONDecoder().decode([PendingGroupSave].self, from: data)
+        else { return [] }
+        return decoded
+    }
+
+    /// Public count exposed to the Home banner so it can show
+    /// "X pending uploads" when something hasn't reached CloudKit
+    /// yet. Sums both queues — events authored offline AND groups
+    /// created offline both count as user-visible pending work.
+    var pendingUploadCount: Int {
+        pendingEmits.count + pendingGroupSaves.count
+    }
+
+    /// Public accessor for the timeline UI. Returns nil for events
+    /// authored by other members (we don't render dots on their
+    /// bubbles) and for events that predate the delivery-tracking
+    /// feature (no recorded status, no dot).
+    func deliveryStatus(for event: Event) -> EventDeliveryStatus? {
+        // Only show status on events we authored — others' status is
+        // not ours to display.
+        let myID = membershipByGroupID[event.groupID] ?? currentUser.id
+        guard event.authorID == myID else { return nil }
+        return eventDeliveryByID[event.id]
+    }
+
+    /// Monotonic advance — refuses to downgrade a status. Used by all
+    /// the transition paths (emit → pending, cloud-append → cloud,
+    /// all-peers-caught-up → delivered).
+    private func advanceDelivery(_ eventID: UUID,
+                                 to status: EventDeliveryStatus) {
+        let current = eventDeliveryByID[eventID]
+        if let current, status.rank <= current.rank { return }
+        eventDeliveryByID[eventID] = status
+    }
+
+    /// Walk every event we authored in this group; for any whose
+    /// status is below `.delivered`, promote to `.delivered` if every
+    /// *other* member's published cursor is at or past it. Members
+    /// without a cursor are treated as "not yet acknowledged" so a
+    /// group with even one offline member keeps showing ✓ instead
+    /// of ✓✓ — which is what users expect from chat-app delivery
+    /// indicators.
+    ///
+    /// Solo groups (only the local member) skip the upgrade entirely:
+    /// there's no one to deliver to, so the status caps at `.cloud`.
+    private func reevaluateDeliveryStatus(for groupID: UUID) {
+        guard let group = currentGroup?.id == groupID
+              ? currentGroup
+              : myGroups.first(where: { $0.id == groupID }) else {
+            return
+        }
+
+        let myID = membershipByGroupID[groupID]
+        let otherMembers = group.members.filter { $0.id != myID }
+        guard !otherMembers.isEmpty else { return }
+
+        let log = eventsByGroup[groupID] ?? []
+        for event in log where event.authorID == myID {
+            let status = eventDeliveryByID[event.id] ?? .pending
+            guard status.rank < EventDeliveryStatus.delivered.rank else { continue }
+
+            // All other members must have a cursor at or past this
+            // event's cursor. Members with no cursor data → bail out
+            // for this event; we can't confirm delivery to them.
+            let allAcknowledged = otherMembers.allSatisfy { member in
+                guard let cursor = member.eventCursor else { return false }
+                // "cursor >= event.cursor" is equivalent to
+                // "not (event.cursor > cursor)" — the EventCursor
+                // ordering already provides strict-greater-than.
+                return !(event.cursor > cursor)
+            }
+            if allAcknowledged {
+                advanceDelivery(event.id, to: .delivered)
+            }
         }
     }
 

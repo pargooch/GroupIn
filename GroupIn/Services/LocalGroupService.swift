@@ -33,6 +33,7 @@ enum GroupServiceError: LocalizedError {
 @MainActor
 final class LocalGroupService: CloudKitServicing {
     private static let storageKey = "GroupIn.LocalGroupService.groups"
+    private static let eventsKey = "GroupIn.LocalGroupService.events"
     /// Stable per-install identifier used for ban-hash computation in
     /// the local backend. Generated once and persisted; survives app
     /// relaunches but rotates on uninstall (the local backend exists
@@ -41,6 +42,10 @@ final class LocalGroupService: CloudKitServicing {
 
     private let defaults: UserDefaults
     private var groupsByCode: [String: GroupSession]
+    /// In-memory event log keyed by groupID, persisted to UserDefaults
+    /// so the local backend behaves like CloudKit for testing — events
+    /// survive process restart, can be queried since cursor, etc.
+    private var eventsByGroup: [UUID: [Event]] = [:]
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -50,26 +55,22 @@ final class LocalGroupService: CloudKitServicing {
         } else {
             self.groupsByCode = [:]
         }
+        if let data = defaults.data(forKey: Self.eventsKey),
+           let decoded = try? JSONDecoder().decode([UUID: [Event]].self, from: data) {
+            self.eventsByGroup = decoded
+        }
     }
 
     // MARK: - Create / Join
 
-    func createGroup(named name: String,
-                     category: GroupCategory,
-                     ownerID: UUID,
-                     expiresAt: Date) async throws -> GroupSession {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw GroupServiceError.invalidName }
-
-        let code = Self.generateInviteCode()
-        let group = GroupSession(name: trimmed,
-                                 inviteCode: code,
-                                 category: category,
-                                 ownerID: ownerID,
-                                 expiresAt: expiresAt)
-        groupsByCode[code] = group
+    func saveGroup(_ group: GroupSession) async throws {
+        // Same offline-first semantics as the CloudKit backend —
+        // caller already minted the GroupSession's identity; we just
+        // persist it. Idempotent on invite code: a re-save of the
+        // same group overwrites the existing entry rather than
+        // duplicating.
+        groupsByCode[group.inviteCode] = group
         save()
-        return group
     }
 
     func fetchGroup(groupID: UUID) async throws -> GroupSession? {
@@ -203,6 +204,18 @@ final class LocalGroupService: CloudKitServicing {
         return group
     }
 
+    func leaveGroup(groupID: UUID,
+                    memberID: UUID) async throws {
+        guard let key = groupsByCode.first(where: { $0.value.id == groupID })?.key,
+              var group = groupsByCode[key] else {
+            // Already gone — treat as success (idempotent).
+            return
+        }
+        group.members.removeAll { $0.id == memberID }
+        groupsByCode[key] = group
+        save()
+    }
+
     func unbanMember(banHash: String,
                      fromGroup groupID: UUID) async throws -> GroupSession {
         guard let key = groupsByCode.first(where: { $0.value.id == groupID })?.key,
@@ -226,6 +239,64 @@ final class LocalGroupService: CloudKitServicing {
         return new
     }
 
+    // MARK: - Event log
+
+    func appendEvent(_ event: Event) async throws {
+        var log = eventsByGroup[event.groupID] ?? []
+        // Idempotent on event ID — a duplicate append (e.g. from a
+        // retry) is a no-op rather than producing two entries.
+        guard !log.contains(where: { $0.id == event.id }) else { return }
+        log.append(event)
+        eventsByGroup[event.groupID] = log
+        saveEvents()
+    }
+
+    func fetchEvents(forGroupID groupID: UUID,
+                     since cursor: EventCursor?) async throws -> [Event] {
+        let log = eventsByGroup[groupID] ?? []
+        guard let cursor else { return log }
+        return log.filter { event in
+            if event.createdAt != cursor.createdAt {
+                return event.createdAt > cursor.createdAt
+            }
+            return event.id.uuidString > cursor.id.uuidString
+        }
+    }
+
+    func fetchEvents(forGroupID groupID: UUID,
+                     olderThan cursor: EventCursor?,
+                     limit: Int) async throws -> [Event] {
+        let log = eventsByGroup[groupID] ?? []
+        let filtered: [Event]
+        if let cursor {
+            filtered = log.filter { event in
+                if event.createdAt != cursor.createdAt {
+                    return event.createdAt < cursor.createdAt
+                }
+                return event.id.uuidString < cursor.id.uuidString
+            }
+        } else {
+            filtered = log
+        }
+        // Sort descending (newest first), then take the first `limit`.
+        // That keeps semantics aligned with the CloudKit backend.
+        let sorted = filtered.sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt > rhs.createdAt
+            }
+            return lhs.id.uuidString > rhs.id.uuidString
+        }
+        return Array(sorted.prefix(limit))
+    }
+
+    func subscribeToEvents(groupID: UUID) async throws {
+        // Local backend has no push delivery; nothing to do.
+    }
+
+    func unsubscribeFromEvents(groupID: UUID) async throws {
+        // Local backend has no push delivery; nothing to do.
+    }
+
     // MARK: - Helpers
 
     private func findGroup(id: UUID) -> GroupSession? {
@@ -238,9 +309,10 @@ final class LocalGroupService: CloudKitServicing {
         }
     }
 
-    // Excludes ambiguous characters (0/O, 1/I) for easier verbal sharing.
-    private static func generateInviteCode(length: Int = 6) -> String {
-        let alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-        return String((0..<length).map { _ in alphabet.randomElement()! })
+    private func saveEvents() {
+        if let data = try? JSONEncoder().encode(eventsByGroup) {
+            defaults.set(data, forKey: Self.eventsKey)
+        }
     }
+
 }

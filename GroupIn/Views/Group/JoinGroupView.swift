@@ -42,6 +42,21 @@ struct JoinGroupView: View {
                         .foregroundStyle(.red)
                         .accessibilityLabel("Error: \(message)")
                 }
+            } else if let status = viewModel.statusMessage {
+                // Silent-retry indicator. We're cycling on a transient
+                // error (network blip, CloudKit hiccup) and don't want
+                // to scare the user with raw error text. The hint is
+                // honest about what's happening and lets them know they
+                // can wait or cancel out.
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text(status)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
             }
 
             Section {
@@ -52,7 +67,9 @@ struct JoinGroupView: View {
                         if viewModel.isSubmitting {
                             ProgressView()
                         }
-                        Text("Join Group")
+                        Text(viewModel.isSubmitting && viewModel.statusMessage != nil
+                             ? "Connecting…"
+                             : "Join Group")
                             .frame(maxWidth: .infinity)
                     }
                 }
