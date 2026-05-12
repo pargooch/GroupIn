@@ -19,6 +19,15 @@ struct GroupDashboardView: View {
     @State private var showsInviteQR = false
     @State private var memberToRemove: User?
     @State private var confirmingLeaveGroup = false
+    /// Currently route-targeted peer on the neon map. Tapping their
+    /// pin draws a glowing route between us and them; tapping again
+    /// (or tapping empty map) clears.
+    @State private var routeTargetID: UUID?
+    /// Bumped by the scope button to tell `MapLibreMapView` to re-fit
+    /// every member into view. Counter-based so repeated taps work.
+    @State private var fitAllTrigger: Int = 0
+    /// Drives the draggable bottom sheet listing members by distance.
+    @State private var showsMemberList = false
 
     init(viewModel: GroupDashboardViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -125,7 +134,7 @@ struct GroupDashboardView: View {
     private func groupList(group: GroupSession) -> some View {
         @Bindable var vm = viewModel
         List {
-            mapSection(group: group, cameraBinding: $vm.cameraPosition)
+            mapSection(group: group)
             if showsLocationStatus {
                 Section { locationStatusContent }
             }
@@ -219,27 +228,142 @@ struct GroupDashboardView: View {
     }
 
     @ViewBuilder
-    private func mapSection(group: GroupSession,
-                            cameraBinding: Binding<MapCameraPosition>) -> some View {
+    private func mapSection(group: GroupSession) -> some View {
         Section {
-            ZStack(alignment: .bottomTrailing) {
+            ZStack(alignment: .topTrailing) {
                 TimelineView(.periodic(from: .now, by: 15)) { context in
-                    mapContent(group: group,
-                               cameraBinding: cameraBinding,
-                               now: context.date)
+                    MapLibreMapView(
+                        members: group.members,
+                        currentMemberID: appState.currentUser.id,
+                        now: context.date,
+                        focusedMemberID: $routeTargetID,
+                        fitAllTrigger: $fitAllTrigger
+                    )
                 }
-                fitAllButton
-                    .padding(10)
+                VStack(spacing: 10) {
+                    membersButton(group: group)
+                    fitAllButton
+                }
+                .padding(12)
             }
-            .overlay(alignment: .topLeading) {
-                connectionModePill
-                    .padding(10)
+            .overlay(alignment: .bottom) {
+                focusedMemberCard(group: group)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
             }
-            .frame(height: 420)
-            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .frame(height: 540)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
             .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+            .listRowBackground(Color.clear)
             .accessibilityLabel("Map showing your location and group members")
+            .sheet(isPresented: $showsMemberList) {
+                TimelineView(.periodic(from: .now, by: 15)) { context in
+                    MemberListSheet(
+                        members: group.members,
+                        currentMemberID: appState.currentUser.id,
+                        now: context.date,
+                        focusedMemberID: $routeTargetID
+                    )
+                    .environment(appState)
+                }
+                .presentationDetents([.height(120), .fraction(0.45), .large])
+                .presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.45)))
+                .presentationDragIndicator(.visible)
+                .presentationBackground(.black)
+            }
         }
+    }
+
+    @ViewBuilder
+    private func membersButton(group: GroupSession) -> some View {
+        Button {
+            showsMemberList = true
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "person.2.fill")
+                    .font(.footnote.weight(.semibold))
+                Text("\(group.members.count)")
+                    .font(.footnote.weight(.semibold))
+                    .monospacedDigit()
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.black.opacity(0.55), in: Capsule())
+            .overlay(Capsule().strokeBorder(.white.opacity(0.2), lineWidth: 1))
+        }
+        .accessibilityLabel("Show members list")
+    }
+
+    /// Floating dark card pinned to the bottom of the map when a
+    /// peer is route-targeted. Mirrors the reference design's
+    /// "Louise 10km · 5min ago" surface so the user knows who the
+    /// glowing route is pointing at and can jump straight to the
+    /// compass / chat for them.
+    @ViewBuilder
+    private func focusedMemberCard(group: GroupSession) -> some View {
+        if let id = routeTargetID,
+           let member = group.members.first(where: { $0.id == id }) {
+            let color = Color.memberColor(for: member.id)
+            let distance = distanceFromCurrentUser(to: member, group: group)
+            HStack(spacing: 12) {
+                AvatarView(data: member.avatarData,
+                           name: member.displayName,
+                           size: 40,
+                           tint: color)
+                    .overlay(
+                        Circle().strokeBorder(color, lineWidth: 2)
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(member.displayName)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white)
+                    HStack(spacing: 6) {
+                        if let distance {
+                            Text(distance)
+                        }
+                        Text("·")
+                        Text(member.lastSeen, style: .relative)
+                        Text("ago")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.7))
+                }
+                Spacer(minLength: 0)
+                Button {
+                    compassMember = member
+                } label: {
+                    Image(systemName: "location.north.fill")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(color.opacity(0.25), in: Circle())
+                        .overlay(Circle().strokeBorder(color, lineWidth: 1.5))
+                }
+                .accessibilityLabel("Find \(member.displayName)")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.black.opacity(0.75), in: Capsule())
+            .overlay(
+                Capsule().strokeBorder(color.opacity(0.5), lineWidth: 1)
+            )
+            .shadow(color: color.opacity(0.6), radius: 14, x: 0, y: 0)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .animation(.smooth(duration: 0.3), value: routeTargetID)
+        }
+    }
+
+    private func distanceFromCurrentUser(to other: User,
+                                         group: GroupSession) -> String? {
+        guard let mine = group.members.first(where: { $0.id == appState.currentUser.id })?.coordinate,
+              let theirs = other.coordinate else { return nil }
+        let meters = CLLocation(latitude: mine.latitude, longitude: mine.longitude)
+            .distance(from: CLLocation(latitude: theirs.latitude, longitude: theirs.longitude))
+        if meters < 1000 {
+            return "\(Int(meters))m"
+        }
+        return String(format: "%.1fkm", meters / 1000)
     }
 
     @ViewBuilder
@@ -264,12 +388,17 @@ struct GroupDashboardView: View {
     @ViewBuilder
     private var fitAllButton: some View {
         Button {
-            viewModel.fitAllMembers()
+            // Bump the trigger to ask `NeonMapView` for a fresh
+            // fit-all. Counter increment guarantees `updateUIView`
+            // sees the change even when the user taps it repeatedly.
+            fitAllTrigger += 1
         } label: {
             Image(systemName: "scope")
                 .font(.title3)
+                .foregroundStyle(.white)
                 .frame(width: 40, height: 40)
-                .background(.thickMaterial, in: Circle())
+                .background(.black.opacity(0.55), in: Circle())
+                .overlay(Circle().strokeBorder(.white.opacity(0.2), lineWidth: 1))
         }
         .accessibilityLabel("Fit all members on map")
     }
@@ -743,125 +872,6 @@ struct GroupDashboardView: View {
             try? await Task.sleep(for: .seconds(2))
             didCopyInviteCode = false
         }
-    }
-
-    // MARK: - Map
-
-    @ViewBuilder
-    private func mapContent(group: GroupSession,
-                            cameraBinding: Binding<MapCameraPosition>,
-                            now: Date) -> some View {
-        Map(position: cameraBinding) {
-            ForEach(group.members) { member in
-                // `renderablePosition` returns the same coordinate but
-                // with provenance baked in — staleGPS degradation, the
-                // accuracy bubble already inflated for old fixes, etc.
-                // The pin and accuracy ring both read from this single
-                // source of truth so they can't disagree.
-                if let estimate = member.renderablePosition(now: now),
-                   estimate.source != .hypothetical {
-                    // Hypothetical positions don't render on the map —
-                    // they don't have meaningful real-world coordinates.
-                    // The member list still surfaces them with a "GPS
-                    // unavailable" status so users know who's indoor.
-                    let coord = estimate.coordinate.clLocation
-                    let status = PresenceStatus(
-                        lastSeen: member.lastSeen,
-                        hasFix: true,
-                        now: now
-                    )
-                    let memberColor = Color.memberColor(for: member.id)
-
-                    // Accuracy bubble — only worth drawing when it
-                    // covers more than ~20m. Below that it's smaller
-                    // than the pin and adds visual noise.
-                    //   • .gps         → faint solid ring
-                    //   • .staleGPS    → darker solid ring (time-aged)
-                    //   • .deadReckoning → dashed ring + warmer tint
-                    //     so the "footstep estimate" reads distinct
-                    //     from a real (stale) GPS fix.
-                    if estimate.accuracy > 20 {
-                        let isStale = estimate.source != .gps
-                        let isDR = estimate.source == .deadReckoning
-                        MapCircle(center: coord, radius: estimate.accuracy)
-                            .foregroundStyle(memberColor.opacity(isStale ? 0.18 : 0.08))
-                            .stroke(
-                                memberColor.opacity(0.5),
-                                style: StrokeStyle(
-                                    lineWidth: 1,
-                                    dash: isDR ? [4, 3] : []
-                                )
-                            )
-                    }
-                    Annotation(member.displayName, coordinate: coord) {
-                        memberMapPin(member: member,
-                                     status: status,
-                                     source: estimate.source)
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func memberMapPin(member: User,
-                              status: PresenceStatus,
-                              source: PositionSource) -> some View {
-        let isFocused = viewModel.focusedMemberID == member.id
-        let color = Color.memberColor(for: member.id)
-        // Non-GPS sources render slightly faded so the user has a
-        // glance-level signal that "this dot isn't a fresh fix."
-        // PresenceStatus already fades by age; this layers a source
-        // signal on top so the two cues compound.
-        let sourceOpacity: Double = (source == .gps) ? 1.0 : 0.65
-
-        ZStack {
-            // Direction indicator (Google Maps style) — only when the
-            // device has a valid heading. Two layers: a wider faint halo
-            // and a focused brighter beam, both with a radial gradient
-            // so the apex (where the person is) is solid and the outer
-            // edge fades away. Blur softens the pie-slice edges.
-            if let heading = member.heading {
-                ZStack {
-                    DirectionCone(spreadDegrees: 90)
-                        .fill(RadialGradient(
-                            colors: [color.opacity(0.30), color.opacity(0.0)],
-                            center: .center,
-                            startRadius: 8,
-                            endRadius: 50
-                        ))
-                        .blur(radius: 4)
-                    DirectionCone(spreadDegrees: 50)
-                        .fill(RadialGradient(
-                            colors: [color.opacity(0.65), color.opacity(0.0)],
-                            center: .center,
-                            startRadius: 6,
-                            endRadius: 44
-                        ))
-                        .blur(radius: 1.5)
-                }
-                .frame(width: 100, height: 100)
-                .rotationEffect(.degrees(heading))
-                .animation(.smooth(duration: 0.3), value: heading)
-            }
-            if isFocused {
-                Circle()
-                    .stroke(Color.accentColor, lineWidth: 3)
-                    .background(Circle().fill(Color.accentColor.opacity(0.18)))
-                    .frame(width: 56, height: 56)
-                    .transition(.scale.combined(with: .opacity))
-            }
-            Circle()
-                .fill(color)
-                .frame(width: 38, height: 38)
-            AvatarView(data: member.avatarData,
-                       name: member.displayName,
-                       size: 32,
-                       tint: color)
-        }
-        .opacity(status.mapOpacity * sourceOpacity)
-        .animation(.smooth, value: isFocused)
-        .accessibilityLabel("\(member.displayName), \(status.label)")
     }
 
     // MARK: - Member row

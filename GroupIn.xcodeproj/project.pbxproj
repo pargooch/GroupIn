@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		4C9802432FB3833500D42DCC /* MapLibre in Frameworks */ = {isa = PBXBuildFile; productRef = 4C9802422FB3833500D42DCC /* MapLibre */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		4C114B4C2FAA163800C84F7C /* GroupIn.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GroupIn.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				4C9802432FB3833500D42DCC /* MapLibre in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = GroupIn;
 			packageProductDependencies = (
+				4C9802422FB3833500D42DCC /* MapLibre */,
 			);
 			productName = GroupIn;
 			productReference = 4C114B4C2FAA163800C84F7C /* GroupIn.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = 4C114B432FAA163800C84F7C;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				4C9802412FB3833500D42DCC /* XCRemoteSwiftPackageReference "maplibre-native-distribution" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 4C114B4D2FAA163800C84F7C /* Products */;
 			projectDirPath = "";
@@ -348,6 +357,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		4C9802412FB3833500D42DCC /* XCRemoteSwiftPackageReference "maplibre-native-distribution" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/maplibre/maplibre-native-distribution";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 6.26.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		4C9802422FB3833500D42DCC /* MapLibre */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4C9802412FB3833500D42DCC /* XCRemoteSwiftPackageReference "maplibre-native-distribution" */;
+			productName = MapLibre;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 4C114B442FAA163800C84F7C /* Project object */;
 }

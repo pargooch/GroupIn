@@ -364,7 +364,6 @@ final class AppState {
         if let data = defaults.data(forKey: Self.currentGroupKey),
            let restored = try? JSONDecoder().decode(GroupSession.self, from: data) {
             self.currentGroup = restored
-            self.path = [.groupDashboard(groupID: restored.id)]
             // Refresh currentUser to the right per-group membership.
             if let myID = membershipByGroupID[restored.id],
                let me = restored.members.first(where: { $0.id == myID }) {

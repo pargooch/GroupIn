@@ -24,11 +24,17 @@ struct HomeView: View {
                                    name: appState.localProfile.displayName,
                                    size: 48)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(appState.localProfile.displayName)
+                            Text(needsProfileSetup
+                                 ? "Set up your profile"
+                                 : appState.localProfile.displayName)
                                 .font(.headline)
-                            Text("Edit profile")
+                            Text(needsProfileSetup
+                                 ? "Add a name and photo to get started"
+                                 : "Edit profile")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(needsProfileSetup
+                                                 ? AnyShapeStyle(Color.accentColor)
+                                                 : AnyShapeStyle(HierarchicalShapeStyle.secondary))
                         }
                         Spacer()
                         Image(systemName: "chevron.right")
@@ -39,7 +45,9 @@ struct HomeView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityHint("Opens your profile to edit name and photo")
+                .accessibilityHint(needsProfileSetup
+                                   ? "Opens the profile editor to set your name and photo"
+                                   : "Opens your profile to edit name and photo")
             }
 
             createJoinSection
@@ -202,6 +210,10 @@ struct HomeView: View {
         }
     }
 
+    private var needsProfileSetup: Bool {
+        appState.localProfile.needsOnboarding
+    }
+
     @ViewBuilder
     private var createJoinSection: some View {
         Section {
@@ -210,14 +222,24 @@ struct HomeView: View {
             } label: {
                 Label("Create a Group", systemImage: "plus.circle.fill")
             }
-            .accessibilityHint("Starts a new group you can invite others to")
+            .disabled(needsProfileSetup)
+            .accessibilityHint(needsProfileSetup
+                               ? "Set up your profile first to create a group"
+                               : "Starts a new group you can invite others to")
 
             Button {
                 appState.path.append(.joinGroup)
             } label: {
                 Label("Join a Group", systemImage: "person.badge.plus")
             }
-            .accessibilityHint("Join an existing group with an invite code")
+            .disabled(needsProfileSetup)
+            .accessibilityHint(needsProfileSetup
+                               ? "Set up your profile first to join a group"
+                               : "Join an existing group with an invite code")
+        } footer: {
+            if needsProfileSetup {
+                Text("Set up your profile above to create or join a group.")
+            }
         }
     }
 
