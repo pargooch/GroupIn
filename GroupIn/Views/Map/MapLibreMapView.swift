@@ -49,6 +49,16 @@ struct MapLibreMapView: UIViewRepresentable {
         // SwiftUI stays the single source of truth.
         map.allowsScrolling = true
         map.allowsZooming = true
+        // Pin a sensible default zoom so the map never opens at the
+        // null-island world view while we're waiting for the first
+        // coordinate. The user's last-known location would be better
+        // but we don't have it on the SwiftUI thread here.
+        map.minimumZoomLevel = 4
+        map.setCenter(
+            CLLocationCoordinate2D(latitude: 41.9, longitude: 12.5),
+            zoomLevel: 11,
+            animated: false
+        )
 
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
@@ -198,13 +208,18 @@ struct MapLibreMapView: UIViewRepresentable {
         }
 
         private func fitAll(on map: MLNMapView, animated: Bool) {
-            let coords = annotationsByMember.values.map(\.coordinate)
-            guard !coords.isEmpty else { return }
+            let allCoords = annotationsByMember.values.map(\.coordinate)
+            guard !allCoords.isEmpty else { return }
+
+            // Focus on where most members are. Outliers (a friend who
+            // left for the airport, a cached old fix in another city)
+            // shouldn't pull the camera out to "see all of Italy."
+            let coords = clusterFocused(coords: allCoords)
 
             if coords.count == 1, let only = coords.first {
                 let camera = MLNMapCamera(
                     lookingAtCenter: only,
-                    acrossDistance: 600,
+                    acrossDistance: 250,
                     pitch: 0,
                     heading: 0
                 )
@@ -216,9 +231,68 @@ struct MapLibreMapView: UIViewRepresentable {
 
             let bounds = MLNCoordinateBounds.from(coords: coords)
             let insets = UIEdgeInsets(top: 100, left: 60, bottom: 220, right: 60)
+
+            // Hard zoom-out cap: if fitting the cluster would mean
+            // pulling back farther than 30 km across, bail out of the
+            // bounds-fit and use a camera centered on the cluster's
+            // centroid at a fixed 30 km. Outliers stay off-screen.
+            let extent = boundsExtentMeters(bounds)
+            if extent > 30_000 {
+                let centroid = CLLocationCoordinate2D(
+                    latitude: coords.map(\.latitude).reduce(0, +) / Double(coords.count),
+                    longitude: coords.map(\.longitude).reduce(0, +) / Double(coords.count)
+                )
+                let camera = MLNMapCamera(
+                    lookingAtCenter: centroid,
+                    acrossDistance: 30_000,
+                    pitch: 0,
+                    heading: 0
+                )
+                map.setCamera(camera,
+                              withDuration: animated ? 0.7 : 0,
+                              animationTimingFunction: CAMediaTimingFunction(name: .easeInEaseOut))
+                return
+            }
+
             map.setVisibleCoordinateBounds(bounds,
                                            edgePadding: insets,
                                            animated: animated)
+        }
+
+        /// Diagonal of the bounding box in meters. Used as a rough
+        /// "how big is this fit going to be" check before we hand it
+        /// to MapLibre.
+        private func boundsExtentMeters(_ b: MLNCoordinateBounds) -> Double {
+            let sw = CLLocation(latitude: b.sw.latitude, longitude: b.sw.longitude)
+            let ne = CLLocation(latitude: b.ne.latitude, longitude: b.ne.longitude)
+            return sw.distance(from: ne)
+        }
+
+        /// Drop outliers so the camera zooms to where the majority of
+        /// the group actually is. Anyone whose distance from the
+        /// centroid exceeds `max(2 × median, 150 m)` is excluded.
+        /// The 150 m floor protects tight clusters (everyone in one
+        /// bar) from accidentally rejecting a member three tables away.
+        private func clusterFocused(coords: [CLLocationCoordinate2D])
+            -> [CLLocationCoordinate2D] {
+            guard coords.count > 2 else { return coords }
+            let centroid = CLLocationCoordinate2D(
+                latitude: coords.map(\.latitude).reduce(0, +) / Double(coords.count),
+                longitude: coords.map(\.longitude).reduce(0, +) / Double(coords.count)
+            )
+            let center = CLLocation(latitude: centroid.latitude,
+                                    longitude: centroid.longitude)
+            let distances = coords.map {
+                CLLocation(latitude: $0.latitude, longitude: $0.longitude)
+                    .distance(from: center)
+            }
+            let sorted = distances.sorted()
+            let median = sorted[sorted.count / 2]
+            let threshold = max(median * 2, 150)
+            let kept = zip(coords, distances).compactMap { $1 <= threshold ? $0 : nil }
+            // If the heuristic somehow drops everyone, fall back to the
+            // full set so the user still sees their group.
+            return kept.isEmpty ? coords : kept
         }
 
         // MARK: Delegate

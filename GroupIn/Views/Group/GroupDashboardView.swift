@@ -135,12 +135,11 @@ struct GroupDashboardView: View {
         @Bindable var vm = viewModel
         List {
             mapSection(group: group)
+            membersSection(group: group)
+            groupSection(group: group)
             if showsLocationStatus {
                 Section { locationStatusContent }
             }
-            expirySection(group: group)
-            groupSection(group: group)
-            membersSection(group: group)
             if viewModel.isOwner {
                 bannedSection(group: group)
             }
@@ -189,6 +188,49 @@ struct GroupDashboardView: View {
             .accessibilityElement(children: .combine)
 
             inviteCodeButton(code: group.inviteCode)
+
+            expiryRow(group: group)
+        }
+    }
+
+    @ViewBuilder
+    private func expiryRow(group: GroupSession) -> some View {
+        TimelineView(.periodic(from: .now, by: 30)) { _ in
+            let isUrgent = group.expiresAt.timeIntervalSinceNow < 30 * 60
+            let tint: Color = isUrgent ? .orange : .secondary
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock")
+                        .font(.caption)
+                        .foregroundStyle(tint)
+                    Text("Expires \(group.expiresAt, style: .relative)")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(tint)
+                    Text("·")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text(group.expiresAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    if viewModel.shouldPromptOwnerToExtend {
+                        Button {
+                            viewModel.showExtendSheet = true
+                        } label: {
+                            Text("Extend")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+
+                if let pending = group.pendingExtension {
+                    pendingBanner(group: group, pending: pending)
+                }
+            }
         }
     }
 
@@ -556,46 +598,6 @@ struct GroupDashboardView: View {
     // MARK: - Expiry / extension UI
 
     @ViewBuilder
-    private func expirySection(group: GroupSession) -> some View {
-        Section {
-            TimelineView(.periodic(from: .now, by: 30)) { _ in
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Image(systemName: "clock")
-                            .foregroundStyle(.tint)
-                            .accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Expires \(group.expiresAt, style: .relative)")
-                                .font(.body.weight(.medium))
-                            Text(group.expiresAt.formatted(date: .abbreviated, time: .shortened))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .accessibilityElement(children: .combine)
-
-                    if let pending = group.pendingExtension {
-                        pendingBanner(group: group, pending: pending)
-                    }
-
-                    if viewModel.shouldPromptOwnerToExtend {
-                        Button {
-                            viewModel.showExtendSheet = true
-                        } label: {
-                            Label("Extend before it expires", systemImage: "exclamationmark.bubble")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.regular)
-                    }
-                }
-            }
-        } header: {
-            Text("Expiry")
-        }
-    }
-
-    @ViewBuilder
     private func pendingBanner(group: GroupSession, pending: PendingExtension) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Label {
@@ -891,13 +893,20 @@ struct GroupDashboardView: View {
 
         HStack(spacing: 12) {
             Button {
-                viewModel.focus(on: member)
+                guard hasLocation, !isMe else { return }
+                routeTargetID = (routeTargetID == member.id) ? nil : member.id
             } label: {
                 HStack(spacing: 12) {
                     AvatarView(data: member.avatarData,
                                name: member.displayName,
                                size: 40,
                                tint: memberColor)
+                        .overlay(
+                            Circle().strokeBorder(
+                                routeTargetID == member.id ? memberColor : .clear,
+                                lineWidth: 2.5
+                            )
+                        )
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             Text(member.displayName)
@@ -928,8 +937,12 @@ struct GroupDashboardView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(!hasLocation)
-            .accessibilityHint(hasLocation ? "Show on map" : "")
+            .disabled(!hasLocation || isMe)
+            .accessibilityHint(hasLocation
+                               ? (routeTargetID == member.id
+                                  ? "Clears the route on the map"
+                                  : "Draws a neon route to \(member.displayName) on the map")
+                               : "")
 
             Spacer()
 
