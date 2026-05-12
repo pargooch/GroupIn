@@ -7,6 +7,9 @@ import SwiftUI
 
 struct HomeView: View {
     @Environment(AppState.self) private var appState
+    #if DEBUG
+    @State private var showDebugOverlay = false
+    #endif
 
     var body: some View {
         List {
@@ -79,6 +82,25 @@ struct HomeView: View {
         }
         .navigationTitle("GroupIn")
         .navigationBarTitleDisplayMode(.inline)
+        #if DEBUG
+        .toolbar {
+            // Dev-only diagnostic surface. Tap to open the overlay
+            // showing retry queues, BLE health, peer cursors, last
+            // events — the single fastest way to diagnose "is
+            // anything stuck?" without grepping logs.
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showDebugOverlay = true
+                } label: {
+                    Image(systemName: "ladybug")
+                }
+                .accessibilityLabel("Debug overlay")
+            }
+        }
+        .sheet(isPresented: $showDebugOverlay) {
+            DebugOverlayView()
+        }
+        #endif
     }
 
     private struct StatusBanner: Identifiable {

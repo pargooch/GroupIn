@@ -162,6 +162,16 @@ final class AppState {
     private var pendingGroupSaves: [PendingGroupSave] = [] {
         didSet { persistPendingGroupSaves() }
     }
+    /// Persisted retry queue for member-record publishes that failed
+    /// — covers the create-group and join-group paths where we mint
+    /// a `User` locally and need to durably ship it to CloudKit so
+    /// peers who only see us via the cloud know we exist. Without
+    /// this, a publish failure was silently dropped (the old
+    /// `try? await groupService.publish(...)` pattern) and the
+    /// member became permanently invisible to cloud-only observers.
+    private var pendingMemberPublishes: [PendingMemberPublish] = [] {
+        didSet { persistPendingMemberPublishes() }
+    }
     private var retryEmitTask: Task<Void, Never>?
     /// Tick interval for the retry task. We wake on this cadence and
     /// drain any pending emits / group saves whose `nextRetryAt` has
@@ -303,6 +313,7 @@ final class AppState {
     private static let eventDeliveryKey = "GroupIn.AppState.eventDelivery"
     private static let pendingEmitsKey = "GroupIn.AppState.pendingEmits"
     private static let pendingGroupSavesKey = "GroupIn.AppState.pendingGroupSaves"
+    private static let pendingMemberPublishesKey = "GroupIn.AppState.pendingMemberPublishes"
 
     var isInGroup: Bool { currentGroup != nil }
 
@@ -343,6 +354,7 @@ final class AppState {
         self.eventDeliveryByID = Self.loadEventDelivery(defaults: defaults)
         self.pendingEmits = Self.loadPendingEmits(defaults: defaults)
         self.pendingGroupSaves = Self.loadPendingGroupSaves(defaults: defaults)
+        self.pendingMemberPublishes = Self.loadPendingMemberPublishes(defaults: defaults)
 
         if let data = defaults.data(forKey: Self.myGroupsKey),
            let decoded = try? JSONDecoder().decode([GroupSession].self, from: data) {
@@ -742,16 +754,26 @@ final class AppState {
 
     // MARK: - Identity
 
-    /// One-shot fetch of the backend's stable identifier for this user.
-    /// Cached in `localCloudUserID` and used as the salt input for the
-    /// per-group ban hash. Re-fetched after CKAccountChanged in case
-    /// the user switched iCloud accounts.
+    /// Resolve the stable identifier used as the salt input for the
+    /// per-group ban hash. Backed by `LocalIdentityStore` (Keychain),
+    /// so:
+    ///   • Works offline / signed out of iCloud — no CloudKit round-
+    ///     trip required, just a synchronous Keychain read.
+    ///   • Survives reinstall on the same device — closes the
+    ///     trivial "ban evasion via reinstall" exploit that the
+    ///     UserDefaults-backed identity had.
+    ///   • Syncs across the user's other devices on the same Apple
+    ///     ID via iCloud Keychain, so a ban applies to all of their
+    ///     devices, not just the one it was issued on.
+    ///
+    /// The backend's `cloudUserID()` (CKUserRecordID for the cloud
+    /// backend, per-install UUID for local) is now legacy — kept on
+    /// the protocol for compatibility but no longer the source of
+    /// identity. Re-resolved on `CKAccountChanged` so an account
+    /// switch invalidates the cached value (the Keychain item itself
+    /// doesn't change, but the call re-reads it for clarity).
     private func loadLocalCloudUserID() {
-        Task { [weak self] in
-            guard let self else { return }
-            let id = await self.groupService.cloudUserID()
-            self.localCloudUserID = id
-        }
+        self.localCloudUserID = LocalIdentityStore.stableID()
     }
 
     /// SHA-256 hash for the local user against a given invite code.
@@ -926,8 +948,14 @@ final class AppState {
         let isOwner = group.ownerID == currentUser.id
 
         if isOwner {
-            // Owner-initiated hard delete — drop the group + cascade
-            // delete its members server-side, then clear local state.
+            // Owner-initiated hard delete. Emit `.groupDeleted` FIRST
+            // so the event lands in the persisted log + pending-emits
+            // queue + BLE gossip stream before we tear down local
+            // state. Non-owner peers reduce this event into "drop the
+            // group locally and show a notice" — see
+            // `applyEventSideEffects(_:)`.
+            emit(.groupDeleted, in: group.id)
+
             myGroups.removeAll { $0.id == group.id }
             membershipByGroupID.removeValue(forKey: group.id)
             if currentGroup?.id == group.id {
@@ -1094,18 +1122,36 @@ final class AppState {
     /// Owner-only unban. Reverses a previous removal so the named
     /// person can rejoin with the invite code. Like `removeMember`,
     /// double-checks ownership defensively.
+    ///
+    /// Offline-first: local banlist is mutated immediately and the
+    /// event is emitted (queued via `pendingEmits` if CloudKit is
+    /// unreachable). The cloud snapshot save also routes through
+    /// `dispatchGroupSave` so the banlist on the Group CKRecord
+    /// catches up whenever connectivity returns.
     func unbanMember(banHash: String) async {
         guard let group = currentGroup,
               group.ownerID == currentUser.id else { return }
-        do {
-            let updated = try await groupService.unbanMember(
-                banHash: banHash, fromGroup: group.id
+
+        var updated = group
+        updated.bannedMembers.removeAll { $0.banHash == banHash }
+        currentGroup = updated
+        addOrUpdate(group: updated)
+
+        // Authoritative record of the unban — retried via
+        // pendingEmits + BLE gossiped to in-range peers.
+        emit(.memberUnbanned(banHash: banHash), in: group.id)
+
+        // Cloud snapshot — writes the updated banlist arrays back to
+        // the Group CKRecord so the next refresh doesn't re-import
+        // the stale ban hash.
+        dispatchGroupSave(updated)
+
+        // Best-effort direct call to the typed unban endpoint. If it
+        // fails the dispatchGroupSave above is the durable path.
+        Task { [groupService, banHash, groupID = group.id] in
+            _ = try? await groupService.unbanMember(
+                banHash: banHash, fromGroup: groupID
             )
-            currentGroup = updated
-            addOrUpdate(group: updated)
-            emit(.memberUnbanned(banHash: banHash), in: group.id)
-        } catch {
-            // Silent retry next refresh.
         }
     }
 
@@ -1638,7 +1684,16 @@ final class AppState {
             authorID: authorID,
             payload: payload
         )
+        emit(event)
+    }
 
+    /// Sibling to `emit(_:in:)` that takes a fully-constructed Event.
+    /// Used when the caller needs a deterministic event ID — most
+    /// notably the two-way join handshake, where the joiner and the
+    /// BLE responder both emit the same `memberJoined` with a
+    /// `(groupID, memberID)`-derived ID so the ingest-level dedup
+    /// collapses them into a single log entry / timeline row.
+    func emit(_ event: Event) {
         // Append to the local event log right away so the timeline UI
         // reflects the emission instantly. Also advances the latest
         // cursor — we authored this event, we definitely "know" it.
@@ -1707,6 +1762,21 @@ final class AppState {
             return
         }
 
+        // Two-way commit: mirror the joiner into our local member
+        // list and emit `memberJoined` on their behalf BEFORE we
+        // ship the JoinResponse. Without this, the responder is
+        // relying on the joiner's own `memberJoined` event arriving
+        // via gossip — but BLE may drop after the response, or the
+        // joiner may walk out of range before their emit lands.
+        // Now both sides converge to the same membership even if
+        // no further packets cross the wire.
+        //
+        // The emit uses a deterministic event ID derived from
+        // `(groupID, joinerMemberID)`, so when the joiner's own
+        // emit also lands, ingestEvent's id-level dedup collapses
+        // the pair into one log entry (and one timeline row).
+        commitJoinerLocally(request: request, group: group)
+
         let response = JoinResponse(
             groupID: group.id,
             name: group.name,
@@ -1718,6 +1788,51 @@ final class AppState {
             responderMemberID: membershipByGroupID[group.id] ?? currentUser.id
         )
         blePresenceService.respondToJoinRequest(response)
+    }
+
+    /// Adds the BLE joiner to our local group state and emits a
+    /// `memberJoined` event on their behalf. Idempotent — re-applying
+    /// for the same joiner (e.g. on a duplicate JoinRequest packet)
+    /// is a no-op. See `handleIncomingJoinRequest` for the rationale.
+    private func commitJoinerLocally(request: JoinRequest, group: GroupSession) {
+        if group.members.contains(where: { $0.id == request.joinerMemberID }) {
+            return
+        }
+
+        var working = group
+        let stub = User(
+            id: request.joinerMemberID,
+            displayName: request.joinerDisplayName,
+            avatarData: nil,
+            banHash: request.joinerBanHash
+        )
+        working.members.append(stub)
+        addOrUpdate(group: working)
+        if currentGroup?.id == working.id {
+            currentGroup = working
+        }
+
+        // Emit with author = joiner so the timeline reads "Alice
+        // joined" attributed to Alice, not to us. Deterministic
+        // event ID collapses against the joiner's own future emit
+        // at ingest.
+        let eventID = Event.memberJoinedEventID(
+            groupID: working.id,
+            memberID: request.joinerMemberID
+        )
+        let event = Event(
+            id: eventID,
+            groupID: working.id,
+            authorID: request.joinerMemberID,
+            createdAt: .now,
+            payload: .memberJoined(
+                memberID: request.joinerMemberID,
+                displayName: request.joinerDisplayName,
+                avatarData: nil,
+                banHash: request.joinerBanHash
+            )
+        )
+        emit(event)
     }
 
     // MARK: - BLE join discovery (joiner side)
@@ -1801,6 +1916,7 @@ final class AppState {
                 try? await Task.sleep(for: .seconds(Self.retryTickInterval))
                 guard let self else { return }
                 await self.drainPendingGroupSaves()
+                await self.drainPendingMemberPublishes()
                 await self.drainPendingEmits()
             }
         }
@@ -1871,6 +1987,102 @@ final class AppState {
         }
     }
 
+    /// Offline-first entry point for publishing a freshly-minted
+    /// per-group `User` record. Caller (CreateGroup / JoinGroup) has
+    /// already added the user to local state; this hands the
+    /// cloud-side publish to the retry queue. Try once immediately,
+    /// queue on failure.
+    func dispatchMemberPublish(_ user: User, in group: GroupSession) {
+        Task { [weak self, user, group] in
+            guard let self else { return }
+            let succeeded = await self.attemptMemberPublish(user: user, in: group)
+            if !succeeded {
+                self.enqueueMemberPublish(user: user, in: group)
+            }
+        }
+    }
+
+    private func attemptMemberPublish(user: User, in group: GroupSession) async -> Bool {
+        do {
+            try await groupService.publish(user: user, in: group)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func enqueueMemberPublish(user: User, in group: GroupSession) {
+        // Idempotent on (groupID, userID): a re-dispatch of the same
+        // user in the same group leaves the existing backoff state
+        // alone. We do refresh the User payload so the most recent
+        // identity bits (display name, avatar, ban hash) are what
+        // gets shipped when the next retry fires.
+        if let idx = pendingMemberPublishes.firstIndex(where: {
+            $0.groupID == group.id && $0.user.id == user.id
+        }) {
+            let entry = pendingMemberPublishes[idx]
+            pendingMemberPublishes[idx] = PendingMemberPublish(
+                user: user,
+                groupID: entry.groupID,
+                inviteCode: group.inviteCode,
+                retryCount: entry.retryCount,
+                nextRetryAt: entry.nextRetryAt
+            )
+            return
+        }
+        let entry = PendingMemberPublish(
+            user: user,
+            groupID: group.id,
+            inviteCode: group.inviteCode,
+            retryCount: 0,
+            nextRetryAt: Date().addingTimeInterval(PendingMemberPublish.backoff(after: 0))
+        )
+        pendingMemberPublishes.append(entry)
+    }
+
+    private func drainPendingMemberPublishes() async {
+        guard !pendingMemberPublishes.isEmpty else { return }
+        let now = Date()
+        let dueKeys = pendingMemberPublishes
+            .filter { $0.nextRetryAt <= now }
+            .map { ($0.groupID, $0.user.id) }
+
+        for (groupID, userID) in dueKeys {
+            guard let idx = pendingMemberPublishes.firstIndex(where: {
+                $0.groupID == groupID && $0.user.id == userID
+            }) else { continue }
+            let entry = pendingMemberPublishes[idx]
+            // Reconstruct the group from the most recent local
+            // snapshot so the publish carries any locally-pending
+            // mutations (e.g. invite-code change is impossible, but
+            // banlist / member changes would otherwise be lost on
+            // the queued group). Fall back to a minimal stub built
+            // from the queue entry if the group is gone locally.
+            let group = myGroups.first(where: { $0.id == groupID })
+                ?? GroupSession(
+                    id: groupID,
+                    name: "",
+                    inviteCode: entry.inviteCode,
+                    ownerID: entry.user.id,
+                    expiresAt: .distantFuture
+                )
+            // Prefer the freshest User snapshot too — heartbeat
+            // updates lastSeen / position / cursor on the local
+            // copy, and we want those in the publish.
+            let user = group.members.first(where: { $0.id == userID }) ?? entry.user
+            let succeeded = await attemptMemberPublish(user: user, in: group)
+            if succeeded {
+                pendingMemberPublishes.removeAll {
+                    $0.groupID == groupID && $0.user.id == userID
+                }
+            } else if let stillIdx = pendingMemberPublishes.firstIndex(where: {
+                $0.groupID == groupID && $0.user.id == userID
+            }) {
+                pendingMemberPublishes[stillIdx] = entry.bumpedRetry(now: Date())
+            }
+        }
+    }
+
     private func drainPendingEmits() async {
         guard !pendingEmits.isEmpty else { return }
         let now = Date()
@@ -1920,6 +2132,46 @@ final class AppState {
         let priorOldest = oldestEventCursors[event.groupID]
         if priorOldest == nil || event.cursor < priorOldest! {
             oldestEventCursors[event.groupID] = event.cursor
+        }
+
+        applyEventSideEffects(event)
+    }
+
+    /// Hook for events whose effect on local state goes beyond the
+    /// pure reducer fold. The reducer is `events → GroupSession?` —
+    /// when "the group is gone" is the right answer we need a side
+    /// effect (drop from `myGroups`, surface a notice, cancel
+    /// notifications), not a pure value. Centralized here so the
+    /// behavior is the same whether the event arrived via local
+    /// emit, CloudKit sync, or BLE gossip.
+    private func applyEventSideEffects(_ event: Event) {
+        switch event.payload {
+        case .groupDeleted:
+            // The author tore down explicitly in `remove(group:)`.
+            // Everyone else: drop the group locally and surface a
+            // notice so the user understands why the dashboard
+            // disappeared. Match by author against both currentUser
+            // (active group) and the per-group membership ID (any
+            // group in myGroups) so we don't double-tear-down.
+            let authorIsLocal = event.authorID == currentUser.id
+                || event.authorID == membershipByGroupID[event.groupID]
+            guard !authorIsLocal else { return }
+            guard let group = myGroups.first(where: { $0.id == event.groupID }) else {
+                return
+            }
+            let isActive = currentGroup?.id == event.groupID
+            myGroups.removeAll { $0.id == event.groupID }
+            membershipByGroupID.removeValue(forKey: event.groupID)
+            if isActive {
+                currentGroup = nil
+                groupDeletedNotice = group.name
+                path.removeAll()
+            }
+            Task { [notificationService, groupID = event.groupID] in
+                await notificationService.cancelAll(for: groupID)
+            }
+        default:
+            break
         }
     }
 
@@ -2269,27 +2521,66 @@ final class AppState {
 
     /// Owner-only. Proposes a new expiry; members must accept by the
     /// original expiry to remain.
+    ///
+    /// Offline-first: local `pendingExtension` is set immediately and
+    /// the event is emitted (queued via `pendingEmits` if CloudKit is
+    /// unreachable). The cloud snapshot save also routes through
+    /// `dispatchGroupSave` so the CKRecord catches up whenever
+    /// connectivity returns. Other members reduce the
+    /// `extensionProposed` event into their own state when it
+    /// reaches them via BLE gossip or cloud sync.
     func proposeCurrentExtension(newExpiresAt: Date) async throws {
         guard let group = currentGroup else { return }
-        let updated = try await groupService.proposeExtension(
-            groupID: group.id,
-            newExpiresAt: newExpiresAt
+
+        var updated = group
+        updated.pendingExtension = PendingExtension(
+            newExpiresAt: newExpiresAt,
+            proposedAt: .now,
+            acceptedMemberIDs: []
         )
         addOrUpdate(group: updated)
         currentGroup = updated
+
         emit(.extensionProposed(newExpiresAt: newExpiresAt), in: group.id)
+        dispatchGroupSave(updated)
+
+        // Best-effort direct call — dispatchGroupSave is the durable
+        // fallback so we ignore failures here.
+        Task { [groupService, groupID = group.id, newExpiresAt] in
+            _ = try? await groupService.proposeExtension(
+                groupID: groupID, newExpiresAt: newExpiresAt
+            )
+        }
     }
 
     /// Member accepts the active extension proposal on `currentGroup`.
+    ///
+    /// Offline-first: local `pendingExtension.acceptedMemberIDs` is
+    /// appended immediately and the event is emitted. Cloud snapshot
+    /// catch-up happens via `dispatchGroupSave`. Other members reduce
+    /// the `extensionAccepted` event when it reaches them.
     func acceptCurrentExtension() async throws {
-        guard let group = currentGroup else { return }
-        let updated = try await groupService.acceptExtension(
-            groupID: group.id,
-            memberID: currentUser.id
-        )
+        guard let group = currentGroup,
+              let memberID = membershipByGroupID[group.id] else { return }
+
+        var updated = group
+        if var pending = updated.pendingExtension {
+            if !pending.acceptedMemberIDs.contains(memberID) {
+                pending.acceptedMemberIDs.append(memberID)
+            }
+            updated.pendingExtension = pending
+        }
         addOrUpdate(group: updated)
         currentGroup = updated
-        emit(.extensionAccepted(memberID: currentUser.id), in: group.id)
+
+        emit(.extensionAccepted(memberID: memberID), in: group.id)
+        dispatchGroupSave(updated)
+
+        Task { [groupService, groupID = group.id, memberID] in
+            _ = try? await groupService.acceptExtension(
+                groupID: groupID, memberID: memberID
+            )
+        }
     }
 
     /// Returns whether the local user is the owner of the currently active group.
@@ -2466,13 +2757,84 @@ final class AppState {
         return decoded
     }
 
+    private func persistPendingMemberPublishes() {
+        if let data = try? JSONEncoder().encode(pendingMemberPublishes) {
+            defaults.set(data, forKey: Self.pendingMemberPublishesKey)
+        }
+    }
+
+    private static func loadPendingMemberPublishes(defaults: UserDefaults) -> [PendingMemberPublish] {
+        guard let data = defaults.data(forKey: pendingMemberPublishesKey),
+              let decoded = try? JSONDecoder().decode([PendingMemberPublish].self, from: data)
+        else { return [] }
+        return decoded
+    }
+
     /// Public count exposed to the Home banner so it can show
     /// "X pending uploads" when something hasn't reached CloudKit
     /// yet. Sums both queues — events authored offline AND groups
     /// created offline both count as user-visible pending work.
     var pendingUploadCount: Int {
-        pendingEmits.count + pendingGroupSaves.count
+        pendingEmits.count + pendingGroupSaves.count + pendingMemberPublishes.count
     }
+
+    #if DEBUG
+    /// One-shot snapshot of every diagnostic the debug overlay
+    /// renders. Computed in one place so the overlay UI is just a
+    /// pretty-printer and additions land here, not in the view.
+    /// `#if DEBUG`-gated so production binaries don't carry the
+    /// surface.
+    var debugSnapshot: DebugSnapshot {
+        let activeID = currentGroup?.id
+        let recent: [Event]
+        if let activeID, let log = eventsByGroup[activeID] {
+            recent = Array(
+                log.sorted {
+                    if $0.createdAt != $1.createdAt {
+                        return $0.createdAt > $1.createdAt
+                    }
+                    return $0.id.uuidString > $1.id.uuidString
+                }
+                .prefix(15)
+            )
+        } else {
+            recent = []
+        }
+        let peerEntries: [DebugSnapshot.PeerCursorEntry] = peerCursors.map { (peerID, cursor) in
+            let name = currentGroup?.members.first(where: { $0.id == peerID })?.displayName
+                ?? String(peerID.uuidString.prefix(8))
+            let mine = activeID.flatMap { eventCursors[$0] }
+            let behindBy: Int? = {
+                guard let activeID, let log = eventsByGroup[activeID] else { return nil }
+                return log.filter { $0.cursor > cursor }.count
+            }()
+            return DebugSnapshot.PeerCursorEntry(
+                memberID: peerID,
+                displayName: name,
+                cursor: cursor,
+                myCursor: mine,
+                behindByEvents: behindBy
+            )
+        }
+        return DebugSnapshot(
+            localIdentity: localCloudUserID,
+            isOnline: isOnline,
+            iCloudStatus: iCloudAccountStatus,
+            pendingEmitsCount: pendingEmits.count,
+            pendingMemberPublishesCount: pendingMemberPublishes.count,
+            pendingGroupSavesCount: pendingGroupSaves.count,
+            oldestPendingEmitAt: pendingEmits.map { $0.event.createdAt }.min(),
+            bleDiagnostics: bleDiagnostics,
+            activeGroupID: activeID,
+            activeGroupName: currentGroup?.name,
+            activeGroupMemberCount: currentGroup?.members.count ?? 0,
+            activeGroupEventCount: activeID.flatMap { eventsByGroup[$0]?.count } ?? 0,
+            myCursor: activeID.flatMap { eventCursors[$0] },
+            peerCursors: peerEntries.sorted { ($0.displayName ?? "") < ($1.displayName ?? "") },
+            recentEvents: recent
+        )
+    }
+    #endif
 
     /// Public accessor for the timeline UI. Returns nil for events
     /// authored by other members (we don't render dots on their

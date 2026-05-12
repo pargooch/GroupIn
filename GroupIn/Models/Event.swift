@@ -25,6 +25,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 /// One immutable event. The `payload` carries the type discriminator
 /// implicitly (via its enum case), so there's no separate `EventType`
@@ -75,6 +76,12 @@ enum EventPayload: Hashable, Sendable {
     case extensionAccepted(memberID: UUID)
     case extensionResolved(newExpiresAt: Date)
     case chatMessage(text: String)
+    /// Owner-initiated hard delete. Carries no payload — the
+    /// receiver tears down the group identified by `event.groupID`.
+    /// Lets the offline-bulletproof path propagate deletions via
+    /// BLE gossip and the persisted event log instead of relying on
+    /// each peer to *miss* the CKRecord and infer deletion.
+    case groupDeleted
 
     var typeIdentifier: String {
         switch self {
@@ -87,6 +94,7 @@ enum EventPayload: Hashable, Sendable {
         case .extensionAccepted:   return "extensionAccepted"
         case .extensionResolved:   return "extensionResolved"
         case .chatMessage:         return "chatMessage"
+        case .groupDeleted:        return "groupDeleted"
         }
     }
 }
@@ -152,6 +160,8 @@ extension EventPayload: Codable {
             self = .chatMessage(
                 text: try c.decode(String.self, forKey: .text)
             )
+        case "groupDeleted":
+            self = .groupDeleted
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .kind,
@@ -191,6 +201,8 @@ extension EventPayload: Codable {
             try c.encode(newExpiresAt, forKey: .newExpiresAt)
         case .chatMessage(let text):
             try c.encode(text, forKey: .text)
+        case .groupDeleted:
+            break
         }
     }
 }
@@ -273,7 +285,33 @@ extension Event {
         case .extensionResolved(let newExpiresAt):
             let when = newExpiresAt.formatted(date: .abbreviated, time: .shortened)
             return "Group extended until \(when)"
+
+        case .groupDeleted:
+            return "\(actor) deleted the group"
         }
+    }
+
+    /// Deterministic event ID for `memberJoined` derived from
+    /// `(groupID, memberID)`. Two devices (the joiner and a BLE
+    /// responder) can emit the same join independently with the
+    /// same event ID, so the ingest-level dedup in `AppState`
+    /// collapses them into one log entry — keeping the timeline
+    /// clean even when both sides commit the join in parallel.
+    ///
+    /// Not RFC 4122 v5 compliant (no namespace UUID, no version /
+    /// variant bits set), but stable as a dedup key, which is the
+    /// only property we need here.
+    static func memberJoinedEventID(groupID: UUID, memberID: UUID) -> UUID {
+        var data = Data()
+        withUnsafeBytes(of: groupID.uuid) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: memberID.uuid) { data.append(contentsOf: $0) }
+        data.append(Data("memberJoined".utf8))
+        let digest = SHA256.hash(data: data)
+        let bytes = Array(digest.prefix(16))
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3],
+                           bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11],
+                           bytes[12], bytes[13], bytes[14], bytes[15]))
     }
 
     /// A copy of this event safe to send over BLE — large blobs

@@ -367,13 +367,26 @@ struct GroupDashboardView: View {
             if group.members.isEmpty {
                 Text("No members yet").foregroundStyle(.secondary)
             } else {
-                TimelineView(.periodic(from: .now, by: 15)) { context in
-                    VStack(spacing: 0) {
-                        ForEach(group.members) { member in
-                            memberRow(member, group: group, now: context.date)
-                                .padding(.vertical, 4)
-                            if member.id != group.members.last?.id {
-                                Divider()
+                // Each member is its own List row. The TimelineView
+                // is per-row (cheap — SwiftUI shares the timer source)
+                // so swipe actions and row separators behave like
+                // every other List in the app. Previously we wrapped
+                // the whole ForEach in one TimelineView + VStack,
+                // which collapsed every member into a single List row
+                // and made swipe-to-remove apply to "all members at
+                // once."
+                ForEach(group.members) { member in
+                    TimelineView(.periodic(from: .now, by: 15)) { context in
+                        memberRow(member, group: group, now: context.date)
+                    }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        if viewModel.isOwner
+                            && member.id != viewModel.currentUser.id
+                            && member.id != group.ownerID {
+                            Button(role: .destructive) {
+                                memberToRemove = member
+                            } label: {
+                                Label("Remove", systemImage: "person.fill.xmark")
                             }
                         }
                     }
@@ -933,18 +946,6 @@ struct GroupDashboardView: View {
             }
         }
         .accessibilityElement(children: .contain)
-        // Owner-only: long-press a non-self, non-owner member to open
-        // a context menu offering removal. Confirmation alert is
-        // wired one level up via `memberToRemove`.
-        .contextMenu {
-            if viewModel.isOwner && !isMe && member.id != group.ownerID {
-                Button(role: .destructive) {
-                    memberToRemove = member
-                } label: {
-                    Label("Remove from group", systemImage: "person.fill.xmark")
-                }
-            }
-        }
     }
 }
 

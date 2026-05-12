@@ -138,12 +138,13 @@ final class CreateGroupViewModel {
         // remains a pure local-side function.
         appState.dispatchGroupSave(withCreator)
 
-        // Initial User publish — heartbeat will retry on its 20s
-        // cadence if this attempt fails, so we just fire-and-forget.
-        // No need for a separate retry queue.
-        Task { [groupService = appState.groupService, me, withCreator] in
-            try? await groupService.publish(user: me, in: withCreator)
-        }
+        // Initial User publish — try once immediately, fall back to
+        // the persisted retry queue on failure. This guarantees the
+        // owner's member record durably reaches CloudKit (so cloud-
+        // only observers see them) even if the create fired in
+        // airplane mode and the app got killed before the network
+        // came back.
+        appState.dispatchMemberPublish(me, in: withCreator)
 
         // Seed the event log via the standard `emit` path so each
         // event flows through `pendingEmits` retry + BLE gossip. The
@@ -158,15 +159,23 @@ final class CreateGroupViewModel {
             ),
             in: withCreator.id
         )
-        appState.emit(
-            .memberJoined(
+        let joinedID = Event.memberJoinedEventID(
+            groupID: withCreator.id,
+            memberID: me.id
+        )
+        let joinedEvent = Event(
+            id: joinedID,
+            groupID: withCreator.id,
+            authorID: me.id,
+            createdAt: .now,
+            payload: .memberJoined(
                 memberID: me.id,
                 displayName: me.displayName,
                 avatarData: me.avatarData,
                 banHash: me.banHash
-            ),
-            in: withCreator.id
+            )
         )
+        appState.emit(joinedEvent)
 
         // Permission prompt + T-30 expiry reminder. Detached so the
         // system prompt doesn't block navigation.

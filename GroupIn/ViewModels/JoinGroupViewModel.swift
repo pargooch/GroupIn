@@ -134,20 +134,33 @@ final class JoinGroupViewModel {
         appState.currentGroup = group
         appState.path.append(.groupDashboard(groupID: group.id))
 
-        // Publish via standard pipeline. Cloud-side publish retries
-        // via heartbeat; BLE event gossip handles the offline case.
-        Task { [groupService = appState.groupService, me, group] in
-            try? await groupService.publish(user: me, in: group)
-        }
-        appState.emit(
-            .memberJoined(
+        // Publish via the persisted retry queue. Cloud-side publish
+        // retries on exponential backoff; BLE event gossip handles
+        // the offline case in parallel.
+        appState.dispatchMemberPublish(me, in: group)
+
+        // Emit with the deterministic memberJoined event ID so this
+        // collapses against the responder's matching emit (see
+        // `AppState.commitJoinerLocally`) at the ingest dedup layer.
+        // Without matching IDs we'd produce two "joined" rows in
+        // every peer's timeline.
+        let eventID = Event.memberJoinedEventID(
+            groupID: group.id,
+            memberID: me.id
+        )
+        let event = Event(
+            id: eventID,
+            groupID: group.id,
+            authorID: me.id,
+            createdAt: .now,
+            payload: .memberJoined(
                 memberID: me.id,
                 displayName: me.displayName,
                 avatarData: me.avatarData,
                 banHash: me.banHash
-            ),
-            in: group.id
+            )
         )
+        appState.emit(event)
     }
 
     // MARK: - Inner attempt
@@ -200,23 +213,33 @@ final class JoinGroupViewModel {
             appState.currentGroup = withMe
             appState.path.append(.groupDashboard(groupID: withMe.id))
 
-            // Publish in the background — heartbeat retries within
-            // ~20 s if this loses a race.
-            Task { [service, me, withMe] in
-                try? await service.publish(user: me, in: withMe)
-            }
+            // Publish via the persisted retry queue — no more
+            // fire-and-forget. If this attempt fails the entry sits
+            // in `pendingMemberPublishes` and the retry loop drains
+            // it on exponential backoff.
+            appState.dispatchMemberPublish(me, in: withMe)
 
             // Append `memberJoined` through the standard emit path so
-            // it goes via pendingEmits (retried) + BLE gossip.
-            appState.emit(
-                .memberJoined(
+            // it goes via pendingEmits (retried) + BLE gossip. The
+            // deterministic event ID keeps us consistent with the
+            // BLE-resolved path — same dedup invariant for both.
+            let eventID = Event.memberJoinedEventID(
+                groupID: withMe.id,
+                memberID: me.id
+            )
+            let event = Event(
+                id: eventID,
+                groupID: withMe.id,
+                authorID: me.id,
+                createdAt: .now,
+                payload: .memberJoined(
                     memberID: me.id,
                     displayName: me.displayName,
                     avatarData: me.avatarData,
                     banHash: me.banHash
-                ),
-                in: withMe.id
+                )
             )
+            appState.emit(event)
 
             return .succeeded
         } catch let error as GroupServiceError {

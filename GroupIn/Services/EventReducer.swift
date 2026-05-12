@@ -139,6 +139,15 @@ enum EventReducer {
             // UI (Path C.4). Keeping them in the event log here gives
             // C.4 a free historical record to display when it lands.
             return state
+
+        case .groupDeleted:
+            // The owner has hard-deleted the group. The reducer can't
+            // signal "remove this group from myGroups" through a pure
+            // GroupSession value — AppState's ingestEvent applies the
+            // side effect (drop the group + show notice) for non-author
+            // peers. Returning nil here is a no-op in the reducer's
+            // local-state merge path.
+            return nil
         }
     }
 }
