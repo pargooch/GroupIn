@@ -22,6 +22,8 @@ struct ProfileEditorView: View {
 
     @State private var name: String = ""
     @State private var avatarData: Data?
+    @State private var hapticsEnabled: Bool = HapticEngine.isUserEnabled
+    @State private var voiceGuidanceEnabled: Bool = VoiceGuidance.isUserEnabled
 
     @State private var photoSelection: PhotosPickerItem?
     @State private var loadingPhoto = false
@@ -42,6 +44,38 @@ struct ProfileEditorView: View {
                     .textInputAutocapitalization(.words)
                     .submitLabel(.done)
                     .accessibilityLabel("Display name")
+            }
+
+            Section {
+                Toggle(isOn: $hapticsEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Haptic feedback")
+                        Text("Subtle taps on key actions and a heartbeat that intensifies as you walk toward a focused friend.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .onChange(of: hapticsEnabled) { _, newValue in
+                    HapticEngine.setUserEnabled(newValue)
+                    if newValue { HapticEngine.shared.tick() }
+                }
+
+                Toggle(isOn: $voiceGuidanceEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Spoken guidance")
+                        Text("When VoiceOver is on, GroupIn announces who joined, when a friend gets closer, and speaks your live distance while finding someone.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .onChange(of: voiceGuidanceEnabled) { _, newValue in
+                    VoiceGuidance.setUserEnabled(newValue)
+                    if newValue {
+                        VoiceGuidance.shared.announce("Spoken guidance on.")
+                    }
+                }
+            } header: {
+                Text("Feedback")
             }
 
             Section {

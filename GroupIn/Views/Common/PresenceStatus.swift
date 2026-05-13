@@ -67,6 +67,27 @@ enum PresenceStatus {
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: .now)
     }
+
+    /// Spoken summary for VoiceOver labels. Slightly more verbose
+    /// than `label` so it reads as a natural clause: "last seen 2
+    /// minutes ago" instead of just "2 min".
+    var accessibilitySummary: String {
+        switch self {
+        case .live:
+            return "live now"
+        case .recent(let date), .stale(let date):
+            return "last seen \(Self.relativeLong(from: date))"
+        case .offline(let date):
+            guard let date else { return "offline" }
+            return "offline, last seen \(Self.relativeLong(from: date))"
+        }
+    }
+
+    private static func relativeLong(from date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: .now)
+    }
 }
 
 struct PresenceBadge: View {

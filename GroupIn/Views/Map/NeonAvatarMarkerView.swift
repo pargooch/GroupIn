@@ -119,6 +119,16 @@ final class NeonAvatarMarkerView: MLNAnnotationView {
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
         addGestureRecognizer(tap)
 
+        // VoiceOver treats the whole marker as a single element so a
+        // user can swipe to it and hear the peer's name + state in
+        // one breath. Decorative subviews stay hidden from a11y.
+        isAccessibilityElement = true
+        accessibilityTraits = [.button]
+        avatarContainer.isAccessibilityElement = false
+        avatarImageView.isAccessibilityElement = false
+        initialsLabel.isAccessibilityElement = false
+        nameLabel.isAccessibilityElement = false
+
         startPulse()
     }
 
@@ -155,6 +165,18 @@ final class NeonAvatarMarkerView: MLNAnnotationView {
         // Focus = larger pulse amplitude. Re-add animation so the new
         // amplitude takes effect immediately.
         startPulse()
+
+        // Refresh the VoiceOver label so it reflects the latest peer
+        // state (name, focus, local-user marker).
+        let suffix = annotation.isLocalUser ? "your location" : "group member"
+        if focused {
+            accessibilityLabel = "\(annotation.displayName), \(suffix), route drawn"
+        } else {
+            accessibilityLabel = "\(annotation.displayName), \(suffix)"
+        }
+        accessibilityHint = annotation.isLocalUser
+            ? ""
+            : "Double tap to draw a route to this person."
     }
 
     private func updateBeam() {

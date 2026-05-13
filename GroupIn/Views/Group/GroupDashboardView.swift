@@ -28,6 +28,13 @@ struct GroupDashboardView: View {
     @State private var fitAllTrigger: Int = 0
     /// Drives the draggable bottom sheet listing members by distance.
     @State private var showsMemberList = false
+    /// Last seen member-ID set, so we can fire a success haptic AND
+    /// a VoiceOver announcement only when someone *new* joins (not
+    /// when someone leaves), and name them in the announcement.
+    @State private var lastMemberIDs: Set<UUID> = []
+    /// Tracks the prior value of the owner's "should extend" prompt
+    /// so we only buzz once on the false→true transition.
+    @State private var lastShouldPromptExtend = false
 
     init(viewModel: GroupDashboardViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -146,6 +153,35 @@ struct GroupDashboardView: View {
             messagesSection
             safetySection
             leaveGroupSection(group: group)
+        }
+        .onAppear {
+            lastMemberIDs = Set(group.members.map(\.id))
+            lastShouldPromptExtend = viewModel.shouldPromptOwnerToExtend
+        }
+        .onChange(of: group.members.map(\.id)) { _, newIDs in
+            let newSet = Set(newIDs)
+            let added = newSet.subtracting(lastMemberIDs)
+            if !lastMemberIDs.isEmpty, !added.isEmpty {
+                HapticEngine.shared.notify(.success)
+                let names = added
+                    .compactMap { id in group.members.first(where: { $0.id == id })?.displayName }
+                    .joined(separator: ", ")
+                let phrase = added.count == 1
+                    ? "\(names) joined the group"
+                    : "\(names) joined the group"
+                VoiceGuidance.shared.announce(phrase)
+            }
+            lastMemberIDs = newSet
+        }
+        .onChange(of: viewModel.shouldPromptOwnerToExtend) { _, newValue in
+            if newValue, !lastShouldPromptExtend {
+                HapticEngine.shared.notify(.warning)
+                VoiceGuidance.shared.announce(
+                    "Group expires soon. You can extend it from the Group section.",
+                    priority: .high
+                )
+            }
+            lastShouldPromptExtend = newValue
         }
         // Pull-to-refresh — forces a CloudKit fetch on demand so the
         // user doesn't have to wait for the 10s polling tick or a
@@ -894,7 +930,13 @@ struct GroupDashboardView: View {
         HStack(spacing: 12) {
             Button {
                 guard hasLocation, !isMe else { return }
-                routeTargetID = (routeTargetID == member.id) ? nil : member.id
+                let willClear = routeTargetID == member.id
+                routeTargetID = willClear ? nil : member.id
+                if willClear {
+                    HapticEngine.shared.tick()
+                } else {
+                    HapticEngine.shared.impact(.light)
+                }
             } label: {
                 HStack(spacing: 12) {
                     AvatarView(data: member.avatarData,
@@ -924,7 +966,6 @@ struct GroupDashboardView: View {
                                 Image(systemName: "crown.fill")
                                     .font(.caption2)
                                     .foregroundStyle(.orange)
-                                    .accessibilityLabel("Owner")
                             }
                         }
                         if !hasLocation {
@@ -938,11 +979,6 @@ struct GroupDashboardView: View {
             }
             .buttonStyle(.plain)
             .disabled(!hasLocation || isMe)
-            .accessibilityHint(hasLocation
-                               ? (routeTargetID == member.id
-                                  ? "Clears the route on the map"
-                                  : "Draws a neon route to \(member.displayName) on the map")
-                               : "")
 
             Spacer()
 
@@ -950,9 +986,10 @@ struct GroupDashboardView: View {
                 Image(systemName: source.icon)
                     .font(.caption2)
                     .foregroundStyle(source.tint)
-                    .accessibilityLabel(source.accessibilityLabel)
+                    .accessibilityHidden(true)
             }
             PresenceBadge(status: status)
+                .accessibilityHidden(true)
 
             if hasLocation && !isMe {
                 Button {
@@ -965,10 +1002,68 @@ struct GroupDashboardView: View {
                         .background(memberColor.opacity(0.12), in: Circle())
                 }
                 .buttonStyle(.borderless)
-                .accessibilityLabel("Find \(member.displayName)")
+                .accessibilityHidden(true)
             }
         }
-        .accessibilityElement(children: .contain)
+        // Treat the whole row as a single VoiceOver element. The
+        // interactive parts (toggle route, find with compass) are
+        // exposed as custom actions so a blind user can swipe to
+        // each row, hear its summary, and choose what to do via the
+        // rotor without hunting individual hit targets.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(memberAccessibilityLabel(member,
+                                                     group: group,
+                                                     status: status,
+                                                     isMe: isMe,
+                                                     hasLocation: hasLocation))
+        .accessibilityValue(routeTargetID == member.id ? "Route drawn on map" : "")
+        .accessibilityHint(hasLocation && !isMe
+                           ? "Double tap to toggle the route on the map."
+                           : "")
+        .accessibilityAction(named: routeTargetID == member.id
+                             ? "Clear route on map"
+                             : "Draw route on map") {
+            guard hasLocation, !isMe else { return }
+            let willClear = routeTargetID == member.id
+            routeTargetID = willClear ? nil : member.id
+        }
+        .accessibilityAction(named: "Open compass to find \(member.displayName)") {
+            guard hasLocation, !isMe else { return }
+            compassMember = member
+        }
+    }
+
+    /// Builds the spoken summary for a member row: name, distance,
+    /// direction relative to the user, presence, owner / me badges.
+    private func memberAccessibilityLabel(_ member: User,
+                                          group: GroupSession,
+                                          status: PresenceStatus,
+                                          isMe: Bool,
+                                          hasLocation: Bool) -> String {
+        var parts: [String] = [member.displayName]
+        if isMe { parts.append("you") }
+        if member.id == group.ownerID { parts.append("group owner") }
+
+        if !hasLocation {
+            parts.append("no location yet")
+        } else if !isMe,
+                  let mine = group.members.first(where: { $0.id == appState.currentUser.id })?.coordinate,
+                  let theirs = member.coordinate {
+            let meCL = CLLocation(latitude: mine.latitude, longitude: mine.longitude)
+            let themCL = CLLocation(latitude: theirs.latitude, longitude: theirs.longitude)
+            let metres = meCL.distance(from: themCL)
+            let bearing = SpatialFormatter.bearingDegrees(
+                from: meCL.coordinate, to: themCL.coordinate
+            )
+            parts.append(SpatialFormatter.distance(meters: metres))
+            parts.append(SpatialFormatter.direction(
+                bearing: bearing,
+                userHeading: appState.currentUser.heading
+            ))
+        }
+
+        parts.append(status.accessibilitySummary)
+        return parts.joined(separator: ", ")
     }
 }
 

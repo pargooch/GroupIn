@@ -164,8 +164,33 @@ struct MemberListSheet: View {
                 Spacer()
 
                 directionArrow
+                    .accessibilityHidden(true)
             }
             .padding(.vertical, 4)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(spokenLabel)
+            .accessibilityValue(focused ? "Route drawn on map" : "")
+            .accessibilityHint("Double tap to toggle the route on the map.")
+        }
+
+        /// Comprehensive spoken summary read by VoiceOver, in place of
+        /// the row's individual labels: "Alex, 120 meters, northeast,
+        /// last seen 2 minutes ago".
+        private var spokenLabel: String {
+            var parts: [String] = [row.member.displayName]
+            if let d = row.distance {
+                parts.append(SpatialFormatter.distance(meters: d))
+            }
+            if let bearing = row.bearingDegrees {
+                parts.append(SpatialFormatter.direction(
+                    bearing: bearing,
+                    userHeading: appState.currentUser.heading
+                ))
+            }
+            let relative = RelativeDateTimeFormatter()
+            relative.unitsStyle = .full
+            parts.append("last seen \(relative.localizedString(for: row.lastSeen, relativeTo: .now))")
+            return parts.joined(separator: ", ")
         }
 
         private var distanceText: String {

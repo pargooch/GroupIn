@@ -28,6 +28,17 @@ struct CompassView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    /// Tracks the previous phone-frame bearing error so we fire an
+    /// alignment haptic only when crossing INTO a tighter zone (e.g.
+    /// from 20° down to 15°), not on every sample.
+    @State private var lastBearingError: Double = 180
+    /// Last distance announced to VoiceOver. Used to fire one
+    /// announcement per threshold crossing without chatter.
+    @State private var lastAnnouncedDistance: Double = .greatestFiniteMagnitude
+    /// Tracks whether VoiceOver has already heard "Aligned with X"
+    /// for this acquisition. Reset when alignment is lost.
+    @State private var announcedAligned: Bool = false
+
     /// Cyan-blue tone used for the orb ring + diamond gem. Fixed
     /// across all members — it's the "GroupIn brand" element of the
     /// compass. Per-member color is used for the dot ring and the
@@ -44,6 +55,7 @@ struct CompassView: View {
 
         ZStack {
             backdrop(color: memberColor)
+                .accessibilityHidden(true)
 
             VStack(spacing: 0) {
                 header(member: member, color: memberColor)
@@ -54,9 +66,11 @@ struct CompassView: View {
                 if let reading {
                     compassDial(reading: reading, memberColor: memberColor)
                         .frame(width: 320, height: 320)
+                        .accessibilityHidden(true)
                 } else {
                     waitingState(member: member)
                         .frame(width: 320, height: 320)
+                        .accessibilityHidden(true)
                 }
 
                 Spacer(minLength: 8)
@@ -64,16 +78,147 @@ struct CompassView: View {
                 if let reading {
                     distanceBlock(reading: reading, color: memberColor, member: member)
                         .padding(.bottom, 8)
+                        .accessibilityHidden(true)
                 }
 
                 doneButton
                     .padding(.horizontal, 32)
                     .padding(.bottom, 32)
             }
+
+            // Invisible VoiceOver layer over the whole compass.
+            // Reading this single element gives a blind user the
+            // complete picture; custom actions cover the on-demand
+            // requests ("speak distance", "speak direction") that
+            // the rotor surfaces.
+            Color.clear
+                .accessibilityElement()
+                .accessibilityLabel(compassAccessibilityLabel(reading: reading,
+                                                              member: member))
+                .accessibilityValue(compassAccessibilityValue(reading: reading))
+                .accessibilityAddTraits(.updatesFrequently)
+                .accessibilityAction(named: "Speak distance") {
+                    if let m = reading?.metres {
+                        announce("\(member?.displayName ?? "Friend") is \(SpatialFormatter.distance(meters: m)) away.")
+                    } else {
+                        announce("Distance is not available right now.")
+                    }
+                }
+                .accessibilityAction(named: "Speak direction") {
+                    if let r = reading {
+                        let phrase = SpatialFormatter.relativeDirection(
+                            bearing: r.phoneFrameBearing, heading: 0
+                        )
+                        announce("\(member?.displayName ?? "Friend") is \(phrase).")
+                    } else {
+                        announce("Direction is not available right now.")
+                    }
+                }
+                .allowsHitTesting(false)
         }
         .preferredColorScheme(.dark)
-        .onAppear { appState.startUWBTracking(targetMemberID: memberID) }
+        .onAppear {
+            appState.startUWBTracking(targetMemberID: memberID)
+            // First reading should speak immediately rather than wait
+            // out the throttle window.
+            VoiceGuidance.shared.resetCompassThrottle()
+        }
         .onDisappear { appState.stopUWBTracking() }
+        .task(id: memberID) { await runHapticLoop() }
+    }
+
+    // MARK: - VoiceOver helpers
+
+    private func compassAccessibilityLabel(reading: ArrowReading?,
+                                           member: User?) -> String {
+        let name = member?.displayName ?? "Friend"
+        guard let reading else {
+            return "Finding \(name). Locating, no signal yet."
+        }
+        var parts: [String] = ["Finding \(name)"]
+        if let m = reading.metres {
+            parts.append(SpatialFormatter.distance(meters: m))
+        } else {
+            parts.append(reading.distanceBand)
+        }
+        // phoneFrameBearing is relative to the phone (0° = top of
+        // screen = where the user is "pointing"). Treat the user as
+        // facing north (heading = 0) so the cardinal helper produces
+        // body-relative phrasing like "ahead and to your right".
+        let phrase = SpatialFormatter.relativeDirection(
+            bearing: reading.phoneFrameBearing, heading: 0
+        )
+        parts.append(phrase)
+        return parts.joined(separator: ", ")
+    }
+
+    private func compassAccessibilityValue(reading: ArrowReading?) -> String {
+        guard let reading else { return "" }
+        let err = abs(reading.phoneFrameBearing.truncatingRemainder(dividingBy: 360))
+        let absErr = min(err, 360 - err)
+        if absErr < 5 { return "Aligned" }
+        if absErr < 20 { return "Almost aligned" }
+        return ""
+    }
+
+    private func announce(_ message: String) {
+        VoiceGuidance.shared.announce(message, priority: .high)
+    }
+
+    /// Drives the two compass haptics on a 200 ms cadence:
+    ///   • Proximity pulse — variable intensity/interval scaled by
+    ///     distance. `HapticEngine` self-throttles so calling every
+    ///     tick is cheap; only fires as often as the cadence allows.
+    ///   • Alignment tick — fires once when the user rotates the
+    ///     phone into a tighter bearing zone (20°, 10°, 5°). Resets
+    ///     when they drift back out so re-acquiring still buzzes.
+    private func runHapticLoop() async {
+        let zones: [Double] = [20, 10, 5]
+        // Distance thresholds spoken to VoiceOver, in metres. Fired
+        // once per crossing (going closer). Step back beyond + 20%
+        // before they re-arm so we don't chatter at the boundary.
+        let distanceThresholds: [Double] = [100, 30, 10, 3]
+        while !Task.isCancelled {
+            if let reading = arrowReading() {
+                if let m = reading.metres {
+                    HapticEngine.shared.proximityPulse(distanceMeters: m)
+                    for t in distanceThresholds
+                    where lastAnnouncedDistance > t * 1.2 && m <= t {
+                        announce("Within \(SpatialFormatter.distance(meters: t))")
+                        break
+                    }
+                    lastAnnouncedDistance = m
+
+                    // Periodic spoken proximity update — AirTag-style.
+                    // `VoiceGuidance` self-throttles to its compass
+                    // interval (5s), and is a no-op when VoiceOver is
+                    // off or the user has disabled spoken guidance.
+                    let phrase = SpatialFormatter.relativeDirection(
+                        bearing: reading.phoneFrameBearing, heading: 0
+                    )
+                    let name = currentMember?.displayName ?? "Friend"
+                    VoiceGuidance.shared.compassUpdate(
+                        "\(name), \(SpatialFormatter.distance(meters: m)), \(phrase)."
+                    )
+                }
+                let err = min(abs(reading.phoneFrameBearing.truncatingRemainder(dividingBy: 360)),
+                              360 - abs(reading.phoneFrameBearing.truncatingRemainder(dividingBy: 360)))
+                for zone in zones where lastBearingError > zone && err <= zone {
+                    HapticEngine.shared.compassAligned(bearingErrorDegrees: err)
+                    break
+                }
+                // Speak "Aligned" once when we settle inside 5°,
+                // re-arm once we drift back past 15°.
+                if err < 5, !announcedAligned {
+                    announce("Aligned")
+                    announcedAligned = true
+                } else if err > 15 {
+                    announcedAligned = false
+                }
+                lastBearingError = err
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
     }
 
     // MARK: - Backdrop
@@ -290,6 +435,10 @@ struct CompassView: View {
     private struct ArrowReading {
         let phoneFrameBearing: Double  // degrees clockwise; 0 = up on screen
         let distanceBand: String
+        /// Best-effort numeric distance in metres. Available for UWB
+        /// and GPS modes; nil when only gradient-based mode is up.
+        /// Used to drive haptic proximity pulses.
+        let metres: Double?
         let isFresh: Bool
         let mode: CompassMode
         let confidence: Double         // 0–1; full opacity for GPS, R² for gradient
@@ -314,6 +463,7 @@ struct CompassView: View {
             return ArrowReading(
                 phoneFrameBearing: bearingDeg,
                 distanceBand: Self.uwbDistanceBand(metres: uwb.distance),
+                metres: uwb.distance.map(Double.init),
                 isFresh: true,
                 mode: .uwb,
                 confidence: 1.0
@@ -352,6 +502,7 @@ struct CompassView: View {
             return ArrowReading(
                 phoneFrameBearing: phoneFrame,
                 distanceBand: band,
+                metres: gps.metres,
                 isFresh: true,
                 mode: .bluetooth,
                 confidence: gradient.confidence
@@ -365,6 +516,7 @@ struct CompassView: View {
             return ArrowReading(
                 phoneFrameBearing: phoneFrame,
                 distanceBand: CompassMath.distanceBand(metres: gps.metres),
+                metres: gps.metres,
                 isFresh: true,
                 mode: .gps,
                 confidence: 1.0
@@ -381,6 +533,7 @@ struct CompassView: View {
             return ArrowReading(
                 phoneFrameBearing: phoneFrame,
                 distanceBand: band,
+                metres: nil,
                 isFresh: false,
                 mode: .bluetooth,
                 confidence: gradient.confidence
