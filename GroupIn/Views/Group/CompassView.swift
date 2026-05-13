@@ -27,6 +27,7 @@ struct CompassView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
 
     /// Tracks the previous phone-frame bearing error so we fire an
     /// alignment haptic only when crossing INTO a tighter zone (e.g.
@@ -116,7 +117,6 @@ struct CompassView: View {
                 }
                 .allowsHitTesting(false)
         }
-        .preferredColorScheme(.dark)
         .onAppear {
             appState.startUWBTracking(targetMemberID: memberID)
             // First reading should speak immediately rather than wait
@@ -226,24 +226,31 @@ struct CompassView: View {
     @ViewBuilder
     private func backdrop(color: Color) -> some View {
         ZStack {
-            // Near-black base. A pure-black bg makes the neon glow
-            // feel sharp; the radial wash on top adds depth.
-            Color(red: 0.02, green: 0.02, blue: 0.04)
+            // Base — pure white in light mode, near-black in dark.
+            // The neon glow on top still pops in light mode because
+            // the orb itself is fully lit; we just lose the "reactor
+            // vignette" feel, which is fine.
+            if colorScheme == .dark {
+                Color(red: 0.02, green: 0.02, blue: 0.04)
+            } else {
+                Color.white
+            }
             RadialGradient(
                 colors: [
-                    color.opacity(0.18),
-                    color.opacity(0.05),
+                    color.opacity(colorScheme == .dark ? 0.18 : 0.10),
+                    color.opacity(colorScheme == .dark ? 0.05 : 0.03),
                     .clear
                 ],
                 center: .center,
                 startRadius: 50,
                 endRadius: 500
             )
-            // Faint cyan vignette top-down — reinforces the "reactor"
-            // feel even before the orb appears.
+            // Top-down vignette: cyan in dark mode reinforces the
+            // "reactor" feel; in light mode we use a soft accent so
+            // we don't muddy the white.
             LinearGradient(
                 colors: [
-                    Self.orbAccent.opacity(0.08),
+                    Self.orbAccent.opacity(colorScheme == .dark ? 0.08 : 0.04),
                     .clear
                 ],
                 startPoint: .top,
@@ -276,8 +283,9 @@ struct CompassView: View {
             }
             Text(member?.displayName ?? "Member")
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
-                .shadow(color: color.opacity(0.4), radius: 8)
+                .foregroundStyle(.primary)
+                .shadow(color: color.opacity(colorScheme == .dark ? 0.4 : 0.0),
+                        radius: 8)
         }
     }
 
@@ -335,20 +343,21 @@ struct CompassView: View {
         VStack(spacing: 10) {
             Text(reading.distanceBand)
                 .font(.system(size: 36, weight: .light, design: .rounded))
-                .foregroundStyle(.white)
-                .shadow(color: color.opacity(0.6), radius: 18)
+                .foregroundStyle(.primary)
+                .shadow(color: color.opacity(colorScheme == .dark ? 0.6 : 0.15),
+                        radius: 18)
 
             modeBadge(reading: reading, color: color)
 
             if let member, !reading.isFresh, reading.mode == .gps {
                 Text("Last seen \(member.lastSeen.formatted(.relative(presentation: .named)))")
                     .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(.secondary)
             }
             if reading.mode == .bluetooth, reading.confidence < 0.4 {
                 Text("Walk a few steps to lock on")
                     .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -378,8 +387,8 @@ struct CompassView: View {
         .overlay(
             Capsule().strokeBorder(color.opacity(0.5), lineWidth: 1)
         )
-        .foregroundStyle(.white)
-        .shadow(color: color.opacity(0.3), radius: 6)
+        .foregroundStyle(.primary)
+        .shadow(color: color.opacity(colorScheme == .dark ? 0.3 : 0.0), radius: 6)
     }
 
     // MARK: - Waiting state
@@ -393,14 +402,14 @@ struct CompassView: View {
                     .frame(width: 200, height: 200)
                 Image(systemName: "location.slash")
                     .font(.system(size: 56))
-                    .foregroundStyle(.white.opacity(0.4))
+                    .foregroundStyle(.secondary)
             }
             Text("Locking on")
                 .font(.title3.weight(.medium))
-                .foregroundStyle(.white)
+                .foregroundStyle(.primary)
             Text("Need a fix from both of you. Make sure \(member?.displayName ?? "this member") has GroupIn open.")
                 .font(.footnote)
-                .foregroundStyle(.white.opacity(0.55))
+                .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 24)
         }
@@ -418,9 +427,9 @@ struct CompassView: View {
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                 .overlay(
                     RoundedRectangle(cornerRadius: 14)
-                        .strokeBorder(Self.orbAccent.opacity(0.2), lineWidth: 1)
+                        .strokeBorder(Self.orbAccent.opacity(0.4), lineWidth: 1)
                 )
-                .foregroundStyle(.white)
+                .foregroundStyle(.primary)
         }
     }
 
