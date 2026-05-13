@@ -100,7 +100,7 @@ struct ChatSheet: View {
                 tint: .red
             )
         }
-        let count = appState.bleDiagnostics.chatSubscribers
+        let count = appState.transportDiagnostics.connectedPeers
         if count == 0 {
             return BannerInfo(
                 icon: "antenna.radiowaves.left.and.right.slash",

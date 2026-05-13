@@ -28,10 +28,18 @@ struct GroupInApp: App {
         }
     }()
 
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environment(appState)
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            // Foreground = seeker (full stack). Background/inactive =
+            // sought (BLE peripheral keeps advertising, transport
+            // sleeps). See `AppState.applyScenePhase(active:)`.
+            appState.applyScenePhase(active: newPhase == .active)
         }
     }
 }

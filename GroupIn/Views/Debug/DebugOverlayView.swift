@@ -66,7 +66,6 @@ struct DebugOverlayView: View {
     private func bleSection(_ diag: BLEDiagnostics) -> some View {
         Section("BLE") {
             row("Bluetooth ready", value: diag.bluetoothReady ? "yes" : "no")
-            row("Chat subscribers", value: "\(diag.chatSubscribers)")
             row("Presence subscribers", value: "\(diag.presenceSubscribers)")
             if diag.serviceAddFailed {
                 row("Service add", value: "failed")

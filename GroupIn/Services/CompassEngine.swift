@@ -32,6 +32,15 @@ struct CompassEngine {
     private let minPairs: Int = 5
     private let minMovementMetres: Double = 2
 
+    /// Hampel-lite outlier rejection: when a raw RSSI sample differs
+    /// from the running median by more than this many dB *and* arrives
+    /// within `obstacleEventInterval` of the previous sample, treat it
+    /// as a wall/pocket transition rather than a real distance
+    /// change. The smoother substitutes the median for the regression
+    /// input — raw is preserved for diagnostics but not fitted.
+    private let outlierDeltaDB: Double = 18
+    private let obstacleEventInterval: TimeInterval = 0.5
+
     // MARK: - Recording
 
     mutating func recordPosition(latitude: Double, longitude: Double) {
@@ -40,12 +49,41 @@ struct CompassEngine {
         prune(now: now)
     }
 
-    mutating func recordRSSI(_ rssi: Double, for memberID: UUID) {
+    mutating func recordRSSI(_ rawRSSI: Double, for memberID: UUID) {
         let now = Date()
         var arr = rssis[memberID] ?? []
-        arr.append(RSSISample(time: now, rssi: rssi))
+
+        // Filter 1: Hampel-lite. If the new sample diverges sharply
+        // from the recent median *and* arrives suspiciously fast,
+        // substitute the median. Bodies, pockets, and walls produce
+        // exactly this signature; the regression should track the
+        // smoother curve, not the obstacle artifact.
+        let recent = arr.suffix(4).map(\.rssi) + [rawRSSI]
+        let median = Self.median(of: recent)
+        let dt = arr.last.map { now.timeIntervalSince($0.time) } ?? .infinity
+        let smoothed: Double
+        if abs(rawRSSI - median) > outlierDeltaDB,
+           dt < obstacleEventInterval {
+            smoothed = median
+        } else {
+            smoothed = rawRSSI
+        }
+
+        arr.append(RSSISample(time: now, rssi: smoothed))
         rssis[memberID] = arr
         prune(now: now)
+    }
+
+    /// Median of a small array. Cheap O(n log n) — sample windows are
+    /// 3–5 entries so the sort cost is negligible.
+    private static func median(of values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[mid - 1] + sorted[mid]) / 2
+        }
+        return sorted[mid]
     }
 
     private mutating func prune(now: Date) {

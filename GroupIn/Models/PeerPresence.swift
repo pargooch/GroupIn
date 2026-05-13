@@ -53,6 +53,13 @@ struct PeerPresence: Codable, Equatable {
     let eventCursorCreatedAt: Date?
     let eventCursorID: UUID?
 
+    /// What payload transports this peer can drive. The group-min
+    /// across every member's capability set selects the active
+    /// transport for the group. Missing field (older clients) decodes
+    /// to nil → treated as "MPC only" since every iOS device can do
+    /// that.
+    let transportCapability: TransportCapability?
+
     init(groupHash: UInt32,
          memberID: UUID,
          latitude: Double?,
@@ -62,7 +69,8 @@ struct PeerPresence: Codable, Equatable {
          accuracy: Double? = nil,
          positionSource: String? = nil,
          positionAnchorAt: Date? = nil,
-         eventCursor: EventCursor? = nil) {
+         eventCursor: EventCursor? = nil,
+         transportCapability: TransportCapability? = nil) {
         self.groupHash = groupHash
         self.memberID = memberID
         self.latitude = latitude
@@ -74,6 +82,7 @@ struct PeerPresence: Codable, Equatable {
         self.positionAnchorAt = positionAnchorAt
         self.eventCursorCreatedAt = eventCursor?.createdAt
         self.eventCursorID = eventCursor?.id
+        self.transportCapability = transportCapability
     }
 
     /// Materialized event cursor, or nil if either field is missing.
@@ -98,6 +107,7 @@ struct PeerPresence: Codable, Equatable {
         self.positionAnchorAt = try? c.decode(Date.self, forKey: .positionAnchorAt)
         self.eventCursorCreatedAt = try? c.decode(Date.self, forKey: .eventCursorCreatedAt)
         self.eventCursorID = try? c.decode(UUID.self, forKey: .eventCursorID)
+        self.transportCapability = try? c.decode(TransportCapability.self, forKey: .transportCapability)
     }
 
     func encoded() -> Data? {

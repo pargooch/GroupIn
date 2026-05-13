@@ -36,16 +36,6 @@ struct RSSIReading: Sendable {
 protocol BLEPresenceServicing: AnyObject {
     var peerUpdates: AsyncStream<PeerPresence> { get }
     var rssiUpdates: AsyncStream<RSSIReading> { get }
-    /// Incoming chat messages from in-range peers. Filtered by group
-    /// hash; only messages matching the active group's hash arrive.
-    var chatMessages: AsyncStream<ChatMessage> { get }
-
-    /// Incoming `Event` payloads from in-range peers — the BLE-side
-    /// of the event log gossip. AppState applies them through the
-    /// reducer just like CloudKit-fetched events. Filtering by group
-    /// happens at the consumer (events carry their own groupID, and
-    /// only one group at a time is "active" for BLE advertising).
-    var events: AsyncStream<Event> { get }
 
     /// JoinResponse payloads received from in-range peers while in
     /// discovery mode. AppState consumes these to short-circuit the
@@ -59,23 +49,12 @@ protocol BLEPresenceServicing: AnyObject {
     /// and decides whether to call `respondToJoinRequest`.
     var incomingJoinRequests: AsyncStream<JoinRequest> { get }
 
-    /// Stream of diagnostics about the peripheral side of the BLE pipe:
-    /// how many remote centrals are connected to us, how many have
-    /// subscribed to chat. Useful for surfacing "no one's listening"
-    /// states in the UI.
+    /// Stream of diagnostics about the BLE pipe.
     var diagnostics: AsyncStream<BLEDiagnostics> { get }
 
     func start(groupHash: UInt32, localPresence: PeerPresence)
     func update(localPresence: PeerPresence)
     func stop()
-    /// Push a chat message to all subscribed central peers.
-    func send(chatMessage: ChatMessage)
-
-    /// Broadcast a single event over the events characteristic.
-    /// Caller is responsible for cursor-based gating (deciding
-    /// whether anyone in range needs it) and for calling
-    /// `Event.strippedForBLE()` if the payload has large blobs.
-    func broadcastEvent(_ event: Event)
 
     /// Enter join-discovery mode: scan + connect to nearby GroupIn
     /// peripherals, write the provided `JoinRequest` to each, and
@@ -97,7 +76,6 @@ protocol BLEPresenceServicing: AnyObject {
 }
 
 struct BLEDiagnostics: Sendable, Equatable {
-    var chatSubscribers: Int
     var presenceSubscribers: Int
     var serviceAddFailed: Bool
     /// True when both BLE roles report `.poweredOn`. Optimistic at app
@@ -119,17 +97,6 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// Characteristic UUID for the JSON-encoded PeerPresence payload.
     static let presenceCharacteristicUUID = CBUUID(string: "A5B7E1C1-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
 
-    /// Characteristic UUID for the JSON-encoded ChatMessage payload.
-    /// Same notify-on-write pattern as presence, just a different payload
-    /// shape; we share the same GroupIn service.
-    static let chatCharacteristicUUID = CBUUID(string: "A5B7E1C2-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
-
-    /// Characteristic UUID for JSON-encoded `Event` payloads — the
-    /// peer-to-peer gossip channel for the unified event log. Same
-    /// read+notify pattern as presence/chat; receivers fold incoming
-    /// events through the reducer and dedup via their own cursor.
-    static let eventsCharacteristicUUID = CBUUID(string: "A5B7E1C3-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
-
     /// Joiner-side writes a JSON-encoded `JoinRequest` here. The peer
     /// validates the invite code against its active group and (on
     /// match) responds via the joinResponse characteristic.
@@ -147,25 +114,31 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// alternates between the two below.
     static let iBeaconUUID = UUID(uuidString: "1A7B5F30-9E2C-4D3B-8A5F-2C9D7E1A4F5B")!
 
+    /// Restoration identifier for the central manager. Required for
+    /// iOS to relaunch the app (or wake it from suspension) when our
+    /// BLE service UUID is detected while we're not running. Paired
+    /// with the `bluetooth-central` background mode.
+    static let centralRestoreIdentifier = "groupin.central.v1"
+
+    /// Restoration identifier for the peripheral manager. Lets iOS
+    /// resume our advertising / GATT serving in background. Paired
+    /// with the `bluetooth-peripheral` background mode.
+    static let peripheralRestoreIdentifier = "groupin.peripheral.v1"
+
     // MARK: - Streams
 
     let peerUpdates: AsyncStream<PeerPresence>
     let rssiUpdates: AsyncStream<RSSIReading>
-    let chatMessages: AsyncStream<ChatMessage>
-    let events: AsyncStream<Event>
     let joinResponses: AsyncStream<JoinResponse>
     let incomingJoinRequests: AsyncStream<JoinRequest>
     let diagnostics: AsyncStream<BLEDiagnostics>
     private nonisolated let peerContinuation: AsyncStream<PeerPresence>.Continuation
     private nonisolated let rssiContinuation: AsyncStream<RSSIReading>.Continuation
-    private nonisolated let chatContinuation: AsyncStream<ChatMessage>.Continuation
-    private nonisolated let eventContinuation: AsyncStream<Event>.Continuation
     private nonisolated let joinResponseContinuation: AsyncStream<JoinResponse>.Continuation
     private nonisolated let incomingJoinRequestContinuation: AsyncStream<JoinRequest>.Continuation
     private nonisolated let diagnosticsContinuation: AsyncStream<BLEDiagnostics>.Continuation
 
     private var currentDiagnostics = BLEDiagnostics(
-        chatSubscribers: 0,
         presenceSubscribers: 0,
         serviceAddFailed: false,
         bluetoothReady: true
@@ -177,13 +150,10 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private var peripheralManager: CBPeripheralManager!
 
     private var presenceCharacteristic: CBMutableCharacteristic?
-    private var chatCharacteristic: CBMutableCharacteristic?
-    private var eventsCharacteristic: CBMutableCharacteristic?
     private var joinRequestCharacteristic: CBMutableCharacteristic?
     private var joinResponseCharacteristic: CBMutableCharacteristic?
     private var advertisedService: CBMutableService?
     private var serviceAdded: Bool = false
-    private var lastChatData: Data?
 
     /// Active invite code we're hunting for when in join-discovery
     /// mode. Set by `startJoinDiscovery`, cleared on first acceptance
@@ -191,23 +161,6 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// the JoinRequest into discovered peripherals; the peripheral
     /// side ignores it.
     private var pendingJoinRequest: JoinRequest?
-    /// Most recently broadcast event payload, exposed so a central
-    /// connecting later can read the latest single event we have. The
-    /// event log on CloudKit + the cursor-mismatch push are how peers
-    /// catch up on history; this just keeps the BLE characteristic
-    /// from looking empty on initial read.
-    private var lastEventData: Data?
-
-    /// Outbox for event-batch updates that hit a full BLE transmission
-    /// queue. Same pattern as `pendingChatUpdates`.
-    private var pendingEventUpdates: [Data] = []
-
-    /// Outbox for chat updates that hit a full BLE transmission queue.
-    /// `peripheralManager.updateValue` returns false when iOS can't
-    /// accept right now; we retry from `peripheralManagerIsReady(...)`.
-    /// Without this, fast-typed messages or congested channels silently
-    /// drop messages.
-    private var pendingChatUpdates: [Data] = []
 
     private var activeGroupHash: UInt32?
     private var localMemberID: UUID?
@@ -240,28 +193,41 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     override init() {
         let (peerStream, peerCont) = AsyncStream.makeStream(of: PeerPresence.self)
         let (rssiStream, rssiCont) = AsyncStream.makeStream(of: RSSIReading.self)
-        let (chatStream, chatCont) = AsyncStream.makeStream(of: ChatMessage.self)
-        let (eventStream, eventCont) = AsyncStream.makeStream(of: Event.self)
         let (joinStream, joinCont) = AsyncStream.makeStream(of: JoinResponse.self)
         let (joinReqStream, joinReqCont) = AsyncStream.makeStream(of: JoinRequest.self)
         let (diagStream, diagCont) = AsyncStream.makeStream(of: BLEDiagnostics.self)
         self.peerUpdates = peerStream
         self.rssiUpdates = rssiStream
-        self.chatMessages = chatStream
-        self.events = eventStream
         self.joinResponses = joinStream
         self.incomingJoinRequests = joinReqStream
         self.diagnostics = diagStream
         self.peerContinuation = peerCont
         self.rssiContinuation = rssiCont
-        self.chatContinuation = chatCont
-        self.eventContinuation = eventCont
         self.joinResponseContinuation = joinCont
         self.incomingJoinRequestContinuation = joinReqCont
         self.diagnosticsContinuation = diagCont
         super.init()
-        self.centralManager = CBCentralManager(delegate: self, queue: nil)
-        self.peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
+        // State restoration on both managers. When iOS wakes the app
+        // because of a BLE event while we're suspended (or after
+        // force-quit on iPhones where the system allows it), the
+        // restored manager fires `willRestoreState` so we can rewire
+        // peripherals + characteristics without losing the connection.
+        self.centralManager = CBCentralManager(
+            delegate: self,
+            queue: nil,
+            options: [
+                CBCentralManagerOptionRestoreIdentifierKey:
+                    Self.centralRestoreIdentifier
+            ]
+        )
+        self.peripheralManager = CBPeripheralManager(
+            delegate: self,
+            queue: nil,
+            options: [
+                CBPeripheralManagerOptionRestoreIdentifierKey:
+                    Self.peripheralRestoreIdentifier
+            ]
+        )
     }
 
     /// Push a fresh snapshot of the diagnostics stream.
@@ -289,13 +255,9 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         serviceAdded = false
         advertisedService = nil
         presenceCharacteristic = nil
-        chatCharacteristic = nil
-        eventsCharacteristic = nil
         joinRequestCharacteristic = nil
         joinResponseCharacteristic = nil
         pendingJoinRequest = nil
-        lastEventData = nil
-        pendingEventUpdates.removeAll()
         beginScanIfReady()
         beginAdvertisingIfReady()
     }
@@ -329,12 +291,9 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         connectedPeers.removeAll()
         connectingPeers.removeAll()
         peripheralToMember.removeAll()
-        pendingChatUpdates.removeAll()
-        lastChatData = nil
         activeGroupHash = nil
         localMemberID = nil
         currentDiagnostics = BLEDiagnostics(
-            chatSubscribers: 0,
             presenceSubscribers: 0,
             serviceAddFailed: false,
             bluetoothReady: bluetoothBothPoweredOn()
@@ -457,18 +416,6 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             value: nil,                  // dynamic value (required for read+notify)
             permissions: [.readable]
         )
-        let chat = CBMutableCharacteristic(
-            type: Self.chatCharacteristicUUID,
-            properties: [.read, .notify],
-            value: nil,
-            permissions: [.readable]
-        )
-        let eventsChar = CBMutableCharacteristic(
-            type: Self.eventsCharacteristicUUID,
-            properties: [.read, .notify],
-            value: nil,
-            permissions: [.readable]
-        )
         // Joiners write a JoinRequest here — write-only, no read /
         // notify because the joiner doesn't need to observe their own
         // request. Permissions writeable.
@@ -488,38 +435,13 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             permissions: [.readable]
         )
         let svc = CBMutableService(type: Self.serviceUUID, primary: true)
-        svc.characteristics = [presence, chat, eventsChar, joinReqChar, joinRespChar]
+        svc.characteristics = [presence, joinReqChar, joinRespChar]
         peripheralManager.add(svc)
         presenceCharacteristic = presence
-        chatCharacteristic = chat
-        eventsCharacteristic = eventsChar
         joinRequestCharacteristic = joinReqChar
         joinResponseCharacteristic = joinRespChar
         advertisedService = svc
         serviceAdded = true
-    }
-
-    func send(chatMessage: ChatMessage) {
-        guard let data = chatMessage.encoded() else { return }
-        lastChatData = data
-        pendingChatUpdates.append(data)
-        drainChatQueue()
-    }
-
-    /// Broadcast a single Event to all subscribed centrals over the
-    /// events characteristic. Caller is responsible for cursor-based
-    /// filtering (deciding whether anyone needs it) and for stripping
-    /// oversized fields (avatarData) via `Event.strippedForBLE()`.
-    ///
-    /// Per-event encoding (not batched) keeps payload size predictable
-    /// and avoids the BLE MTU fragmentation problem entirely for the
-    /// shapes we currently emit. If a future event type grows beyond
-    /// ~150 encoded bytes, we'll need real fragmentation here.
-    func broadcastEvent(_ event: Event) {
-        guard let data = try? JSONEncoder().encode(event) else { return }
-        lastEventData = data
-        pendingEventUpdates.append(data)
-        drainEventQueue()
     }
 
     func startJoinDiscovery(_ request: JoinRequest) {
@@ -572,43 +494,14 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         peripheral.writeValue(data, for: char, type: .withResponse)
     }
 
-    /// Drain pending chat updates through `peripheralManager.updateValue`.
-    /// Returns early if iOS pushes back; the manager will call
-    /// `peripheralManagerIsReady(toUpdateSubscribers:)` once it can
-    /// accept more, and we resume from there.
-    private func drainChatQueue() {
-        guard let char = chatCharacteristic else { return }
-        while let next = pendingChatUpdates.first {
-            let delivered = peripheralManager.updateValue(
-                next,
-                for: char,
-                onSubscribedCentrals: nil
-            )
-            if delivered {
-                pendingChatUpdates.removeFirst()
-            } else {
-                return
-            }
-        }
-    }
-
-    /// Same drain pattern as chat — push queued events through
-    /// `updateValue`, stop on backpressure. Resumed from
-    /// `peripheralManagerIsReady` when iOS has room again.
-    private func drainEventQueue() {
-        guard let char = eventsCharacteristic else { return }
-        while let next = pendingEventUpdates.first {
-            let delivered = peripheralManager.updateValue(
-                next,
-                for: char,
-                onSubscribedCentrals: nil
-            )
-            if delivered {
-                pendingEventUpdates.removeFirst()
-            } else {
-                return
-            }
-        }
+    // Chat + event characteristic queues are gone — they live on the
+    // payload transport now. The remaining backpressure-prone path is
+    // the JoinResponse broadcast, which uses a single best-effort
+    // `updateValue` with no queue. If a joiner misses the notify they
+    // fall back to reading the characteristic value directly.
+    private func drainObsoleteQueues() {
+        // No-op shim left in place to keep delegate hooks stable; if
+        // a future characteristic adds backpressure, drain it here.
     }
 
     private func considerConnect(to peripheral: CBPeripheral) {
@@ -690,6 +583,25 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
         }
     }
 
+    nonisolated func centralManager(
+        _ central: CBCentralManager,
+        willRestoreState dict: [String: Any]
+    ) {
+        // iOS handed us back the peripherals we had open when the app
+        // was last suspended / terminated. Rewire each one as the
+        // delegate so subsequent characteristic notifications land in
+        // our handlers without us having to re-scan + reconnect.
+        let restored = dict[CBCentralManagerRestoredStatePeripheralsKey]
+            as? [CBPeripheral] ?? []
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for peripheral in restored {
+                peripheral.delegate = self
+                self.connectedPeers[peripheral.identifier] = peripheral
+            }
+        }
+    }
+
     nonisolated func centralManager(_ central: CBCentralManager,
                                     didDiscover peripheral: CBPeripheral,
                                     advertisementData: [String: Any],
@@ -756,8 +668,6 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                 // the chat characteristic was never discovered.
                 peripheral.discoverCharacteristics(
                     [Self.presenceCharacteristicUUID,
-                     Self.chatCharacteristicUUID,
-                     Self.eventsCharacteristicUUID,
                      Self.joinRequestCharacteristicUUID,
                      Self.joinResponseCharacteristicUUID],
                     for: service
@@ -777,20 +687,6 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                     // 1. Initial read so we get the peer's current state right away.
                     peripheral.readValue(for: char)
                     // 2. Subscribe for ongoing live updates pushed via notify.
-                    peripheral.setNotifyValue(true, for: char)
-                case Self.chatCharacteristicUUID:
-                    // Chat messages are notify-driven. No initial read —
-                    // there's no concept of "current chat state," only a
-                    // stream of new messages from this point onward.
-                    peripheral.setNotifyValue(true, for: char)
-                case Self.eventsCharacteristicUUID:
-                    // Events: read once so we pick up the most-recent
-                    // event the peer last broadcast (which is what's
-                    // sitting in their characteristic's last value),
-                    // then subscribe for the rest pushed via notify.
-                    // The cursor-mismatch push from AppState fills in
-                    // any older missing events too.
-                    peripheral.readValue(for: char)
                     peripheral.setNotifyValue(true, for: char)
                 case Self.joinResponseCharacteristicUUID:
                     // Join discovery — subscribe so a peer's reply
@@ -820,36 +716,12 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
             switch charUUID {
             case Self.presenceCharacteristicUUID:
                 self.handlePresenceData(data, from: peripheral)
-            case Self.chatCharacteristicUUID:
-                self.handleChatData(data)
-            case Self.eventsCharacteristicUUID:
-                self.handleEventData(data)
             case Self.joinResponseCharacteristicUUID:
                 self.handleJoinResponseData(data)
             default:
                 break
             }
         }
-    }
-
-    private func handleEventData(_ data: Data) {
-        guard let event = try? JSONDecoder().decode(Event.self, from: data) else {
-            return
-        }
-        // Yield the event up to AppState's gossip consumer. Dedup
-        // happens there — comparing against the local event log so
-        // already-seen events don't re-trigger reducer application
-        // or onward gossip.
-        eventContinuation.yield(event)
-    }
-
-    private func handleChatData(_ data: Data) {
-        guard let message = ChatMessage.decoded(from: data) else { return }
-        // Drop messages from a different group; the per-device chat
-        // characteristic broadcasts to all subscribers regardless of
-        // group, so we filter at the app layer.
-        guard message.groupHash == activeGroupHash else { return }
-        chatContinuation.yield(message)
     }
 }
 
@@ -864,12 +736,43 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
         }
     }
 
-    nonisolated func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
-        // The transmission queue has space again. Resume any chat
-        // messages and event broadcasts we couldn't push earlier.
+    nonisolated func peripheralManager(
+        _ peripheral: CBPeripheralManager,
+        willRestoreState dict: [String: Any]
+    ) {
+        // Rebind any restored services to our characteristic refs so
+        // reads/writes that land before `start(...)` runs again still
+        // resolve. iOS doesn't reissue `didAdd` for restored services.
+        let services = dict[CBPeripheralManagerRestoredStateServicesKey]
+            as? [CBMutableService] ?? []
         Task { @MainActor [weak self] in
-            self?.drainChatQueue()
-            self?.drainEventQueue()
+            guard let self else { return }
+            for service in services where service.uuid == Self.serviceUUID {
+                self.advertisedService = service
+                self.serviceAdded = true
+                for char in service.characteristics ?? [] {
+                    guard let mutable = char as? CBMutableCharacteristic else { continue }
+                    switch mutable.uuid {
+                    case Self.presenceCharacteristicUUID:
+                        self.presenceCharacteristic = mutable
+                    case Self.joinRequestCharacteristicUUID:
+                        self.joinRequestCharacteristic = mutable
+                    case Self.joinResponseCharacteristicUUID:
+                        self.joinResponseCharacteristic = mutable
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    nonisolated func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        // Backpressure path. Currently no characteristic queues need
+        // draining (chat + events moved to the payload transport), so
+        // this is a stub awaiting a future use.
+        Task { @MainActor [weak self] in
+            self?.drainObsoleteQueues()
         }
     }
 
@@ -890,15 +793,10 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
         let charUUID = characteristic.uuid
         Task { @MainActor [weak self] in
             guard let self else { return }
-            switch charUUID {
-            case Self.chatCharacteristicUUID:
-                self.currentDiagnostics.chatSubscribers += 1
-            case Self.presenceCharacteristicUUID:
+            if charUUID == Self.presenceCharacteristicUUID {
                 self.currentDiagnostics.presenceSubscribers += 1
-            default:
-                break
+                self.emitDiagnostics()
             }
-            self.emitDiagnostics()
         }
     }
 
@@ -908,17 +806,11 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
         let charUUID = characteristic.uuid
         Task { @MainActor [weak self] in
             guard let self else { return }
-            switch charUUID {
-            case Self.chatCharacteristicUUID:
-                self.currentDiagnostics.chatSubscribers =
-                    max(0, self.currentDiagnostics.chatSubscribers - 1)
-            case Self.presenceCharacteristicUUID:
+            if charUUID == Self.presenceCharacteristicUUID {
                 self.currentDiagnostics.presenceSubscribers =
                     max(0, self.currentDiagnostics.presenceSubscribers - 1)
-            default:
-                break
+                self.emitDiagnostics()
             }
-            self.emitDiagnostics()
         }
     }
 
@@ -935,25 +827,6 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
                 } else {
                     peripheral.respond(to: request, withResult: .attributeNotFound)
                 }
-            case Self.chatCharacteristicUUID:
-                if let data = self.lastChatData {
-                    request.value = data
-                    peripheral.respond(to: request, withResult: .success)
-                } else {
-                    // No message sent yet — respond cleanly with empty
-                    // value rather than an error.
-                    request.value = Data()
-                    peripheral.respond(to: request, withResult: .success)
-                }
-            case Self.eventsCharacteristicUUID:
-                // Hand back the most recently broadcast event so a
-                // central connecting mid-stream gets *something* on
-                // initial read. The full catch-up flows through the
-                // cursor-mismatch push from AppState — there's no
-                // notion of "the current event," only "the latest
-                // event we happen to have broadcast."
-                request.value = self.lastEventData ?? Data()
-                peripheral.respond(to: request, withResult: .success)
             default:
                 peripheral.respond(to: request, withResult: .attributeNotFound)
             }

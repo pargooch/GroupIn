@@ -223,6 +223,11 @@ final class AppState {
     let motionService: MotionActivityServicing
     let uwbSessionService: UWBSessionServicing
     let deadReckoningService: DeadReckoningServicing
+    /// Payload-tier transport — carries chat + event-log gossip + (Phase 4)
+    /// capability and anchor messages. BLE remains the signal tier
+    /// (presence heartbeat, join handshake, wake-on-proximity); anything
+    /// substantive flows through here on MPC or Wi-Fi Aware.
+    let payloadTransport: PayloadTransport
 
     private let defaults: UserDefaults
     private var networkMonitor: NetworkMonitor?
@@ -250,29 +255,56 @@ final class AppState {
     private(set) var uwbReadings: [UUID: UWBReading] = [:]
     private var uwbReadingsTask: Task<Void, Never>?
 
-    /// Rolling buffer of chat messages received over BLE for the active
-    /// group, plus our own outgoing ones. Capped at 100 to avoid growth.
-    /// Newest at the end, so chat list rendering reads naturally
-    /// top-to-bottom = oldest-to-newest.
+    /// Rolling buffer of chat messages applied for the active group,
+    /// populated from the unified event log (`.chatMessage` events).
+    /// Capped at 100 to avoid growth. Newest at the end, so chat list
+    /// rendering reads naturally top-to-bottom = oldest-to-newest.
     private(set) var chatMessages: [ChatMessage] = []
-    private var chatTask: Task<Void, Never>?
     private static let chatBufferLimit = 100
 
     /// Live BLE diagnostics — surfaced in the chat sheet so the user
     /// can see whether anyone's actually subscribed to receive their
     /// messages. Populated from the BLE service's diagnostics stream.
     private(set) var bleDiagnostics: BLEDiagnostics = BLEDiagnostics(
-        chatSubscribers: 0,
         presenceSubscribers: 0,
         serviceAddFailed: false,
         bluetoothReady: true
     )
     private var bleDiagnosticsTask: Task<Void, Never>?
+
+    /// Live payload-transport diagnostics — connected MPC / Wi-Fi
+    /// Aware peers. Drives the "Sending to X nearby" indicator that
+    /// used to read from `bleDiagnostics.chatSubscribers`.
+    private(set) var transportDiagnostics: TransportDiagnostics =
+        TransportDiagnostics.inactive
+    private var transportDiagnosticsTask: Task<Void, Never>?
     private var iCloudAccountChangeTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
-    private var bleEventTask: Task<Void, Never>?
     private var bleJoinRequestTask: Task<Void, Never>?
     private var deadReckoningTask: Task<Void, Never>?
+
+    /// Payload-transport consumer task — decodes incoming `PayloadFrame`s
+    /// and routes events into the same `handleGossipedEvent` pipeline
+    /// that BLE used to feed.
+    private var payloadIncomingTask: Task<Void, Never>?
+    /// Group ID of the rendezvous currently active on the transport.
+    /// `nil` when the transport isn't running. Used to decide whether
+    /// a presence start needs to restart the transport too.
+    private var activeTransportGroupID: UUID?
+
+    /// Asymmetric activity role:
+    ///
+    /// - `.seeker`: app is foreground / actively in use. Runs the full
+    ///   stack — BLE central + peripheral, payload transport, sensor
+    ///   fusion, compass UI. Pays the battery cost.
+    /// - `.sought`: app is backgrounded. BLE peripheral keeps advertising
+    ///   so other people can find *me*; nothing else spins up
+    ///   proactively. The payload transport sleeps and only comes alive
+    ///   when a seeker wakes us via BLE state restoration.
+    ///
+    /// Driven by `applyScenePhase(_:)` from the root view.
+    enum Role { case seeker, sought }
+    private(set) var role: Role = .seeker
 
     /// Timestamp of the most recent fresh GPS fix. The DR consumer
     /// uses this to decide whether to apply DR estimates (only when
@@ -298,6 +330,11 @@ final class AppState {
     /// all: if every tracked peer is already at or ahead of an
     /// event's cursor, we skip the BLE write.
     private var peerCursors: [UUID: EventCursor] = [:]
+
+    /// Per-peer transport capability advertised in PeerPresence. Used
+    /// by `recomputeGroupTransport()` to pick the group-min transport
+    /// — Wi-Fi Aware only if every member supports it.
+    private var peerCapabilities: [UUID: TransportCapability] = [:]
     private static let heartbeatInterval: TimeInterval = 20
     /// Threshold under which the heartbeat skips work — if a real GPS
     /// fix updated `lastSeen` recently, no need to pile on extra writes.
@@ -322,6 +359,7 @@ final class AppState {
          locationService: LocationServicing? = nil,
          notificationService: NotificationServicing? = nil,
          blePresenceService: BLEPresenceServicing? = nil,
+         payloadTransport: PayloadTransport? = nil,
          motionService: MotionActivityServicing? = nil,
          uwbSessionService: UWBSessionServicing? = nil,
          deadReckoningService: DeadReckoningServicing? = nil,
@@ -341,6 +379,11 @@ final class AppState {
 
         self.notificationService = notificationService ?? NotificationService()
         self.blePresenceService = blePresenceService ?? BLEAdvertisementService()
+        self.payloadTransport = payloadTransport
+            ?? PayloadTransportRouter(
+                multipeer: MultipeerService(),
+                wifiAware: WiFiAwareService()
+            )
         self.beaconMonitor = BeaconMonitorService()
         self.motionService = motionService ?? MotionActivityService()
         self.uwbSessionService = uwbSessionService ?? UWBSessionService()
@@ -565,6 +608,13 @@ final class AppState {
 
     private func tickHeartbeat() {
         guard !myGroups.isEmpty else { return }
+
+        // Adaptive "walk a few steps" prompt: when we're a seeker in
+        // an active group and every known peer's last-seen has gone
+        // stale, the compass arrow is decaying. Schedule a notification
+        // asking the user to move. Cancelled on the next fresh peer
+        // update via `mergeBLEPeer`.
+        checkPeerStalenessForPrompt()
 
         // Skip if a real location fix already kept us fresh — keeps the
         // CloudKit write rate from doubling when we're moving.
@@ -1364,7 +1414,10 @@ final class AppState {
     // MARK: - BLE peer presence
 
     /// Start broadcasting + scanning for nearby group members over BLE.
-    /// Pairs with `stopBLEPresence()` on dashboard disappear.
+    /// Pairs with `stopBLEPresence()` on dashboard disappear. Also
+    /// brings up the payload transport (chat + event-log gossip) under
+    /// the group's rendezvous token; BLE only carries the heartbeat
+    /// and join handshake.
     func startBLEPresence() {
         guard let group = currentGroup else { return }
         let presence = makeLocalPresence(for: group)
@@ -1394,22 +1447,129 @@ final class AppState {
             }
         }
 
-        if chatTask == nil {
-            chatTask = Task { [weak self] in
-                guard let self else { return }
-                for await message in self.blePresenceService.chatMessages {
-                    self.appendChat(message)
-                }
-            }
-        }
+        startPayloadTransport(for: group)
+    }
 
-        if bleEventTask == nil {
-            bleEventTask = Task { [weak self] in
-                guard let self else { return }
-                for await event in self.blePresenceService.events {
+    /// Bring up the payload transport for `group` and start consuming
+    /// incoming frames. Idempotent: a no-op if already running for the
+    /// same group; a clean restart if the group changed.
+    ///
+    /// Sought role doesn't spin the transport up — a backgrounded user
+    /// only needs to be *findable* over BLE; the transport comes alive
+    /// when they foreground (and the role flips to seeker) or when an
+    /// in-range seeker wakes them via state restoration.
+    private func startPayloadTransport(for group: GroupSession) {
+        guard role == .seeker else { return }
+        if activeTransportGroupID == group.id { return }
+
+        let displayName = (membershipByGroupID[group.id] ?? currentUser.id)
+            .uuidString
+        let rendezvous = Self.rendezvousToken(forInviteCode: group.inviteCode)
+
+        payloadTransport.stop()
+        payloadIncomingTask?.cancel()
+        payloadIncomingTask = nil
+
+        payloadTransport.start(displayName: displayName, rendezvousToken: rendezvous)
+        activeTransportGroupID = group.id
+
+        payloadIncomingTask = Task { [weak self] in
+            guard let self else { return }
+            for await packet in self.payloadTransport.incoming {
+                guard let frame = PayloadFrame.decode(from: packet.data) else { continue }
+                switch frame {
+                case .event(let event):
                     self.handleGossipedEvent(event)
                 }
             }
+        }
+    }
+
+    /// Tear down the payload transport. Safe to call when not running.
+    private func stopPayloadTransport() {
+        payloadTransport.stop()
+        payloadIncomingTask?.cancel()
+        payloadIncomingTask = nil
+        activeTransportGroupID = nil
+    }
+
+    /// Derive a short, stable rendezvous token from an invite code.
+    /// SHA-256 hashed + truncated so the invite code itself isn't
+    /// broadcast in the transport's discovery info. Pre-encryption
+    /// (v2) it's just a disambiguator that keeps two GroupIn groups
+    /// running nearby from cross-talk.
+    private static func rendezvousToken(forInviteCode inviteCode: String) -> String {
+        var hasher = Hasher()
+        hasher.combine("groupin.payload.rdv")
+        hasher.combine(inviteCode)
+        return String(UInt64(bitPattern: Int64(hasher.finalize())), radix: 16)
+    }
+
+    /// Peer-staleness threshold for the walk-around prompt. If every
+    /// member in the active group has a `lastSeen` older than this,
+    /// schedule the prompt. 90 s balances "the user notices we lost
+    /// signal" against "we're not nagging during a normal lull."
+    private static let peerStalenessThreshold: TimeInterval = 90
+    /// Delay before the prompt actually fires after scheduling, giving
+    /// the next heartbeat or peer update a chance to cancel it. Keeps
+    /// transient gaps from producing noise notifications.
+    private static let walkAroundPromptDelay: TimeInterval = 15
+
+    private func checkPeerStalenessForPrompt() {
+        guard role == .seeker,
+              let group = currentGroup,
+              !group.members.isEmpty else { return }
+        let myID = membershipByGroupID[group.id]
+        let now = Date()
+        // Look at members other than ourselves. If they're all stale
+        // *and* we have at least one of them tracked, prompt.
+        let peers = group.members.filter { $0.id != myID }
+        guard !peers.isEmpty else { return }
+        let allStale = peers.allSatisfy { peer in
+            now.timeIntervalSince(peer.lastSeen) > Self.peerStalenessThreshold
+        }
+        if allStale {
+            Task { [notificationService, groupID = group.id] in
+                await notificationService.scheduleWalkAroundPrompt(
+                    for: groupID,
+                    after: Self.walkAroundPromptDelay
+                )
+            }
+        } else {
+            Task { [notificationService, groupID = group.id] in
+                await notificationService.cancelWalkAroundPrompt(for: groupID)
+            }
+        }
+    }
+
+    /// Apply a SwiftUI scene-phase change. Foreground → seeker (full
+    /// stack). Background / inactive → sought (BLE peripheral keeps
+    /// advertising; transport tears down).
+    func applyScenePhase(active: Bool) {
+        let newRole: Role = active ? .seeker : .sought
+        guard newRole != role else { return }
+        role = newRole
+        switch newRole {
+        case .seeker:
+            if let group = currentGroup {
+                startPayloadTransport(for: group)
+            }
+        case .sought:
+            stopPayloadTransport()
+        }
+    }
+
+    /// Recompute the group-min transport across the active group's
+    /// known peer capabilities + our own, and ask the router to
+    /// switch if the answer changed. Called whenever a peer's
+    /// advertised capability shifts.
+    private func recomputeGroupTransport() {
+        guard activeTransportGroupID != nil else { return }
+        var all: [TransportCapability] = [Self.localTransportCapability()]
+        all.append(contentsOf: peerCapabilities.values)
+        if let selection = TransportCapability.groupMinimum(across: all),
+           selection != payloadTransport.selection {
+            payloadTransport.select(selection)
         }
     }
 
@@ -1451,6 +1611,7 @@ final class AppState {
 
     func stopBLEPresence() {
         blePresenceService.stop()
+        stopPayloadTransport()
     }
 
     /// Consume the BLE diagnostics stream for the lifetime of the app,
@@ -1459,11 +1620,20 @@ final class AppState {
     /// the user toggles Bluetooth in Control Center — including before
     /// they've ever opened a group.
     private func startBLEDiagnosticsMonitor() {
-        guard bleDiagnosticsTask == nil else { return }
-        bleDiagnosticsTask = Task { [weak self] in
-            guard let self else { return }
-            for await diag in self.blePresenceService.diagnostics {
-                self.bleDiagnostics = diag
+        if bleDiagnosticsTask == nil {
+            bleDiagnosticsTask = Task { [weak self] in
+                guard let self else { return }
+                for await diag in self.blePresenceService.diagnostics {
+                    self.bleDiagnostics = diag
+                }
+            }
+        }
+        if transportDiagnosticsTask == nil {
+            transportDiagnosticsTask = Task { [weak self] in
+                guard let self else { return }
+                for await diag in self.payloadTransport.diagnostics {
+                    self.transportDiagnostics = diag
+                }
             }
         }
     }
@@ -1508,7 +1678,18 @@ final class AppState {
             accuracy: currentUser.accuracy,
             positionSource: currentUser.positionSource?.rawValue,
             positionAnchorAt: currentUser.positionAnchorAt,
-            eventCursor: eventCursors[group.id]
+            eventCursor: eventCursors[group.id],
+            transportCapability: Self.localTransportCapability()
+        )
+    }
+
+    /// Snapshot of this device's transport capabilities for
+    /// broadcasting in PeerPresence. The group-min across all
+    /// members' snapshots picks the active transport.
+    private static func localTransportCapability() -> TransportCapability {
+        TransportCapability(
+            wifiAware: WiFiAwareService.deviceSupportsWiFiAware(),
+            multipeer: true
         )
     }
 
@@ -1529,6 +1710,23 @@ final class AppState {
         // "we're hearing this peer on Bluetooth" signal regardless of
         // whether their full member record has caught up yet.
         recordTransport(.ble, for: peer.memberID)
+
+        // Capability tracking → drives the group-min transport
+        // selection. Missing field (older client) is treated as
+        // MPC-only, matching the safest fallback.
+        let advertised = peer.transportCapability ?? .mpcOnly
+        if peerCapabilities[peer.memberID] != advertised {
+            peerCapabilities[peer.memberID] = advertised
+            recomputeGroupTransport()
+        }
+
+        // Fresh signal from a peer means the staleness window resets —
+        // cancel any pending "walk a few steps" prompt.
+        if let groupID = currentGroup?.id {
+            Task { [notificationService] in
+                await notificationService.cancelWalkAroundPrompt(for: groupID)
+            }
+        }
 
         // Cursor tracking + cursor-mismatch push run unconditionally
         // too. The BLE service has already verified the peer's
@@ -2145,6 +2343,23 @@ final class AppState {
     /// emit, CloudKit sync, or BLE gossip.
     private func applyEventSideEffects(_ event: Event) {
         switch event.payload {
+        case .chatMessage(let text):
+            // Mirror the chat-message event into the in-memory chat
+            // buffer so the dashboard badge + any chat list reads see
+            // the message regardless of which path delivered it
+            // (local emit, transport gossip, or CloudKit replay).
+            let groupHash = PeerPresence.groupHash(
+                forInviteCode: myGroups.first(where: { $0.id == event.groupID })?
+                    .inviteCode ?? ""
+            )
+            let message = ChatMessage(
+                id: event.id,
+                groupHash: groupHash,
+                senderID: event.authorID,
+                text: text,
+                timestamp: event.createdAt
+            )
+            appendChat(message)
         case .groupDeleted:
             // The author tore down explicitly in `remove(group:)`.
             // Everyone else: drop the group locally and surface a
@@ -2174,35 +2389,38 @@ final class AppState {
         }
     }
 
-    /// Broadcast an event over BLE if at least one in-range peer's
-    /// cursor is older than the event. Skips the write if every
-    /// tracked peer is already caught up — saves bandwidth and
-    /// battery without losing any actual coverage (any peer that
-    /// arrives later will catch up via the cursor-mismatch path).
+    /// Broadcast an event over the payload transport if at least one
+    /// in-range peer's cursor is older than the event. Skips the send
+    /// if every tracked peer is already caught up.
     ///
     /// **First-sync flooding caveat:** when we receive a large batch
     /// from CloudKit (e.g. after a cold launch sync), each event runs
     /// through this filter so we don't re-broadcast events nearby
-    /// peers already have. That use case wants the gate.
+    /// peers already have.
     private func broadcastEventIfPeersBehind(_ event: Event) {
         guard !peerCursors.isEmpty else { return }
         let anyBehind = peerCursors.values.contains { peerCursor in
             event.cursor > peerCursor
         }
         guard anyBehind else { return }
-        blePresenceService.broadcastEvent(event.strippedForBLE())
+        sendEventToPayloadTransport(event)
     }
 
-    /// Unconditional BLE broadcast for events the local user just
-    /// authored. Skipping the `peerCursors`-empty gate matters when a
-    /// new peer is in BLE range but their `PeerPresence` hasn't been
-    /// received yet — without this, our outgoing chat would never
-    /// reach them until their first cursor arrives (which itself
-    /// requires our PeerPresence to land on them first). Idempotent
-    /// at the receiver because the reducer dedups on event ID, so
-    /// duplicate-arrival is harmless.
+    /// Unconditional transport broadcast for events the local user
+    /// just authored. Skipping the `peerCursors`-empty gate matters
+    /// when a new peer just joined and their cursor hasn't arrived
+    /// yet. Idempotent at the receiver because the reducer dedups on
+    /// event ID, so duplicate-arrival is harmless.
     private func broadcastLocalEmit(_ event: Event) {
-        blePresenceService.broadcastEvent(event.strippedForBLE())
+        sendEventToPayloadTransport(event)
+    }
+
+    /// Wrap `event` in a `PayloadFrame.event` and broadcast over the
+    /// transport. Full event flows (no `strippedForBLE()` shrinkage)
+    /// because MPC / Wi-Fi Aware can carry the avatar payload.
+    private func sendEventToPayloadTransport(_ event: Event) {
+        guard let data = PayloadFrame.event(event).encoded() else { return }
+        payloadTransport.broadcast(data)
     }
 
     /// Paginated scroll-to-top history fetch. Called by the timeline
@@ -2259,7 +2477,7 @@ final class AppState {
             return lhs.id.uuidString < rhs.id.uuidString
         }
         for event in sorted {
-            blePresenceService.broadcastEvent(event.strippedForBLE())
+            sendEventToPayloadTransport(event)
         }
     }
 

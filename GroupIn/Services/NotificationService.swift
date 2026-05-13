@@ -14,6 +14,7 @@ enum AppNotificationType: String, Sendable {
     case expiryReminder
     case extensionProposed
     case peerNearby
+    case walkAroundPrompt
 }
 
 struct NotificationTap: Sendable {
@@ -33,6 +34,16 @@ protocol NotificationServicing: AnyObject {
     /// `peerName` lets us swap the generic body for a per-peer one when
     /// region ranging identified who triggered the entry.
     func firePeerNearbyNotification(for groupID: UUID, peerName: String?) async
+
+    /// Schedule the "your signal is fuzzy — walk a few steps" prompt.
+    /// Used by the seeker side when peer staleness crosses a threshold
+    /// despite the transport being up. Idempotent on identifier; call
+    /// `cancelWalkAroundPrompt(for:)` when sync recovers.
+    func scheduleWalkAroundPrompt(for groupID: UUID, after seconds: TimeInterval) async
+
+    /// Cancel a pending walk-around prompt for `groupID`. Safe to call
+    /// when none is scheduled.
+    func cancelWalkAroundPrompt(for groupID: UUID) async
 }
 
 @MainActor
@@ -88,10 +99,44 @@ final class NotificationService: NSObject, NotificationServicing, UNUserNotifica
         let ids = [
             Self.expiryReminderID(for: groupID),
             Self.extensionProposedID(for: groupID),
-            Self.peerNearbyID(for: groupID)
+            Self.peerNearbyID(for: groupID),
+            Self.walkAroundPromptID(for: groupID)
         ]
         center.removePendingNotificationRequests(withIdentifiers: ids)
         center.removeDeliveredNotifications(withIdentifiers: ids)
+    }
+
+    func scheduleWalkAroundPrompt(
+        for groupID: UUID,
+        after seconds: TimeInterval
+    ) async {
+        let id = Self.walkAroundPromptID(for: groupID)
+        // Idempotent: replace any pending prompt with a fresh one so
+        // the staleness window is computed from "right now," not from
+        // whenever the first staleness was detected.
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+
+        let content = UNMutableNotificationContent()
+        content.title = "Signal is fuzzy"
+        content.body = "Take a few steps to refresh the compass."
+        content.userInfo = [
+            "groupID": groupID.uuidString,
+            "type": AppNotificationType.walkAroundPrompt.rawValue
+        ]
+        content.sound = .default
+
+        let trigger = UNTimeIntervalNotificationTrigger(
+            timeInterval: max(1, seconds),
+            repeats: false
+        )
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        try? await center.add(request)
+    }
+
+    func cancelWalkAroundPrompt(for groupID: UUID) async {
+        let id = Self.walkAroundPromptID(for: groupID)
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+        center.removeDeliveredNotifications(withIdentifiers: [id])
     }
 
     func firePeerNearbyNotification(for groupID: UUID, peerName: String?) async {
@@ -167,5 +212,9 @@ final class NotificationService: NSObject, NotificationServicing, UNUserNotifica
 
     private static func peerNearbyID(for groupID: UUID) -> String {
         "peerNearby.\(groupID.uuidString)"
+    }
+
+    private static func walkAroundPromptID(for groupID: UUID) -> String {
+        "walkAround.\(groupID.uuidString)"
     }
 }
