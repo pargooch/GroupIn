@@ -246,24 +246,13 @@ struct HomeView: View {
     @ViewBuilder
     private var emptyGroupsState: some View {
         VStack(spacing: 14) {
-            ZStack {
-                // Soft background halo so the icon doesn't float in white
-                // space — matches the colored-circle motif used elsewhere
-                // in the app (member avatars, category chips).
-                Circle()
-                    .fill(Color.accentColor.opacity(0.12))
-                    .frame(width: 96, height: 96)
-                Image(systemName: "person.3.sequence.fill")
-                    .font(.system(size: 44, weight: .semibold))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [.accentColor, .accentColor.opacity(0.65)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-            }
-            .accessibilityHidden(true)
+            Image(systemName: "person.3.sequence.fill")
+                .font(.system(size: 52, weight: .semibold))
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.cyan, .pink, .green)
+                .shadow(color: .cyan.opacity(0.7), radius: 7)
+                .shadow(color: .pink.opacity(0.6), radius: 11)
+                .accessibilityHidden(true)
 
             Text("No groups yet")
                 .font(.headline)

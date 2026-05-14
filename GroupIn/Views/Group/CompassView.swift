@@ -82,7 +82,7 @@ struct CompassView: View {
                         .accessibilityHidden(true)
                 }
 
-                doneButton
+                doneButton(color: memberColor)
                     .padding(.horizontal, 32)
                     .padding(.bottom, 32)
             }
@@ -418,7 +418,7 @@ struct CompassView: View {
     // MARK: - Done button
 
     @ViewBuilder
-    private var doneButton: some View {
+    private func doneButton(color: Color) -> some View {
         Button { dismiss() } label: {
             Text("Done")
                 .font(.body.weight(.semibold))
@@ -427,9 +427,9 @@ struct CompassView: View {
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                 .overlay(
                     RoundedRectangle(cornerRadius: 14)
-                        .strokeBorder(Self.orbAccent.opacity(0.4), lineWidth: 1)
+                        .strokeBorder(color, lineWidth: 1.5)
                 )
-                .foregroundStyle(.primary)
+                .foregroundStyle(color)
         }
     }
 

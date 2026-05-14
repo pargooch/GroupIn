@@ -10,7 +10,6 @@ import UIKit
 
 struct GroupDashboardView: View {
     @Environment(AppState.self) private var appState
-    @Environment(\.openURL) private var openURL
     @State private var viewModel: GroupDashboardViewModel
     @State private var didCopyInviteCode = false
     @State private var showsLocationHelp = false
@@ -26,8 +25,6 @@ struct GroupDashboardView: View {
     /// Bumped by the scope button to tell `MapLibreMapView` to re-fit
     /// every member into view. Counter-based so repeated taps work.
     @State private var fitAllTrigger: Int = 0
-    /// Drives the draggable bottom sheet listing members by distance.
-    @State private var showsMemberList = false
     /// Last seen member-ID set, so we can fire a success haptic AND
     /// a VoiceOver announcement only when someone *new* joins (not
     /// when someone leaves), and name them in the announcement.
@@ -137,21 +134,27 @@ struct GroupDashboardView: View {
         }
     }
 
+    /// Find My–style split: the neon map is pinned to the top half of
+    /// the screen, and everything else scrolls in the bottom half.
     @ViewBuilder
     private func groupList(group: GroupSession) -> some View {
-        @Bindable var vm = viewModel
+        VStack(spacing: 0) {
+            mapPane(group: group)
+                .frame(height: UIScreen.main.bounds.height * 0.5)
+                .clipped()
+            dashboardList(group: group)
+        }
+        .ignoresSafeArea(edges: .top)
+    }
+
+    @ViewBuilder
+    private func dashboardList(group: GroupSession) -> some View {
         List {
-            mapSection(group: group)
             membersSection(group: group)
             groupSection(group: group)
-            if showsLocationStatus {
-                Section { locationStatusContent }
-            }
             if viewModel.isOwner {
                 bannedSection(group: group)
             }
-            messagesSection
-            safetySection
             leaveGroupSection(group: group)
         }
         .onAppear {
@@ -193,35 +196,33 @@ struct GroupDashboardView: View {
         }
     }
 
-    /// We always show the location section now — either with a permission
-    /// prompt, an "acquiring…" spinner, or a small live freshness indicator.
-    /// Helps the user see at a glance whether GPS is actively producing
-    /// fixes, which matters most when offline.
-    private var showsLocationStatus: Bool { true }
-
     @ViewBuilder
     private func groupSection(group: GroupSession) -> some View {
         Section("Group") {
             HStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(group.category.tint.opacity(0.18))
-                    Image(systemName: group.category.systemImage)
-                        .foregroundStyle(group.category.tint)
-                }
-                .frame(width: 36, height: 36)
-                .accessibilityHidden(true)
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(group.category.tint.opacity(0.18))
+                        Image(systemName: group.category.systemImage)
+                            .foregroundStyle(group.category.tint)
+                    }
+                    .frame(width: 36, height: 36)
+                    .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(group.name)
-                        .font(.body.weight(.medium))
-                    Text(group.category.label)
-                        .font(.caption)
-                        .foregroundStyle(group.category.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(group.name)
+                            .font(.body.weight(.medium))
+                        Text(group.category.label)
+                            .font(.caption)
+                            .foregroundStyle(group.category.tint)
+                    }
+                    Spacer(minLength: 8)
                 }
-                Spacer()
+                .accessibilityElement(children: .combine)
+
+                messagesButton
             }
-            .accessibilityElement(children: .combine)
 
             inviteCodeButton(code: group.inviteCode)
 
@@ -305,72 +306,98 @@ struct GroupDashboardView: View {
         }
     }
 
+    /// The map pane pinned to the top half of the dashboard.
     @ViewBuilder
-    private func mapSection(group: GroupSession) -> some View {
-        Section {
-            ZStack(alignment: .topTrailing) {
-                TimelineView(.periodic(from: .now, by: 15)) { context in
-                    MapLibreMapView(
-                        members: group.members,
-                        currentMemberID: appState.currentUser.id,
-                        now: context.date,
-                        focusedMemberID: $routeTargetID,
-                        fitAllTrigger: $fitAllTrigger
-                    )
-                }
-                VStack(spacing: 10) {
-                    membersButton(group: group)
-                    fitAllButton
-                }
+    private func mapPane(group: GroupSession) -> some View {
+        ZStack(alignment: .topTrailing) {
+            TimelineView(.periodic(from: .now, by: 15)) { context in
+                MapLibreMapView(
+                    members: group.members,
+                    currentMemberID: appState.currentUser.id,
+                    now: context.date,
+                    focusedMemberID: $routeTargetID,
+                    fitAllTrigger: $fitAllTrigger
+                )
+            }
+            fitAllButton
                 .padding(12)
-            }
-            .overlay(alignment: .bottom) {
-                focusedMemberCard(group: group)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 12)
-            }
-            .frame(height: 540)
-            .clipShape(RoundedRectangle(cornerRadius: 18))
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-            .listRowBackground(Color.clear)
-            .accessibilityLabel("Map showing your location and group members")
-            .sheet(isPresented: $showsMemberList) {
-                TimelineView(.periodic(from: .now, by: 15)) { context in
-                    MemberListSheet(
-                        members: group.members,
-                        currentMemberID: appState.currentUser.id,
-                        now: context.date,
-                        focusedMemberID: $routeTargetID
-                    )
-                    .environment(appState)
+                .padding(.top, 44)
+        }
+        .overlay(alignment: .bottomLeading) {
+            if routeTargetID == nil {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    mapLocationStatus(now: context.date)
                 }
-                .presentationDetents([.height(120), .fraction(0.45), .large])
-                .presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.45)))
-                .presentationDragIndicator(.visible)
-                .presentationBackground(.black)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
             }
+        }
+        .overlay(alignment: .bottom) {
+            focusedMemberCard(group: group)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+        }
+        .accessibilityLabel("Map showing your location and group members")
+    }
+
+    /// Compact location-sharing status shown as plain text in the
+    /// bottom-left of the map — replaces the old list section.
+    @ViewBuilder
+    private func mapLocationStatus(now: Date) -> some View {
+        switch appState.locationAuthorizationStatus {
+        case .notDetermined:
+            mapStatusText("Requesting permission…",
+                          color: .white.opacity(0.85),
+                          tappable: false)
+
+        case .denied, .restricted:
+            mapStatusText("Location off — tap for help",
+                          color: .red,
+                          tappable: true)
+
+        case .authorizedWhenInUse, .authorizedAlways:
+            if viewModel.currentUser.coordinate != nil {
+                let state = LocationFreshness(
+                    lastSeen: viewModel.currentUser.lastSeen,
+                    now: now
+                )
+                mapStatusText(state.title,
+                              color: state.color,
+                              tappable: state != .live)
+            } else {
+                mapStatusText("Acquiring location…",
+                              color: .white.opacity(0.85),
+                              tappable: false)
+            }
+
+        @unknown default:
+            EmptyView()
         }
     }
 
     @ViewBuilder
-    private func membersButton(group: GroupSession) -> some View {
-        Button {
-            showsMemberList = true
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "person.2.fill")
-                    .font(.footnote.weight(.semibold))
-                Text("\(group.members.count)")
-                    .font(.footnote.weight(.semibold))
-                    .monospacedDigit()
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.black.opacity(0.55), in: Capsule())
-            .overlay(Capsule().strokeBorder(.white.opacity(0.2), lineWidth: 1))
+    private func mapStatusText(_ text: String,
+                               color: Color,
+                               tappable: Bool) -> some View {
+        let label = HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(text)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white)
         }
-        .accessibilityLabel("Show members list")
+        .shadow(color: .black.opacity(0.7), radius: 3)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
+
+        if tappable {
+            Button { showsLocationHelp = true } label: { label }
+                .buttonStyle(.plain)
+                .accessibilityHint("Tap to learn why")
+        } else {
+            label
+        }
     }
 
     /// Floating dark card pinned to the bottom of the map when a
@@ -586,6 +613,9 @@ struct GroupDashboardView: View {
                     TimelineView(.periodic(from: .now, by: 15)) { context in
                         memberRow(member, group: group, now: context.date)
                     }
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 10, leading: 18, bottom: 10, trailing: 18))
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if viewModel.isOwner
                             && member.id != viewModel.currentUser.id
@@ -668,199 +698,39 @@ struct GroupDashboardView: View {
         .accessibilityElement(children: .combine)
     }
 
-    // MARK: - Location authorization
-
-    @ViewBuilder
-    private var locationStatusContent: some View {
-        switch appState.locationAuthorizationStatus {
-        case .notDetermined:
-            HStack(spacing: 8) {
-                ProgressView()
-                Text("Requesting permission…")
-                    .foregroundStyle(.secondary)
-            }
-            .accessibilityElement(children: .combine)
-
-        case .denied, .restricted:
-            VStack(alignment: .leading, spacing: 8) {
-                Label("Location access is off", systemImage: "location.slash")
-                    .foregroundStyle(.red)
-                Text("Enable location for GroupIn in Settings to share your position with the group.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if let url = URL(string: UIApplication.openSettingsURLString) {
-                    Link("Open Settings", destination: url)
-                        .accessibilityHint("Opens the iOS Settings app")
-                }
-            }
-            .accessibilityElement(children: .combine)
-
-        case .authorizedWhenInUse, .authorizedAlways:
-            if viewModel.currentUser.coordinate != nil {
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    locationFreshnessRow(now: context.date)
-                }
-            } else {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text("Acquiring location…")
-                        .foregroundStyle(.secondary)
-                }
-                .accessibilityElement(children: .combine)
-            }
-
-        @unknown default:
-            Text("Unknown location authorization state.")
-                .foregroundStyle(.secondary)
-        }
-    }
-
     // MARK: - Messages (offline BLE chat)
 
+    /// Chat entry point — a small circular button on the trailing edge
+    /// of the group-name row.
     @ViewBuilder
-    private var messagesSection: some View {
-        Section {
-            Button {
-                showsChat = true
-            } label: {
-                HStack(spacing: 12) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.accentColor.opacity(0.18))
-                        Image(systemName: "bubble.left.and.bubble.right.fill")
-                            .foregroundStyle(.tint)
-                    }
-                    .frame(width: 36, height: 36)
-                    .accessibilityHidden(true)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Messages")
-                            .font(.body.weight(.medium))
-                            .foregroundStyle(.primary)
-                        Text("Send short notes to nearby members over Bluetooth.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
+    private var messagesButton: some View {
+        Button {
+            showsChat = true
+        } label: {
+            Image(systemName: "bubble.left.and.bubble.right.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 38, height: 38)
+                .background(Color.accentColor, in: Circle())
+                .overlay(alignment: .topTrailing) {
                     if !appState.chatMessages.isEmpty {
-                        Text("\(appState.chatMessages.count)")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.accentColor.opacity(0.18), in: Capsule())
-                            .foregroundStyle(.tint)
-                    }
-                    Image(systemName: "chevron.right")
-                        .font(.footnote)
-                        .foregroundStyle(.tertiary)
-                        .accessibilityHidden(true)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-        } header: {
-            Text("Messages")
-        }
-    }
-
-    // MARK: - Safety / Find My handoff
-
-    @ViewBuilder
-    private var safetySection: some View {
-        Section {
-            Button {
-                openFindMy()
-            } label: {
-                HStack(spacing: 12) {
-                    ZStack {
                         Circle()
-                            .fill(Color.green.opacity(0.18))
-                        Image(systemName: "location.viewfinder")
-                            .foregroundStyle(.green)
+                            .fill(.red)
+                            .frame(width: 11, height: 11)
+                            .overlay(
+                                Circle().strokeBorder(Color(.systemBackground), lineWidth: 2)
+                            )
                     }
-                    .frame(width: 36, height: 36)
-                    .accessibilityHidden(true)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Set up Find My backup")
-                            .foregroundStyle(.primary)
-                            .font(.body.weight(.medium))
-                        Text("Apple's separate network — works at longer range when GroupIn can't reach.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: "arrow.up.forward")
-                        .font(.footnote)
-                        .foregroundStyle(.tertiary)
-                        .accessibilityHidden(true)
                 }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint("Opens the Find My app so you can share your location as a backup")
-        } header: {
-            Text("Safety")
-        } footer: {
-            Text("GroupIn handles real-time group awareness. Find My runs through Apple's network — useful as a long-range backup when our signal can't reach.")
-                .font(.caption)
         }
-    }
-
-    private func openFindMy() {
-        // Try the native scheme first; fall back to the universal link
-        // (which iOS routes into the Find My app on devices that have it,
-        // and to the iCloud web UI otherwise).
-        guard let scheme = URL(string: "findmy://"),
-              let universal = URL(string: "https://www.icloud.com/findmy") else {
-            return
-        }
-        openURL(scheme) { accepted in
-            if !accepted {
-                openURL(universal)
-            }
-        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(appState.chatMessages.isEmpty
+                            ? "Messages"
+                            : "Messages, \(appState.chatMessages.count) unread")
+        .accessibilityHint("Opens the group chat")
     }
 
     // MARK: - Helpers
-
-    @ViewBuilder
-    private func locationFreshnessRow(now: Date) -> some View {
-        let state = LocationFreshness(
-            lastSeen: viewModel.currentUser.lastSeen,
-            now: now
-        )
-        Button {
-            if state != .live { showsLocationHelp = true }
-        } label: {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(state.color)
-                    .frame(width: 10, height: 10)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(state.title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.primary)
-                    if let detail = state.detail(lastSeen: viewModel.currentUser.lastSeen) {
-                        Text(detail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                if state != .live {
-                    Image(systemName: "questionmark.circle")
-                        .foregroundStyle(.tertiary)
-                        .accessibilityHidden(true)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(state == .live)
-        .accessibilityHint(state == .live ? "" : "Tap to learn why")
-    }
 
     private enum LocationFreshness: Equatable {
         case live
@@ -887,17 +757,6 @@ struct GroupDashboardView: View {
             case .live:    return "Sharing live"
             case .slow:    return "Slow connection"
             case .stalled: return "Can't share location"
-            }
-        }
-
-        func detail(lastSeen: Date) -> String? {
-            switch self {
-            case .live:
-                return nil
-            case .slow:
-                return "Last update \(lastSeen.formatted(.relative(presentation: .named)))"
-            case .stalled:
-                return "Tap to learn why"
             }
         }
     }
@@ -982,12 +841,6 @@ struct GroupDashboardView: View {
 
             Spacer()
 
-            if let source = appState.transportSource(for: member.id), !isMe {
-                Image(systemName: source.icon)
-                    .font(.caption2)
-                    .foregroundStyle(source.tint)
-                    .accessibilityHidden(true)
-            }
             PresenceBadge(status: status)
                 .accessibilityHidden(true)
 
@@ -999,12 +852,24 @@ struct GroupDashboardView: View {
                         .font(.body.weight(.semibold))
                         .frame(width: 36, height: 36)
                         .foregroundStyle(memberColor)
-                        .background(memberColor.opacity(0.12), in: Circle())
+                        .background(memberColor.opacity(0.14), in: Circle())
                 }
                 .buttonStyle(.borderless)
                 .accessibilityHidden(true)
             }
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(
+            Color(uiColor: .secondarySystemBackground),
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(memberColor, lineWidth: 2.5)
+                .shadow(color: memberColor.opacity(0.95), radius: 4)
+                .shadow(color: memberColor.opacity(0.6), radius: 9)
+        )
         // Treat the whole row as a single VoiceOver element. The
         // interactive parts (toggle route, find with compass) are
         // exposed as custom actions so a blind user can swipe to

@@ -219,7 +219,7 @@ struct MapLibreMapView: UIViewRepresentable {
             if coords.count == 1, let only = coords.first {
                 let camera = MLNMapCamera(
                     lookingAtCenter: only,
-                    acrossDistance: 250,
+                    acrossDistance: 130,
                     pitch: 0,
                     heading: 0
                 )
@@ -230,7 +230,7 @@ struct MapLibreMapView: UIViewRepresentable {
             }
 
             let bounds = MLNCoordinateBounds.from(coords: coords)
-            let insets = UIEdgeInsets(top: 100, left: 60, bottom: 220, right: 60)
+            let insets = UIEdgeInsets(top: 70, left: 44, bottom: 170, right: 44)
 
             // Hard zoom-out cap: if fitting the cluster would mean
             // pulling back farther than 30 km across, bail out of the
@@ -412,7 +412,7 @@ private extension MLNCoordinateBounds {
             maxLon = max(maxLon, c.longitude)
         }
         // Tiny pad so single-cluster groups don't render at max zoom.
-        let pad = 0.0005
+        let pad = 0.00015
         return MLNCoordinateBounds(
             sw: CLLocationCoordinate2D(latitude: minLat - pad, longitude: minLon - pad),
             ne: CLLocationCoordinate2D(latitude: maxLat + pad, longitude: maxLon + pad)

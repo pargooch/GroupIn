@@ -9,7 +9,7 @@
 //
 //  Backoff schedule (cap 60s) means a transient network blip resolves
 //  fast and a longer outage doesn't hammer the radio:
-//
+// 
 //    retry 1 → 5s
 //    retry 2 → 10s
 //    retry 3 → 20s

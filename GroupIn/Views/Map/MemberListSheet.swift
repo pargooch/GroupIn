@@ -41,9 +41,10 @@ struct MemberListSheet: View {
                                       focused: focusedMemberID == row.member.id)
                         }
                         .buttonStyle(.plain)
-                        .listRowBackground(focusedMemberID == row.member.id
-                                           ? Color.white.opacity(0.06)
-                                           : Color.clear)
+                        .listRowBackground(
+                            Color.memberColor(for: row.member.id)
+                                .opacity(focusedMemberID == row.member.id ? 0.45 : 0.28)
+                        )
                     }
                 }
             }
@@ -210,7 +211,7 @@ struct MemberListSheet: View {
                 let relative = bearing - heading
                 Image(systemName: "location.north.fill")
                     .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Color.memberColor(for: row.member.id))
+                    .foregroundStyle(.white)
                     .rotationEffect(.degrees(relative))
                     .frame(width: 28, height: 28)
             } else {

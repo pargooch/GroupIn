@@ -19,6 +19,7 @@ import UIKit
 struct ProfileEditorView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
 
     @State private var name: String = ""
     @State private var avatarData: Data?
@@ -77,6 +78,8 @@ struct ProfileEditorView: View {
             } header: {
                 Text("Feedback")
             }
+
+            safetySection
 
             Section {
                 Button {
@@ -166,6 +169,65 @@ struct ProfileEditorView: View {
                 }
                 cropperSource = nil
                 photoSelection = nil
+            }
+        }
+    }
+
+    // MARK: - Safety / Find My handoff
+
+    @ViewBuilder
+    private var safetySection: some View {
+        Section {
+            Button {
+                openFindMy()
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.green.opacity(0.18))
+                        Image(systemName: "location.viewfinder")
+                            .foregroundStyle(.green)
+                    }
+                    .frame(width: 36, height: 36)
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Set up Find My backup")
+                            .foregroundStyle(.primary)
+                            .font(.body.weight(.medium))
+                        Text("Apple's separate network — works at longer range when GroupIn can't reach.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "arrow.up.forward")
+                        .font(.footnote)
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Opens the Find My app so you can share your location as a backup")
+        } header: {
+            Text("Safety")
+        } footer: {
+            Text("GroupIn handles real-time group awareness. Find My runs through Apple's network — useful as a long-range backup when our signal can't reach.")
+                .font(.caption)
+        }
+    }
+
+    private func openFindMy() {
+        // Try the native scheme first; fall back to the universal link
+        // (which iOS routes into the Find My app on devices that have it,
+        // and to the iCloud web UI otherwise).
+        guard let scheme = URL(string: "findmy://"),
+              let universal = URL(string: "https://www.icloud.com/findmy") else {
+            return
+        }
+        openURL(scheme) { accepted in
+            if !accepted {
+                openURL(universal)
             }
         }
     }
