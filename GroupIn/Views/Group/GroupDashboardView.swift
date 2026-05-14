@@ -198,35 +198,41 @@ struct GroupDashboardView: View {
 
     @ViewBuilder
     private func groupSection(group: GroupSession) -> some View {
-        Section("Group") {
-            HStack(spacing: 12) {
+        Section {
+            VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 12) {
-                    ZStack {
-                        Circle()
-                            .fill(group.category.tint.opacity(0.18))
-                        Image(systemName: group.category.systemImage)
-                            .foregroundStyle(group.category.tint)
-                    }
-                    .frame(width: 36, height: 36)
-                    .accessibilityHidden(true)
+                    HStack(spacing: 12) {
+                        ZStack {
+                            Circle()
+                                .fill(group.category.tint.opacity(0.18))
+                            Image(systemName: group.category.systemImage)
+                                .foregroundStyle(group.category.tint)
+                        }
+                        .frame(width: 40, height: 40)
+                        .accessibilityHidden(true)
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(group.name)
-                            .font(.body.weight(.medium))
-                        Text(group.category.label)
-                            .font(.caption)
-                            .foregroundStyle(group.category.tint)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(group.name)
+                                .font(.headline)
+                            Text(group.category.label)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(group.category.tint)
+                        }
+                        Spacer(minLength: 8)
                     }
-                    Spacer(minLength: 8)
+                    .accessibilityElement(children: .combine)
+
+                    messagesButton
                 }
-                .accessibilityElement(children: .combine)
 
-                messagesButton
+                inviteCodeButton(code: group.inviteCode)
+
+                expiryRow(group: group)
             }
-
-            inviteCodeButton(code: group.inviteCode)
-
-            expiryRow(group: group)
+            .padding(.vertical, 6)
+            .listRowSeparator(.hidden)
+        } header: {
+            Text("Group")
         }
     }
 
@@ -277,12 +283,17 @@ struct GroupDashboardView: View {
             Button {
                 copyInviteCode(code)
             } label: {
-                HStack {
+                HStack(spacing: 8) {
                     Text("Invite Code")
                         .foregroundStyle(.primary)
                     Spacer()
                     Text(code)
-                        .foregroundStyle(.secondary)
+                        .font(.callout.weight(.semibold))
+                        .monospaced()
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.accentColor.opacity(0.12), in: Capsule())
                     Image(systemName: didCopyInviteCode ? "checkmark.circle.fill" : "doc.on.doc")
                         .foregroundStyle(didCopyInviteCode ? Color.green : Color.accentColor)
                         .accessibilityHidden(true)

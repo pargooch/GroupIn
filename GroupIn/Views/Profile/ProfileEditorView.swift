@@ -50,8 +50,8 @@ struct ProfileEditorView: View {
             Section {
                 Toggle(isOn: $hapticsEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Haptic feedback")
-                        Text("Subtle taps on key actions and a heartbeat that intensifies as you walk toward a focused friend.")
+                        Text("Vibration Guidance")
+                        Text("GroupIn's own taps and a heartbeat that gets stronger as you walk toward a friend you're finding.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -63,8 +63,8 @@ struct ProfileEditorView: View {
 
                 Toggle(isOn: $voiceGuidanceEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Spoken guidance")
-                        Text("When VoiceOver is on, GroupIn announces who joined, when a friend gets closer, and speaks your live distance while finding someone.")
+                        Text("Spoken Updates")
+                        Text("With VoiceOver on, GroupIn speaks its own updates — who joined, when a friend gets closer, and live distance while you're finding someone.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -72,11 +72,14 @@ struct ProfileEditorView: View {
                 .onChange(of: voiceGuidanceEnabled) { _, newValue in
                     VoiceGuidance.setUserEnabled(newValue)
                     if newValue {
-                        VoiceGuidance.shared.announce("Spoken guidance on.")
+                        VoiceGuidance.shared.announce("Spoken updates on.")
                     }
                 }
             } header: {
-                Text("Feedback")
+                Text("GroupIn Feedback")
+            } footer: {
+                Text("These are GroupIn's own cues — separate from iOS's system haptics and VoiceOver settings.")
+                    .font(.caption)
             }
 
             safetySection
