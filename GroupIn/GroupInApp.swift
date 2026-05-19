@@ -9,11 +9,15 @@ import SwiftUI
 
 @main
 struct GroupInApp: App {
-    /// Flip to `true` once you've enabled the iCloud capability + CloudKit
-    /// in Xcode (Target → Signing & Capabilities → + Capability → iCloud).
-    /// Calling `CKContainer.default()` without that entitlement crashes
-    /// at launch from inside the CloudKit framework.
-    private static let useCloudKit = true
+    /// Master switch for CloudKit. When false, the app runs **fully
+    /// offline**: LocalGroupService backs every CloudKitServicing call,
+    /// AppDelegate silent-push hooks short-circuit, and AppState skips
+    /// CKAccountChanged listening. Joins must happen over BLE
+    /// (JoinRequest / JoinResponse on the in-range members' GATT).
+    /// Flip back to `true` once you've re-enabled the iCloud capability
+    /// in Xcode (Target → Signing & Capabilities → + Capability → iCloud);
+    /// every CloudKit call site is unchanged and will resume automatically.
+    static let useCloudKit = false
 
     /// Owns UIApplicationDelegate methods we need for CloudKit silent
     /// pushes (CKQuerySubscription delivers via APNs). Without this,

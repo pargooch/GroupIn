@@ -202,11 +202,17 @@ struct GroupDashboardView: View {
                 drawerHeader(group: group)
 
                 List {
+                    // Four always-rendered sections. Section count is
+                    // constant regardless of `isOwner` or banlist
+                    // contents — every conditional that used to gate
+                    // a whole Section now lives INSIDE the section as
+                    // content variation. Avoids the "invalid number
+                    // of items in section N" UICollectionView
+                    // assertion that was crashing this view on the
+                    // joiner side as soon as the dashboard mounted.
                     membersSection(group: group)
                     groupSection(group: group)
-                    if viewModel.isOwner {
-                        bannedSection(group: group)
-                    }
+                    bannedSection(group: group)
                     leaveGroupSection(group: group)
                 }
                 .scrollContentBackground(.hidden)
@@ -576,8 +582,13 @@ struct GroupDashboardView: View {
     /// don't tap them on the way past.
     @ViewBuilder
     private func leaveGroupSection(group: GroupSession) -> some View {
-        if !viewModel.isOwner {
-            Section {
+        // Always rendered. Content vanishes for owners (they delete
+        // via the existing remove-group flow) but the *Section
+        // itself* stays put. Previous version was an outer
+        // `if !isOwner { Section }` which made the section count
+        // depend on a runtime flag — the cause of the diff crash.
+        Section {
+            if !viewModel.isOwner {
                 Button(role: .destructive) {
                     confirmingLeaveGroup = true
                 } label: {
@@ -591,8 +602,8 @@ struct GroupDashboardView: View {
                 }
                 .accessibilityHint("Removes you from this group and stops sharing your location with its members")
             }
-            .listRowBackground(Color.clear)
         }
+        .listRowBackground(Color.clear)
     }
 
     /// Owner-only banlist UI. Hidden when the group has no banned
@@ -601,19 +612,32 @@ struct GroupDashboardView: View {
     /// previously-removed person.
     @ViewBuilder
     private func bannedSection(group: GroupSession) -> some View {
-        if !group.bannedMembers.isEmpty {
-            Section {
+        // ALWAYS render this Section so the dashboard's section count
+        // is constant. When the user isn't the owner, OR there are
+        // no banned members, the section yields zero rows and no
+        // header/footer (entire Section becomes invisible). What was
+        // previously `if condition { Section { ... } }` triggered a
+        // UICollectionView assertion every time the condition
+        // flipped — appearing/disappearing sections is what blew up
+        // the List diff.
+        let showBanlist = viewModel.isOwner && !group.bannedMembers.isEmpty
+        Section {
+            if showBanlist {
                 ForEach(group.bannedMembers) { entry in
                     bannedRow(entry)
                 }
-            } header: {
+            }
+        } header: {
+            if showBanlist {
                 Text("Banned (\(group.bannedMembers.count))")
-            } footer: {
+            }
+        } footer: {
+            if showBanlist {
                 Text("Banned members can't rejoin with the invite code. Tap Unban to let them back in.")
                     .font(.caption)
             }
-            .listRowBackground(Color.clear)
         }
+        .listRowBackground(Color.clear)
     }
 
     @ViewBuilder
@@ -659,37 +683,40 @@ struct GroupDashboardView: View {
 
     @ViewBuilder
     private func membersSection(group: GroupSession) -> some View {
-        Section("Members (\(group.members.count))") {
-            if group.members.isEmpty {
-                Text("No members yet").foregroundStyle(.secondary)
-            } else {
-                // Each member is its own List row. The TimelineView
-                // is per-row (cheap — SwiftUI shares the timer source)
-                // so swipe actions and row separators behave like
-                // every other List in the app. Previously we wrapped
-                // the whole ForEach in one TimelineView + VStack,
-                // which collapsed every member into a single List row
-                // and made swipe-to-remove apply to "all members at
-                // once."
-                ForEach(group.members) { member in
-                    TimelineView(.periodic(from: .now, by: 15)) { context in
-                        memberRow(member, group: group, now: context.date)
-                    }
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 10, leading: 18, bottom: 10, trailing: 18))
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if viewModel.isOwner
-                            && member.id != viewModel.currentUser.id
-                            && member.id != group.ownerID {
-                            Button(role: .destructive) {
-                                memberToRemove = member
-                            } label: {
-                                Label("Remove", systemImage: "person.fill.xmark")
-                            }
+        // Section structure is *strictly stable*: always a ForEach
+        // (which yields zero rows when members is empty) plus an
+        // optional footer for the empty placeholder. Previously this
+        // section did `if isEmpty { Text } else { ForEach }`, which
+        // is a view-type swap that SwiftUI's List diff handles with
+        // the "invalid number of items in section N" assertion the
+        // moment members goes from 0 → N or vice versa. Footer
+        // content is supplementary and not counted as a row in the
+        // diff, so showing/hiding it never trips the diff.
+        Section {
+            ForEach(group.members) { member in
+                TimelineView(.periodic(from: .now, by: 15)) { context in
+                    memberRow(member, group: group, now: context.date)
+                }
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 10, leading: 18, bottom: 10, trailing: 18))
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    if viewModel.isOwner
+                        && member.id != viewModel.currentUser.id
+                        && member.id != group.ownerID {
+                        Button(role: .destructive) {
+                            memberToRemove = member
+                        } label: {
+                            Label("Remove", systemImage: "person.fill.xmark")
                         }
                     }
                 }
+            }
+        } header: {
+            Text("Members (\(group.members.count))")
+        } footer: {
+            if group.members.isEmpty {
+                Text("No members yet").foregroundStyle(.secondary)
             }
         }
     }

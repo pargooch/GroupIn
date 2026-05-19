@@ -2138,6 +2138,13 @@ final class AppState {
     /// Returns the next valid `JoinResponse` matching `inviteCode`,
     /// or nil if the calling task is cancelled before any response
     /// arrives.
+    /// Tear down any in-flight BLE join discovery — used by the join
+    /// view model on Cancel and on timeout so the central stops
+    /// writing JoinRequests to every in-range peripheral. Idempotent.
+    func cancelBLEJoinDiscovery() {
+        blePresenceService.stopJoinDiscovery()
+    }
+
     func awaitBLEJoinResponse(forInviteCode inviteCode: String,
                               joiner: User) async -> JoinResponse? {
         let banHash = localBanHash(forInviteCode: inviteCode)
@@ -2149,18 +2156,64 @@ final class AppState {
         )
         blePresenceService.startJoinDiscovery(request)
 
-        // Wait for the first matching response. The BLE service
-        // already filters by invite code before yielding, so any
-        // yielded response is for us.
-        for await response in blePresenceService.joinResponses {
-            if Task.isCancelled { break }
-            if response.inviteCode == inviteCode {
-                blePresenceService.stopJoinDiscovery()
-                return response
+        // Single-consumer continuation. The previous for-await on
+        // `blePresenceService.joinResponses` was a shared AsyncStream;
+        // a cancelled-but-still-suspended iterator and a new attempt's
+        // iterator would race for the same yielded JoinResponse, and
+        // the cancelled one frequently won (calling stopJoinDiscovery
+        // and clearing pendingJoinRequest before the new task could
+        // see anything). Routing through a single replaceable handler
+        // makes the delivery deterministic: each new awaiter overrides
+        // the prior handler, and cancellation cleanly resumes with nil
+        // exactly once.
+        let box = ResumeBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<JoinResponse?, Never>) in
+                box.install(continuation: continuation)
+                self.blePresenceService.setJoinResponseHandler { [weak self, box] response in
+                    guard response.inviteCode == inviteCode else { return }
+                    Task { @MainActor [weak self, box] in
+                        self?.blePresenceService.setJoinResponseHandler(nil)
+                        self?.blePresenceService.stopJoinDiscovery()
+                        box.resume(with: response)
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self, box] in
+                self?.blePresenceService.setJoinResponseHandler(nil)
+                self?.blePresenceService.stopJoinDiscovery()
+                box.resume(with: nil)
             }
         }
-        blePresenceService.stopJoinDiscovery()
-        return nil
+    }
+
+    /// Thread-safe one-shot continuation resume. Wraps a
+    /// `CheckedContinuation` with a lock so concurrent code paths
+    /// (handler delivery + cancellation) can race to resume without
+    /// double-resume crashes — first call wins, rest no-op. Installed
+    /// after construction so the box can be captured by both the
+    /// onCancel handler and the inner withCheckedContinuation closure
+    /// without ordering pain.
+    private final class ResumeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<JoinResponse?, Never>?
+
+        init() {}
+
+        func install(continuation: CheckedContinuation<JoinResponse?, Never>) {
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func resume(with value: JoinResponse?) {
+            lock.lock()
+            let cont = continuation
+            continuation = nil
+            lock.unlock()
+            cont?.resume(returning: value)
+        }
     }
 
     /// One-shot CloudKit append attempt with delivery-status
@@ -2432,6 +2485,40 @@ final class AppState {
         applyEventSideEffects(event)
     }
 
+    /// Reason we're tearing down a local group, used by
+    /// `tearDownLocalGroup` to decide which notice to surface.
+    private enum LocalGroupTeardownReason {
+        case banned   // owner kicked us
+        case left     // we (or some other device acting as us) left
+    }
+
+    /// Drop a group from local state and surface the appropriate
+    /// user-facing notice. Idempotent — re-applying after the group
+    /// is already gone is a no-op. Used by both the CloudKit refresh
+    /// path (`isLocalUserBanned` check) and the offline gossip path
+    /// (`memberRemoved` event side effect) so the experience is the
+    /// same regardless of which channel delivered the kick.
+    private func tearDownLocalGroup(_ groupID: UUID,
+                                    reason: LocalGroupTeardownReason) {
+        guard let group = myGroups.first(where: { $0.id == groupID }) else {
+            return
+        }
+        let isActive = currentGroup?.id == groupID
+        myGroups.removeAll { $0.id == groupID }
+        membershipByGroupID.removeValue(forKey: groupID)
+        if isActive {
+            currentGroup = nil
+            switch reason {
+            case .banned: bannedFromGroupName = group.name
+            case .left:   groupDeletedNotice = group.name
+            }
+            path.removeAll()
+        }
+        Task { [notificationService, groupID] in
+            await notificationService.cancelAll(for: groupID)
+        }
+    }
+
     /// Hook for events whose effect on local state goes beyond the
     /// pure reducer fold. The reducer is `events → GroupSession?` —
     /// when "the group is gone" is the right answer we need a side
@@ -2458,6 +2545,26 @@ final class AppState {
                 timestamp: event.createdAt
             )
             appendChat(message)
+        case .memberRemoved(let removedID, _, _):
+            // The owner kicked someone. If that someone is us, the
+            // event-driven side effect is "tear down local group
+            // state and surface a notice" — same outcome that
+            // `refreshCurrentGroup` produces when it sees our banHash
+            // server-side. Doing it here closes the offline gap: a
+            // kick that arrives only via BLE gossip (CloudKit
+            // unreachable, or disabled entirely) still kicks us off
+            // the dashboard.
+            guard let ourMemberID = membershipByGroupID[event.groupID],
+                  removedID == ourMemberID else { return }
+            tearDownLocalGroup(event.groupID, reason: .banned)
+        case .memberLeft(let leftID):
+            // Mirror of memberRemoved but without the ban — only
+            // matters in the (rare) case where some other device
+            // initiated leave on our behalf. Tear down so we don't
+            // keep a ghost membership locally.
+            guard let ourMemberID = membershipByGroupID[event.groupID],
+                  leftID == ourMemberID else { return }
+            tearDownLocalGroup(event.groupID, reason: .left)
         case .groupDeleted:
             // The author tore down explicitly in `remove(group:)`.
             // Everyone else: drop the group locally and surface a
@@ -2709,15 +2816,22 @@ final class AppState {
         guard let active = currentGroup else { return }
         do {
             guard var updated = try await groupService.fetchGroup(groupID: active.id) else {
-                // Server-side gone — the group was hard-deleted (owner
-                // pressed Delete on Home, or expiry cleanup ran). Drop
-                // it from local state immediately so we don't keep a
-                // ghost group on Home with stale data, and surface a
-                // one-time alert via the dashboard modifier so the
-                // user knows why their dashboard just popped.
-                let groupName = active.name
-                remove(group: active)
-                groupDeletedNotice = groupName
+                // Two interpretations of `nil`:
+                //   1. The backend has authoritative server state and
+                //      truly says "this group is gone" — drop it locally
+                //      and tell the user.
+                //   2. The backend is local-only (LocalGroupService) and
+                //      simply doesn't know about this group because we
+                //      joined it via BLE, not by creating it locally.
+                //      In that case `nil` is meaningless and we MUST
+                //      NOT tear down — the only source of truth for the
+                //      group's existence is our own local state.
+                // `supportsRemoteJoin` distinguishes the two.
+                if groupService.supportsRemoteJoin {
+                    let groupName = active.name
+                    remove(group: active)
+                    groupDeletedNotice = groupName
+                }
                 return
             }
             // Detect post-removal: if the owner kicked us, our banHash
@@ -3021,7 +3135,18 @@ final class AppState {
     }
 
     private func persistEventsByGroup() {
-        if let data = try? JSONEncoder().encode(eventsByGroup) {
+        // Strip avatar payloads from `memberJoined` events before
+        // persisting. Avatars live on the per-group `User` record
+        // already; carrying them inside the event log too means each
+        // 50-100 KB avatar gets written N times (once per join event
+        // per group), trivially exceeding UserDefaults' 4 MB platform
+        // ceiling and crashing the app with `CFPrefsPlistSource`
+        // truncation. The reducer can reconstruct member avatars from
+        // the User record on replay; events don't need them.
+        let stripped = eventsByGroup.mapValues { events in
+            events.map { $0.strippedForBLE() }
+        }
+        if let data = try? JSONEncoder().encode(stripped) {
             defaults.set(data, forKey: Self.eventsByGroupKey)
         }
     }

@@ -2,6 +2,23 @@
 //  JoinGroupViewModel.swift
 //  GroupIn
 //
+//  Fully-offline, nearby-only join. The flow:
+//
+//   1. User enters or scans the invite code.
+//   2. We start BLE join-discovery: scan for in-range peers, write
+//      a JoinRequest to anyone advertising our service.
+//   3. When a host with a matching invite code responds (over BLE
+//      GATT notify), we materialize their JoinResponse into a local
+//      `GroupSession`, register membership, navigate to the dashboard,
+//      and emit a `memberJoined` event so the host's gossip + our
+//      local log converge.
+//   4. If no response arrives within `discoveryTimeout`, we surface
+//      a clear "no nearby host" error with retry.
+//
+//  Design intent — make every state transition explicit and ordered.
+//  No racing tasks, no withTaskGroup, no CloudKit fallback. One task,
+//  one path, one user-visible outcome.
+//
 
 import Foundation
 import Observation
@@ -11,22 +28,36 @@ import Observation
 final class JoinGroupViewModel {
     var inviteCode: String = ""
     var isSubmitting: Bool = false
-    /// Hard error to show to the user — only set for problems they
-    /// can actually do something about (wrong code, banned, not
-    /// signed into iCloud). Transient errors silently retry instead.
+    /// User-visible error. Cleared on every new join attempt + every
+    /// edit of the invite code. The view shows it in a banner above
+    /// the join button.
     var errorMessage: String?
-    /// In-flight status message for the user during silent retries.
-    /// Nil when idle; "Looking for group..." while we're cycling
-    /// through retry attempts behind the scenes.
+    /// In-flight status message. Drives the spinner row when
+    /// `isSubmitting` is true.
     var statusMessage: String?
 
     private let appState: AppState
 
-    /// Cap the silent-retry backoff. Beyond this, each retry waits
-    /// the same interval — we never give up entirely, but we don't
-    /// keep doubling forever either. The user can cancel by tapping
-    /// out of the join screen.
-    private static let maxRetryDelay: TimeInterval = 30
+    /// Active join task. Cancelled by `cancel()` or by `joinGroup()`
+    /// itself when a new attempt supersedes the prior one. Held so
+    /// `cancel()` can tear down the BLE discovery immediately.
+    private var activeTask: Task<Void, Never>?
+
+    /// Joiner identity for this view-model session. We cache it on
+    /// first attempt and reuse on every retry — the host dedups
+    /// `JoinRequest`s by `joinerMemberID` in `commitJoinerLocally`,
+    /// so if every retry minted a new UUID the host would happily
+    /// commit you as a brand-new member each tap (causing the
+    /// "duplications" bug). Cleared when the join ultimately
+    /// succeeds or the screen disappears.
+    private var sessionJoiner: User?
+
+    /// Discovery deadline. Beyond this, we give up and surface
+    /// "no nearby host." 30 seconds is comfortable for a real-room
+    /// scan — long enough that a host walking back from the bathroom
+    /// can still answer, short enough that we don't strand the user
+    /// in an infinite spinner.
+    private static let discoveryTimeout: TimeInterval = 30
 
     init(appState: AppState) {
         self.appState = appState
@@ -37,88 +68,120 @@ final class JoinGroupViewModel {
             && !isSubmitting
     }
 
+    // MARK: - Entry points
+
     func joinGroup() async {
-        guard canSubmit else { return }
-        isSubmitting = true
+        // Supersede any earlier in-flight attempt — fresh tap, fresh
+        // task. Without this an impatient user could stack 5 BLE
+        // discovery tasks by tapping Join repeatedly.
+        activeTask?.cancel()
+
+        let trimmed = inviteCode
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        guard !trimmed.isEmpty else {
+            errorMessage = "Enter a group invite code first."
+            return
+        }
+        inviteCode = trimmed
+
         errorMessage = nil
-        statusMessage = nil
-        defer {
-            isSubmitting = false
-            statusMessage = nil
+        statusMessage = "Looking for nearby host…"
+        isSubmitting = true
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runJoinAttempt(inviteCode: trimmed)
         }
-
-        let service = appState.groupService
-        let code = inviteCode
-
-        statusMessage = "Looking for group…"
-
-        // Race two paths in parallel:
-        //   1. CloudKit join — retries transient errors silently.
-        //   2. BLE discovery — asks any in-range peer "do you have a
-        //      group with this invite code?" via the joinRequest /
-        //      joinResponse handshake.
-        // Whichever resolves first wins; the other is cancelled. BLE
-        // discovery is uniquely useful when CloudKit is unreachable
-        // OR when the host's group save is still queued (so the cloud
-        // hasn't seen it yet but a member in BLE range has).
-        await withTaskGroup(of: JoinAttemptResult.self) { group in
-            group.addTask { @MainActor [appState = appState] in
-                let joiner = appState.makeMembership()
-                if let response = await appState.awaitBLEJoinResponse(
-                    forInviteCode: code, joiner: joiner
-                ) {
-                    return .bleResolved(response, joiner)
-                }
-                return .transient
-            }
-            group.addTask { @MainActor [self, service, code] in
-                var delay: TimeInterval = 2
-                while !Task.isCancelled {
-                    let outcome = await self.attemptJoin(service: service, inviteCode: code)
-                    switch outcome {
-                    case .succeeded, .hardError, .bleResolved:
-                        return outcome
-                    case .transient:
-                        try? await Task.sleep(for: .seconds(delay))
-                        delay = min(Self.maxRetryDelay, delay * 2)
-                    }
-                }
-                return .transient
-            }
-
-            // Accept the first authoritative answer (success / hard
-            // error / BLE-resolved) and cancel the other task.
-            while let result = await group.next() {
-                switch result {
-                case .succeeded:
-                    group.cancelAll()
-                    return
-                case .hardError(let message):
-                    errorMessage = message
-                    group.cancelAll()
-                    return
-                case .bleResolved(let response, let joiner):
-                    await applyBLEJoin(response: response, joiner: joiner)
-                    group.cancelAll()
-                    return
-                case .transient:
-                    // Loop — the other task may still resolve.
-                    continue
-                }
-            }
-        }
+        activeTask = task
+        await task.value
     }
 
-    /// Apply a BLE-derived JoinResponse: mint the local GroupSession,
-    /// stamp the joiner's ban hash, update AppState, navigate to the
-    /// dashboard. The actual member publish + memberJoined event use
-    /// the standard `emit` pipeline so cloud + BLE gossip both see
-    /// the new member.
-    private func applyBLEJoin(response: JoinResponse, joiner: User) async {
-        guard var group = response.toGroupSession() else { return }
+    /// User-initiated cancel from the Cancel button. Tears down the
+    /// active task and BLE discovery, clears the spinner, leaves the
+    /// invite code populated so the user can retry without retyping.
+    func cancel() {
+        activeTask?.cancel()
+        activeTask = nil
+        appState.cancelBLEJoinDiscovery()
+        isSubmitting = false
+        statusMessage = nil
+    }
 
-        // Ban gate at the joiner side too — defense in depth in case
-        // the responder skipped its check.
+    // MARK: - Core flow
+
+    private func runJoinAttempt(inviteCode: String) async {
+        defer {
+            // Always clean up on exit — task ending normally,
+            // throwing, or cancelled. Without this defer a thrown
+            // path could leave `isSubmitting = true` forever.
+            if !Task.isCancelled {
+                isSubmitting = false
+                statusMessage = nil
+            }
+            appState.cancelBLEJoinDiscovery()
+        }
+
+        // Quick local-side ban check before even broadcasting — if
+        // we already know we're banned (we have a cached cloud ID
+        // and the group has us in its banlist), refuse early. This
+        // doesn't catch the case where we don't have a banHash yet;
+        // the responder's check covers that.
+        // (Performed inside `awaitBLEJoinResponse` once we have the
+        // response too — defense in depth.)
+
+        let joiner: User
+        if let cached = sessionJoiner {
+            joiner = cached
+        } else {
+            let fresh = appState.makeMembership()
+            sessionJoiner = fresh
+            joiner = fresh
+        }
+
+        let response: JoinResponse?
+        do {
+            response = try await withTimeout(seconds: Self.discoveryTimeout) {
+                await self.appState.awaitBLEJoinResponse(
+                    forInviteCode: inviteCode,
+                    joiner: joiner
+                )
+            }
+        } catch is TimeoutError {
+            // No host answered within the discovery window.
+            errorMessage = "No nearby host found with this code. " +
+                "Make sure the host's phone is unlocked, GroupIn is open, " +
+                "and you're within Bluetooth range."
+            return
+        } catch {
+            // Cancellation lands here too (CancellationError). Don't
+            // surface an error message — the cancel button cleared
+            // state already.
+            return
+        }
+
+        guard let response else {
+            // BLE discovery returned nil without throwing — discovery
+            // stopped (e.g. group teardown), surface generic message.
+            errorMessage = "Couldn't connect to a nearby host. Try again."
+            return
+        }
+
+        if Task.isCancelled { return }
+        await applyJoinResponse(response, joiner: joiner)
+    }
+
+    /// Materialize a JoinResponse received over BLE into a local
+    /// GroupSession, register membership, navigate. Mirrors the
+    /// host's `commitJoinerLocally` — the deterministic
+    /// `memberJoinedEventID` collapses our emit against theirs at
+    /// ingest so the timeline shows one "X joined" row, not two.
+    private func applyJoinResponse(_ response: JoinResponse, joiner: User) async {
+        guard var group = response.toGroupSession() else {
+            errorMessage = "The host's response was malformed. Try again."
+            return
+        }
+
         if appState.isLocalUserBanned(from: group) {
             errorMessage = GroupServiceError.banned.localizedDescription
             return
@@ -126,24 +189,32 @@ final class JoinGroupViewModel {
 
         var me = joiner
         me = appState.stampBanHash(me, for: group)
-        group.members.append(me)
+        if !group.members.contains(where: { $0.id == me.id }) {
+            group.members.append(me)
+        }
 
         appState.registerMembership(groupID: group.id, memberID: me.id)
         appState.addOrUpdate(group: group)
         appState.currentUser = me
         appState.currentGroup = group
-        appState.path.append(.groupDashboard(groupID: group.id))
 
-        // Publish via the persisted retry queue. Cloud-side publish
-        // retries on exponential backoff; BLE event gossip handles
-        // the offline case in parallel.
+        // Persist the group via the backend too — without this,
+        // LocalGroupService doesn't have a record of this group
+        // (we only know about it because the host gave us a
+        // JoinResponse over BLE), and subsequent calls into
+        // `groupService.fetchGroup(groupID:)` return nil. The
+        // CloudKit backend's saveGroup is idempotent on group ID, so
+        // re-saving on the joiner side is harmless when CloudKit is on.
+        appState.dispatchGroupSave(group)
+
+        // Dispatch the member publish via the persisted retry queue —
+        // when CloudKit comes back online (or stays off forever in
+        // pure-offline mode), the queue carries the side-effect
+        // semantics. Local LocalGroupService just persists immediately.
         appState.dispatchMemberPublish(me, in: group)
 
-        // Emit with the deterministic memberJoined event ID so this
-        // collapses against the responder's matching emit (see
-        // `AppState.commitJoinerLocally`) at the ingest dedup layer.
-        // Without matching IDs we'd produce two "joined" rows in
-        // every peer's timeline.
+        // Emit memberJoined with the deterministic ID so this collapses
+        // against the host's matching emit at ingest dedup.
         let eventID = Event.memberJoinedEventID(
             groupID: group.id,
             memberID: me.id
@@ -161,114 +232,48 @@ final class JoinGroupViewModel {
             )
         )
         appState.emit(event)
+
+        // Pop back to Home rather than auto-navigating to the
+        // dashboard. The previous flow mounted the dashboard in the
+        // same tick as `currentGroup` was set + `addOrUpdate`
+        // persisted + the emit pipeline ran — that burst of state
+        // mutations triggered a SwiftUI List diff bug that crashed
+        // the app on the joiner side. Popping to Home lets the user
+        // see the freshly-joined group in their list and tap to
+        // enter when state has settled — the dashboard mount then
+        // happens against fully-stable data with no concurrent
+        // mutations.
+        appState.path.removeAll()
+
+        // Joined — clear the cached joiner so a future trip to this
+        // screen mints a fresh identity.
+        sessionJoiner = nil
     }
 
-    // MARK: - Inner attempt
+    // MARK: - Timeout primitive
 
-    private enum JoinAttemptResult: Sendable {
-        case succeeded
-        case hardError(message: String)
-        case transient
-        /// BLE discovery returned a response — the calling code
-        /// constructs the local GroupSession from this and the
-        /// freshly-minted joiner User.
-        case bleResolved(JoinResponse, User)
-    }
+    private struct TimeoutError: Error {}
 
-    private func attemptJoin(service: CloudKitServicing,
-                             inviteCode: String) async -> JoinAttemptResult {
-        do {
-            let group = try await service.joinGroup(inviteCode: inviteCode)
-
-            // Pre-publish ban gate — refuse before writing a member
-            // record so the banned user doesn't briefly appear on
-            // the owner's dashboard.
-            if appState.isLocalUserBanned(from: group) {
-                return .hardError(message: GroupServiceError.banned.localizedDescription)
+    /// Race the operation against a sleep. First to finish wins;
+    /// the loser is cancelled. Cancellation propagates from the
+    /// caller (e.g. `cancel()` cancelling `activeTask`) through
+    /// `withTaskGroup` to each child.
+    private func withTimeout<T: Sendable>(
+        seconds: TimeInterval,
+        operation: @Sendable @escaping () async -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                await operation()
             }
-
-            // Idempotent join: reuse existing membership ID if any.
-            var me: User
-            if let existingID = appState.membershipByGroupID[group.id] {
-                me = User(
-                    id: existingID,
-                    displayName: appState.localProfile.displayName,
-                    avatarData: appState.localProfile.avatarData
-                )
-            } else {
-                me = appState.makeMembership()
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw TimeoutError()
             }
-            me = appState.stampBanHash(me, for: group)
-
-            // Local state first — user sees the dashboard immediately.
-            var withMe = group
-            if let idx = withMe.members.firstIndex(where: { $0.id == me.id }) {
-                withMe.members[idx] = me
-            } else {
-                withMe.members.append(me)
-            }
-            appState.registerMembership(groupID: withMe.id, memberID: me.id)
-            appState.addOrUpdate(group: withMe)
-            appState.currentUser = me
-            appState.currentGroup = withMe
-            appState.path.append(.groupDashboard(groupID: withMe.id))
-
-            // Publish via the persisted retry queue — no more
-            // fire-and-forget. If this attempt fails the entry sits
-            // in `pendingMemberPublishes` and the retry loop drains
-            // it on exponential backoff.
-            appState.dispatchMemberPublish(me, in: withMe)
-
-            // Append `memberJoined` through the standard emit path so
-            // it goes via pendingEmits (retried) + BLE gossip. The
-            // deterministic event ID keeps us consistent with the
-            // BLE-resolved path — same dedup invariant for both.
-            let eventID = Event.memberJoinedEventID(
-                groupID: withMe.id,
-                memberID: me.id
-            )
-            let event = Event(
-                id: eventID,
-                groupID: withMe.id,
-                authorID: me.id,
-                createdAt: .now,
-                payload: .memberJoined(
-                    memberID: me.id,
-                    displayName: me.displayName,
-                    avatarData: me.avatarData,
-                    banHash: me.banHash
-                )
-            )
-            appState.emit(event)
-
-            return .succeeded
-        } catch let error as GroupServiceError {
-            // Service-level errors — most are user-fixable.
-            switch error {
-            case .invalidCode, .invalidName, .groupNotFound, .banned, .noPendingExtension:
-                return .hardError(message: error.localizedDescription)
-            }
-        } catch let error as CloudKitError {
-            switch error {
-            case .notSignedIn:
-                // User-fixable: they need to sign into iCloud.
-                return .hardError(message: error.localizedDescription)
-            case .schemaIncomplete:
-                // Pseudo-transient: the schema may auto-deploy as
-                // writes happen; meanwhile let the user know it's
-                // a setup-side problem rather than retrying silently.
-                return .hardError(message: error.localizedDescription)
-            case .invalidRecord:
-                return .hardError(message: error.localizedDescription)
-            case .other:
-                // Network blips, CloudKit unavailability, etc.
-                return .transient
-            }
-        } catch {
-            // Anything else — treat as transient. Worst case the
-            // user sits on the loading state for a while and can
-            // cancel out.
-            return .transient
+            // First child wins. Cancel the rest so they don't dangle.
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
         }
     }
 }

@@ -29,10 +29,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        // Has to happen at launch so iOS knows we want APNs delivery.
-        // No-op if entitlement is missing — registration just fails
-        // silently and the polling fallback in AppState carries us.
-        application.registerForRemoteNotifications()
+        // Skip APNs registration when CloudKit is off — there's nothing
+        // to push without a server-side subscription. Saves the silent
+        // failure log from `didFailToRegisterForRemoteNotifications`
+        // when the aps-environment entitlement isn't present.
+        if GroupInApp.useCloudKit {
+            application.registerForRemoteNotifications()
+        }
         return true
     }
 

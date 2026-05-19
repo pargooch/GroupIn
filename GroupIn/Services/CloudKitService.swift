@@ -100,6 +100,10 @@ private func ckErrorCodeName(_ code: CKError.Code) -> String {
 
 @MainActor
 final class CloudKitService: CloudKitServicing {
+    /// CloudKit queries the shared public database — remote-join via
+    /// invite code is the whole point.
+    let supportsRemoteJoin = true
+
     private let container: CKContainer
     private let database: CKDatabase
 

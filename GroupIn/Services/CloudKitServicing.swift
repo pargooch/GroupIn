@@ -31,6 +31,17 @@ enum ICloudAccountStatus: Sendable, Equatable {
 
 @MainActor
 protocol CloudKitServicing: AnyObject {
+    /// Whether this backend can discover groups by invite code without
+    /// physical proximity. CloudKit returns true (it queries a shared
+    /// server-side database). LocalGroupService returns false — it
+    /// only knows about groups the *local device* has created or
+    /// already joined, so a cross-device join through this backend
+    /// always fails with `.groupNotFound`. JoinGroupViewModel uses
+    /// this to decide whether to race a backend `joinGroup` call
+    /// against BLE discovery, or skip the backend path entirely and
+    /// rely on BLE alone.
+    var supportsRemoteJoin: Bool { get }
+
     /// Persists a fully-constructed `GroupSession`. The caller is
     /// expected to mint the GroupSession locally (via
     /// `GroupSession.generateInviteCode` + a fresh UUID + the user-

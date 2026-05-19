@@ -12,80 +12,23 @@ struct HomeView: View {
     #endif
 
     var body: some View {
-        List {
-            statusSection
-
-            Section {
-                Button {
-                    appState.path.append(.profileEditor)
-                } label: {
-                    HStack(spacing: 12) {
-                        AvatarView(data: appState.localProfile.avatarData,
-                                   name: appState.localProfile.displayName,
-                                   size: 48)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(needsProfileSetup
-                                 ? "Set up your profile"
-                                 : appState.localProfile.displayName)
-                                .font(.headline)
-                            Text(needsProfileSetup
-                                 ? "Add a name and photo to get started"
-                                 : "Edit profile")
-                                .font(.caption)
-                                .foregroundStyle(needsProfileSetup
-                                                 ? AnyShapeStyle(Color.accentColor)
-                                                 : AnyShapeStyle(HierarchicalShapeStyle.secondary))
-                        }
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.footnote)
-                            .foregroundStyle(.tertiary)
-                            .accessibilityHidden(true)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint(needsProfileSetup
-                                   ? "Opens the profile editor to set your name and photo"
-                                   : "Opens your profile to edit name and photo")
-            }
-
-            createJoinSection
-
-            Section {
-                if appState.myGroups.isEmpty {
-                    emptyGroupsState
-                } else {
-                    ForEach(appState.myGroups) { group in
-                        let isOwner = group.ownerID == appState.currentUser.id
-                        Button {
-                            appState.open(group: group)
-                        } label: {
-                            groupRow(group)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityHint("Opens group \(group.name)")
-                        // Per-row swipe label: owners delete the whole
-                        // group (cascade removes members server-side);
-                        // non-owners leave (their member record alone
-                        // is removed, others stay intact). Wording
-                        // matches the verb that actually happens.
-                        .swipeActions(edge: .trailing) {
-                            Button(role: .destructive) {
-                                appState.remove(group: group)
-                            } label: {
-                                Label(
-                                    isOwner ? "Delete" : "Leave",
-                                    systemImage: isOwner
-                                        ? "trash"
-                                        : "rectangle.portrait.and.arrow.right"
-                                )
-                            }
-                        }
-                    }
-                }
-            } header: {
-                Text("Your groups")
+        // Banners + empty-state live OUTSIDE the List in plain
+        // VStacks so the List's section count and ForEach contents
+        // stay stable across state changes. The previous layout had
+        // a conditional Section for banners (count changed when
+        // bluetoothReady flipped during BLE scanning) and an
+        // if/else swap between `emptyGroupsState` and `ForEach`
+        // inside the groups Section — both classic triggers for the
+        // UICollectionView "invalid number of items in section N"
+        // assertion that was terminating the app. Plain SwiftUI
+        // containers above/below a List with strictly-stable
+        // sections sidesteps the entire crash class.
+        VStack(spacing: 0) {
+            bannersStack
+            List {
+                profileSection
+                createJoinSection
+                groupsSection
             }
         }
         .navigationTitle("GroupIn")
@@ -181,11 +124,15 @@ struct HomeView: View {
         return banners
     }
 
+    /// Banners stack rendered above the List (NOT as a List section).
+    /// Plain VStack so banners can appear/disappear freely without
+    /// invalidating the List's section indices. Empty banners yield
+    /// an empty VStack which collapses to zero height.
     @ViewBuilder
-    private var statusSection: some View {
+    private var bannersStack: some View {
         let banners = statusBanners
         if !banners.isEmpty {
-            Section {
+            VStack(spacing: 8) {
                 ForEach(banners) { banner in
                     HStack(alignment: .top, spacing: 12) {
                         Image(systemName: banner.icon)
@@ -200,12 +147,97 @@ struct HomeView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        Spacer(minLength: 0)
                     }
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(banner.tint.opacity(0.08))
+                    )
                     .accessibilityElement(children: .combine)
                 }
-            } header: {
-                Text("Status")
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+        }
+    }
+
+    @ViewBuilder
+    private var profileSection: some View {
+        Section {
+            Button {
+                appState.path.append(.profileEditor)
+            } label: {
+                HStack(spacing: 12) {
+                    AvatarView(data: appState.localProfile.avatarData,
+                               name: appState.localProfile.displayName,
+                               size: 48)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(needsProfileSetup
+                             ? "Set up your profile"
+                             : appState.localProfile.displayName)
+                            .font(.headline)
+                        Text(needsProfileSetup
+                             ? "Add a name and photo to get started"
+                             : "Edit profile")
+                            .font(.caption)
+                            .foregroundStyle(needsProfileSetup
+                                             ? AnyShapeStyle(Color.accentColor)
+                                             : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.footnote)
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(needsProfileSetup
+                               ? "Opens the profile editor to set your name and photo"
+                               : "Opens your profile to edit name and photo")
+        }
+    }
+
+    /// Groups section. Always a `ForEach` — even when there are zero
+    /// groups, the section just produces zero rows and the empty
+    /// placeholder is rendered as a section *footer* below. Keeping
+    /// the section's row-producer constant (always ForEach over
+    /// `myGroups`) means the List diff never sees a view-type swap
+    /// between "empty placeholder" and "list of rows".
+    @ViewBuilder
+    private var groupsSection: some View {
+        Section {
+            ForEach(appState.myGroups) { group in
+                let isOwner = group.ownerID == appState.currentUser.id
+                Button {
+                    appState.open(group: group)
+                } label: {
+                    groupRow(group)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Opens group \(group.name)")
+                .swipeActions(edge: .trailing) {
+                    Button(role: .destructive) {
+                        appState.remove(group: group)
+                    } label: {
+                        Label(
+                            isOwner ? "Delete" : "Leave",
+                            systemImage: isOwner
+                                ? "trash"
+                                : "rectangle.portrait.and.arrow.right"
+                        )
+                    }
+                }
+            }
+        } header: {
+            Text("Your groups")
+        } footer: {
+            if appState.myGroups.isEmpty {
+                emptyGroupsState
             }
         }
     }
@@ -241,6 +273,12 @@ struct HomeView: View {
         }
     }
 
+    /// Empty-state placeholder rendered as the groups Section's
+    /// footer. Footers aren't counted as rows in the List diff so
+    /// showing/hiding this can't trigger the "invalid number of
+    /// items in section" assertion that bit us when the same
+    /// placeholder lived as a Section row alongside an `if/else`
+    /// ForEach swap.
     @ViewBuilder
     private var emptyGroupsState: some View {
         VStack(spacing: 14) {
@@ -254,6 +292,7 @@ struct HomeView: View {
 
             Text("No groups yet")
                 .font(.headline)
+                .foregroundStyle(.primary)
 
             Text("Create one or join with a code to start finding your friends in real time — online or off.")
                 .font(.subheadline)
@@ -263,7 +302,6 @@ struct HomeView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
-        .listRowBackground(Color.clear)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("No groups yet. Create one or join with a code.")
     }

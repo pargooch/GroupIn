@@ -75,6 +75,13 @@ protocol BLEPresenceServicing: AnyObject {
     /// after it validates a `JoinRequest` against the active group.
     func respondToJoinRequest(_ response: JoinResponse)
 
+    /// Register a single callback that fires when a `JoinResponse`
+    /// arrives. Pass `nil` to deregister. Used by AppState's join
+    /// awaiter — strictly single-consumer so retries don't race on a
+    /// shared AsyncStream's iterators. The handler is replaced atomically;
+    /// only the most recently registered one ever fires.
+    func setJoinResponseHandler(_ handler: ((JoinResponse) -> Void)?)
+
     /// Start polling `readRSSI()` on the live GATT connection for the
     /// given member at 5 Hz. Used by the BLE seeking channel — gives
     /// us active RSSI samples that work even when the peer is
@@ -184,6 +191,21 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private var presenceCharacteristic: CBMutableCharacteristic?
     private var joinRequestCharacteristic: CBMutableCharacteristic?
     private var joinResponseCharacteristic: CBMutableCharacteristic?
+
+    /// Recent JoinResponses we've emitted, kept so we can replay them
+    /// to centrals that subscribe AFTER we already responded.
+    /// CoreBluetooth has no "send to specific central across
+    /// subscriptions" — `updateValue` only reaches currently
+    /// subscribed centrals — so if a joiner subscribes a beat later
+    /// than they wrote the JoinRequest, our reply lands in the void.
+    /// Replaying on subscribe closes that race window. Bounded so we
+    /// don't keep growing while the app runs.
+    private var recentJoinResponses: [(response: JoinResponse, sentAt: Date)] = []
+    private static let recentJoinResponsesLimit = 8
+    /// Replay a JoinResponse only if it was generated within this
+    /// window. Beyond that the joiner has either landed via another
+    /// channel or moved on.
+    private static let joinResponseReplayWindow: TimeInterval = 30
     private var advertisedService: CBMutableService?
     private var serviceAdded: Bool = false
 
@@ -385,15 +407,15 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     func update(localPresence: PeerPresence) {
         guard let data = localPresence.encoded() else { return }
         lastPresenceData = data
-        if let char = presenceCharacteristic {
-            // Push to all subscribed centrals via BLE notify — fast path
-            // (sub-second to peers with a live connection).
-            peripheralManager.updateValue(
-                data,
-                for: char,
-                onSubscribedCentrals: nil
-            )
-        }
+        guard let char = presenceCharacteristic,
+              peripheralManager.state == .poweredOn else { return }
+        // Push to all subscribed centrals via BLE notify — fast path
+        // (sub-second to peers with a live connection).
+        peripheralManager.updateValue(
+            data,
+            for: char,
+            onSubscribedCentrals: nil
+        )
     }
 
     func stop() {
@@ -418,6 +440,8 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         activeRSSITasks.removeAll()
         discoveredPeripherals.removeAll()
         servicesDiscoveredFor.removeAll()
+        recentJoinResponses.removeAll()
+        joinResponseHandler = nil
         lastRSSIDiagnosticsEmit = .distantPast
         activeGroupHash = nil
         localMemberID = nil
@@ -613,11 +637,32 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     func respondToJoinRequest(_ response: JoinResponse) {
         guard let char = joinResponseCharacteristic,
               let data = response.encoded() else { return }
-        // updateValue to all subscribed centrals — the joiner
-        // filters by invite code on receive. We don't have a clean
-        // way to target a specific central without tracking the
-        // CBCentral object across the write→respond roundtrip, and
-        // the broadcast is harmless to non-matching listeners.
+
+        // Cache for replay-on-subscribe. The joiner's central may
+        // subscribe a beat AFTER it wrote the JoinRequest (the two
+        // GATT operations race when both go out from
+        // `didDiscoverCharacteristicsFor`), so a broadcast right now
+        // can reach an empty subscriber set. Cache + replay closes
+        // the gap.
+        recentJoinResponses.append((response, .now))
+        if recentJoinResponses.count > Self.recentJoinResponsesLimit {
+            recentJoinResponses.removeFirst(
+                recentJoinResponses.count - Self.recentJoinResponsesLimit
+            )
+        }
+
+        // Don't call updateValue while the manager isn't powered on
+        // — CoreBluetooth logs "API MISUSE" and the call is a no-op
+        // anyway. The replay-on-subscribe path picks up the cached
+        // response once the manager comes online and the central
+        // subscribes.
+        guard peripheralManager.state == .poweredOn else { return }
+
+        // updateValue to all currently-subscribed centrals — the
+        // joiner filters by invite code on receive, so an unrelated
+        // central in our `joinResponseCharacteristic` subscriber
+        // set (rare, but possible if a third device is mid-discovery)
+        // just sees a payload they discard.
         _ = peripheralManager.updateValue(
             data,
             for: char,
@@ -712,20 +757,27 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         peerContinuation.yield(presence)
     }
 
-    /// Decode an incoming JoinResponse off the wire and surface it
-    /// to AppState via the stream. Called when a remote peripheral
-    /// notifies us on the joinResponse characteristic during
-    /// discovery mode.
+    /// Decode an incoming JoinResponse off the wire and dispatch to
+    /// the registered single handler. Each `setJoinResponseHandler`
+    /// caller replaces the previous handler atomically, so retries
+    /// can never race on the same delivery. The legacy `joinResponses`
+    /// AsyncStream is still fed for backwards compat, but new code
+    /// should use the handler.
     private func handleJoinResponseData(_ data: Data) {
         guard let response = JoinResponse.decoded(from: data) else { return }
-        // Sanity: only yield responses that match the invite code we
+        // Sanity: only deliver responses that match the invite code we
         // asked for. Discards crossed-wire responses if multiple
-        // join attempts are in flight (shouldn't happen given we
-        // single-thread join through `pendingJoinRequest`, but
-        // defense in depth).
+        // join attempts are in flight.
         guard let request = pendingJoinRequest,
               response.inviteCode == request.inviteCode else { return }
+        joinResponseHandler?(response)
         joinResponseContinuation.yield(response)
+    }
+
+    private var joinResponseHandler: ((JoinResponse) -> Void)?
+
+    func setJoinResponseHandler(_ handler: ((JoinResponse) -> Void)?) {
+        joinResponseHandler = handler
     }
 }
 
@@ -960,26 +1012,34 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                                 error: Error?) {
         Task { @MainActor in
             guard let chars = service.characteristics else { return }
+            // Two-pass ordering — subscriptions FIRST, writes second.
+            // The host's `respondToJoinRequest` uses
+            // `updateValue(..., onSubscribedCentrals: nil)` which only
+            // reaches centrals currently subscribed to the response
+            // characteristic. If we wrote the JoinRequest before
+            // subscribing to the response notify, the host would
+            // respond into the void and the joiner would never see
+            // the reply. Doing subscribes first closes most of that
+            // race (the host-side replay-on-subscribe path closes the
+            // remainder).
             for char in chars {
                 switch char.uuid {
                 case Self.presenceCharacteristicUUID:
-                    // 1. Initial read so we get the peer's current state right away.
+                    // Initial read so we get the peer's current state right away.
                     peripheral.readValue(for: char)
-                    // 2. Subscribe for ongoing live updates pushed via notify.
+                    // Subscribe for ongoing live updates pushed via notify.
                     peripheral.setNotifyValue(true, for: char)
                 case Self.joinResponseCharacteristicUUID:
-                    // Join discovery — subscribe so a peer's reply
-                    // notifies us. Only relevant when we're in
-                    // discovery mode; harmless otherwise.
+                    // Subscribe before any write goes out so we don't
+                    // miss the host's JoinResponse notify.
                     peripheral.setNotifyValue(true, for: char)
-                case Self.joinRequestCharacteristicUUID:
-                    // If we're currently looking to join, write the
-                    // request to this peer right now. Discovery
-                    // mode bypasses the activeGroupHash filter so
-                    // every peer we reach gets a chance to answer.
-                    self.writeJoinRequestIfPossible(to: peripheral)
                 default:
                     break
+                }
+            }
+            for char in chars {
+                if char.uuid == Self.joinRequestCharacteristicUUID {
+                    self.writeJoinRequestIfPossible(to: peripheral)
                 }
             }
         }
@@ -1110,8 +1170,29 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
                 // its response — a fresh notify here guarantees the
                 // peer gets the presence packet at least once.
                 if let data = self.lastPresenceData,
-                   let char = self.presenceCharacteristic {
+                   let char = self.presenceCharacteristic,
+                   self.peripheralManager.state == .poweredOn {
                     self.peripheralManager.updateValue(
+                        data,
+                        for: char,
+                        onSubscribedCentrals: [central]
+                    )
+                }
+            } else if charUUID == Self.joinResponseCharacteristicUUID {
+                // Replay recent JoinResponses to this newly-subscribed
+                // central. They may have written their JoinRequest a
+                // beat before subscribing, in which case our reply
+                // was generated while their subscriber set was empty.
+                // The joiner filters by inviteCode on receive, so
+                // replaying a response for some other joiner is
+                // harmless to them.
+                guard let char = self.joinResponseCharacteristic,
+                      self.peripheralManager.state == .poweredOn else { return }
+                let cutoff = Date().addingTimeInterval(-Self.joinResponseReplayWindow)
+                for entry in self.recentJoinResponses
+                where entry.sentAt >= cutoff {
+                    guard let data = entry.response.encoded() else { continue }
+                    _ = self.peripheralManager.updateValue(
                         data,
                         for: char,
                         onSubscribedCentrals: [central]

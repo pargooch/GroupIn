@@ -32,6 +32,12 @@ enum GroupServiceError: LocalizedError {
 
 @MainActor
 final class LocalGroupService: CloudKitServicing {
+    /// LocalGroupService only stores groups the local device created
+    /// or already joined. No shared server-side store → no way to
+    /// discover a remote group by invite code. JoinGroupViewModel
+    /// reads this and falls back to BLE-only discovery.
+    let supportsRemoteJoin = false
+
     private static let storageKey = "GroupIn.LocalGroupService.groups"
     private static let eventsKey = "GroupIn.LocalGroupService.events"
     /// Stable per-install identifier used for ban-hash computation in
@@ -310,7 +316,16 @@ final class LocalGroupService: CloudKitServicing {
     }
 
     private func saveEvents() {
-        if let data = try? JSONEncoder().encode(eventsByGroup) {
+        // Strip avatar payloads before persisting — see the matching
+        // comment in AppState.persistEventsByGroup. Avatars live on
+        // the User record and don't need to be duplicated inside
+        // every memberJoined event written to UserDefaults; doing so
+        // blows past the 4 MB platform ceiling once a group has a
+        // few photo-bearing joins.
+        let stripped = eventsByGroup.mapValues { events in
+            events.map { $0.strippedForBLE() }
+        }
+        if let data = try? JSONEncoder().encode(stripped) {
             defaults.set(data, forKey: Self.eventsKey)
         }
     }
