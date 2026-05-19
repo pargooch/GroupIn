@@ -74,6 +74,16 @@ protocol BLEPresenceServicing: AnyObject {
     /// wrong central is harmlessly ignored. Called by AppState
     /// after it validates a `JoinRequest` against the active group.
     func respondToJoinRequest(_ response: JoinResponse)
+
+    /// Start polling `readRSSI()` on the live GATT connection for the
+    /// given member at 5 Hz. Used by the BLE seeking channel — gives
+    /// us active RSSI samples that work even when the peer is
+    /// backgrounded, with much higher density than passive scan
+    /// callbacks (which iOS throttles). Idempotent.
+    func startActiveRSSIPolling(for memberID: UUID)
+
+    /// Stop the polling Task for a member. Idempotent.
+    func stopActiveRSSIPolling(for memberID: UUID)
 }
 
 struct BLEDiagnostics: Sendable, Equatable {
@@ -241,6 +251,15 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// common silent failure between conn and map.
     private var servicesDiscoveredFor: Set<UUID> = []
 
+    /// MemberIDs we're currently active-polling RSSI for. Maps to a
+    /// running Task that fires `peripheral.readRSSI()` on a cadence.
+    /// Driven by `startActiveRSSIPolling` / `stopActiveRSSIPolling`
+    /// from the seeking channel layer.
+    private var activeRSSITasks: [UUID: Task<Void, Never>] = [:]
+    /// Polling interval for active GATT readRSSI() — 200ms = 5 Hz, the
+    /// "compass open" cadence agreed in the seeking-tier design.
+    private static let activeRSSIPollInterval: TimeInterval = 0.2
+
     /// Last time we yielded a diagnostics snapshot driven by an RSSI
     /// sample. RSSI callbacks fire many times per second; without this
     /// throttle the diagnostics stream would dominate the run loop.
@@ -395,6 +414,8 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         connectTimestamps.removeAll()
         presenceRetryTask?.cancel()
         presenceRetryTask = nil
+        for task in activeRSSITasks.values { task.cancel() }
+        activeRSSITasks.removeAll()
         discoveredPeripherals.removeAll()
         servicesDiscoveredFor.removeAll()
         lastRSSIDiagnosticsEmit = .distantPast
@@ -800,6 +821,41 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
     /// `didDiscoverCharacteristicsFor` is best-effort — if it returns
     /// nil or the decode fails, no retry happens by default and RSSI
     /// samples for that peer are silently dropped forever.
+    // MARK: - Active RSSI polling
+
+    func startActiveRSSIPolling(for memberID: UUID) {
+        guard activeRSSITasks[memberID] == nil else { return }
+        let task = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.pollActiveRSSI(for: memberID)
+                try? await Task.sleep(
+                    for: .seconds(Self.activeRSSIPollInterval)
+                )
+            }
+        }
+        activeRSSITasks[memberID] = task
+    }
+
+    func stopActiveRSSIPolling(for memberID: UUID) {
+        activeRSSITasks[memberID]?.cancel()
+        activeRSSITasks.removeValue(forKey: memberID)
+    }
+
+    private func pollActiveRSSI(for memberID: UUID) {
+        // Find the peripheral mapped to this memberID. If we don't
+        // have a live connection yet, the next scan-callback path
+        // will keep trying — nothing to do here.
+        guard let peripheralID = peripheralToMember.first(where: {
+            $0.value == memberID
+        })?.key,
+              let peripheral = connectedPeers[peripheralID] else { return }
+        // `readRSSI()` is an active GATT request — result lands in
+        // `peripheral(_:didReadRSSI:error:)`. Works while the peer is
+        // backgrounded; only requires the connection to be alive.
+        peripheral.readRSSI()
+    }
+
     private func schedulePresenceReadRetry() {
         if presenceRetryTask != nil { return }
         presenceRetryTask = Task { @MainActor [weak self] in
@@ -925,6 +981,34 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                 default:
                     break
                 }
+            }
+        }
+    }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral,
+                                didReadRSSI RSSI: NSNumber,
+                                error: Error?) {
+        guard error == nil else { return }
+        let rssiValue = RSSI.doubleValue
+        let peripheralID = peripheral.identifier
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let memberID = self.peripheralToMember[peripheralID] else { return }
+            let now = Date()
+            // Same downstream as scan-callback RSSI — feeds straight
+            // into the compass engine. The active path is just denser
+            // and works while the peer is backgrounded.
+            self.rssiContinuation.yield(RSSIReading(
+                memberID: memberID,
+                rssi: rssiValue,
+                timestamp: now
+            ))
+            self.currentDiagnostics.rssiSampleCountByMember[memberID, default: 0] += 1
+            self.currentDiagnostics.lastRSSITimestampByMember[memberID] = now
+            if now.timeIntervalSince(self.lastRSSIDiagnosticsEmit)
+                >= Self.rssiDiagnosticsMinInterval {
+                self.lastRSSIDiagnosticsEmit = now
+                self.emitDiagnostics()
             }
         }
     }

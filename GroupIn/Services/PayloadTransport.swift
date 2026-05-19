@@ -131,20 +131,83 @@ extension PayloadTransport {
 }
 
 /// Capability bits for a single device. Advertised on the BLE
-/// presence channel (Phase 4) so the group can negotiate the
-/// minimum-common transport.
+/// presence channel so the group can negotiate the minimum-common
+/// transport for the **payload tier** (chat, event-log gossip) and
+/// the best-shared channel for the **seeking tier** (compass / range
+/// finding). Two tiers, one struct — keeps the wire format flat.
 struct TransportCapability: Sendable, Equatable, Codable {
+    // MARK: - Payload tier
+
     /// Wi-Fi Aware available on this device (iOS 26+, hardware
-    /// supports it, entitlement granted, radio on).
+    /// supports it, entitlement granted, radio on). Drives the
+    /// payload transport selection.
     var wifiAware: Bool
 
     /// MPC available (Local Network permission granted, not airplane
     /// mode with Bluetooth + Wi-Fi both off).
     var multipeer: Bool
 
-    static let none = TransportCapability(wifiAware: false, multipeer: false)
-    static let mpcOnly = TransportCapability(wifiAware: false, multipeer: true)
-    static let full = TransportCapability(wifiAware: true, multipeer: true)
+    // MARK: - Seeking tier
+
+    /// U1/U2 chip + NearbyInteraction available. Top tier — gives
+    /// centimeter-grade distance + direction vector, but is foreground-
+    /// only on both sides.
+    var uwb: Bool
+
+    /// Wi-Fi Aware FTM ranging available. Mid tier — meter-grade
+    /// distance, RSSI for gradient bearing, works backgrounded with
+    /// the entitlement. Tied to the same `wifiAware` capability bit
+    /// since both ride on the same framework; exposed separately so
+    /// the seeking router can be reasoned about independently of the
+    /// payload router.
+    var wifiAwareRanging: Bool
+
+    /// Active GATT RSSI polling. Always true on iOS 14+ — listed
+    /// here as a bit purely so the negotiation function can pick a
+    /// floor without special-casing.
+    var bleRanging: Bool
+
+    static let none = TransportCapability(
+        wifiAware: false, multipeer: false,
+        uwb: false, wifiAwareRanging: false, bleRanging: false
+    )
+    static let mpcOnly = TransportCapability(
+        wifiAware: false, multipeer: true,
+        uwb: false, wifiAwareRanging: false, bleRanging: true
+    )
+    static let full = TransportCapability(
+        wifiAware: true, multipeer: true,
+        uwb: true, wifiAwareRanging: true, bleRanging: true
+    )
+
+    // Custom decoder — older clients shipped without the seeking-tier
+    // fields. Missing fields decode to safe defaults: uwb/wifiAwareRanging
+    // false (we can't assume support), bleRanging true (always available
+    // on the platform target).
+    private enum CodingKeys: String, CodingKey {
+        case wifiAware, multipeer, uwb, wifiAwareRanging, bleRanging
+    }
+
+    init(wifiAware: Bool,
+         multipeer: Bool,
+         uwb: Bool = false,
+         wifiAwareRanging: Bool = false,
+         bleRanging: Bool = true) {
+        self.wifiAware = wifiAware
+        self.multipeer = multipeer
+        self.uwb = uwb
+        self.wifiAwareRanging = wifiAwareRanging
+        self.bleRanging = bleRanging
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.wifiAware = try c.decode(Bool.self, forKey: .wifiAware)
+        self.multipeer = try c.decode(Bool.self, forKey: .multipeer)
+        self.uwb = (try? c.decode(Bool.self, forKey: .uwb)) ?? false
+        self.wifiAwareRanging = (try? c.decode(Bool.self, forKey: .wifiAwareRanging)) ?? false
+        self.bleRanging = (try? c.decode(Bool.self, forKey: .bleRanging)) ?? true
+    }
 }
 
 extension TransportCapability {

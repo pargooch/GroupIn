@@ -223,6 +223,10 @@ final class AppState {
     let motionService: MotionActivityServicing
     let uwbSessionService: UWBSessionServicing
     let deadReckoningService: DeadReckoningServicing
+    /// Router that picks the best seeking channel (UWB → Wi-Fi Aware
+    /// → BLE) per peer based on shared capability bits, and forwards
+    /// ranging samples upward under one stable stream.
+    let seekingRouter: SeekingRouter
     /// Payload-tier transport — carries chat + event-log gossip + (Phase 4)
     /// capability and anchor messages. BLE remains the signal tier
     /// (presence heartbeat, join handshake, wake-on-proximity); anything
@@ -239,7 +243,10 @@ final class AppState {
     private var lastLocationPublishAt: Date?
     private static let publishInterval: TimeInterval = 10
     private var bleConsumerTask: Task<Void, Never>?
-    private var bleRSSITask: Task<Void, Never>?
+    /// Consumer of the seeking router's unified ranging stream.
+    /// Replaces the old per-channel `bleRSSITask` and
+    /// `uwbReadingsTask` — every channel's samples now arrive here.
+    private var seekingRouterTask: Task<Void, Never>?
     private var headingTask: Task<Void, Never>?
     private var motionTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
@@ -252,8 +259,9 @@ final class AppState {
 
     /// Most recent UWB reading per peer. The compass view reads this to
     /// override its GPS/RSSI bearing when a fresh reading is present.
+    /// Populated by `handleRangingSample` whenever the seeking router
+    /// forwards a UWB or Wi-Fi Aware sample with distance/direction.
     private(set) var uwbReadings: [UUID: UWBReading] = [:]
-    private var uwbReadingsTask: Task<Void, Never>?
 
     /// Rolling buffer of chat messages applied for the active group,
     /// populated from the unified event log (`.chatMessage` events).
@@ -278,6 +286,12 @@ final class AppState {
     private(set) var transportDiagnostics: TransportDiagnostics =
         TransportDiagnostics.inactive
     private var transportDiagnosticsTask: Task<Void, Never>?
+
+    /// Live seeking-router diagnostics — which channel is currently
+    /// engaged (UWB / Wi-Fi Aware / BLE) and per-peer sample counts.
+    /// Surfaces the `ch:` chip in the indoor compass strip.
+    private(set) var seekingDiagnostics: SeekingDiagnostics = .empty
+    private var seekingDiagnosticsTask: Task<Void, Never>?
     private var iCloudAccountChangeTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var bleJoinRequestTask: Task<Void, Never>?
@@ -391,6 +405,17 @@ final class AppState {
         self.uwbSessionService = uwbSessionService ?? UWBSessionService()
         self.deadReckoningService = deadReckoningService
             ?? DeadReckoningService(defaults: defaults)
+
+        // Seeking router wires the three channels together. UWB and
+        // BLE adapt around their existing services; Wi-Fi Aware is a
+        // stub until the framework lands. Capability-driven selection
+        // picks the highest tier supported by both sides per peer.
+        self.seekingRouter = SeekingRouter(
+            uwb: UWBSeekingChannel(uwbService: self.uwbSessionService),
+            wifiAware: WiFiAwareRangingChannel(),
+            ble: BLERangingChannel(bleService: self.blePresenceService)
+        )
+        self.seekingRouter.setLocalCapability(Self.localTransportCapability())
 
         self.membershipByGroupID = Self.loadMembershipMap(defaults: defaults)
         self.eventCursors = Self.loadEventCursors(defaults: defaults)
@@ -707,18 +732,17 @@ final class AppState {
     /// a peer session against the target's stored token, publishes our
     /// fresh token to CloudKit so the target's app can reciprocate.
     func startUWBTracking(targetMemberID: UUID) {
+        // Engage the seeking router — it picks the best channel (UWB
+        // when both sides support it + are foregrounded, else
+        // Wi-Fi Aware ranging, else BLE active RSSI polling) and
+        // forwards samples through the unified `rangingUpdates`
+        // stream consumed by `seekingRouterTask`. UWB token plumbing
+        // below stays even on non-UWB devices because peers may yet
+        // upgrade and the router will re-pick once capability flips.
+        seekingRouter.engage(targetMemberID: targetMemberID)
+
         guard uwbSessionService.isSupported else { return }
         uwbSessionService.start()
-
-        // Start consuming readings; idempotent.
-        if uwbReadingsTask == nil {
-            uwbReadingsTask = Task { [weak self] in
-                guard let self else { return }
-                for await reading in self.uwbSessionService.readings {
-                    self.uwbReadings[reading.memberID] = reading
-                }
-            }
-        }
 
         // Publish the fresh token so the peer can fetch it on their next
         // refresh / push and start a session targeting us.
@@ -749,9 +773,8 @@ final class AppState {
     /// Called when the compass view dismisses. Tears down UWB sessions
     /// and clears local readings so a re-open starts fresh.
     func stopUWBTracking() {
+        seekingRouter.stop()
         uwbSessionService.stop()
-        uwbReadingsTask?.cancel()
-        uwbReadingsTask = nil
         uwbReadings.removeAll()
         // Clear our published token. Peers fetching after this point
         // get a stale-token failure rather than a phantom session.
@@ -1468,19 +1491,36 @@ final class AppState {
             }
         }
 
-        if bleRSSITask == nil {
-            bleRSSITask = Task { [weak self] in
+        if seekingRouterTask == nil {
+            seekingRouterTask = Task { [weak self] in
                 guard let self else { return }
-                for await reading in self.blePresenceService.rssiUpdates {
-                    self.compassEngine.recordRSSI(
-                        reading.rssi,
-                        for: reading.memberID
-                    )
+                for await sample in self.seekingRouter.rangingUpdates {
+                    self.handleRangingSample(sample)
                 }
             }
         }
 
         startPayloadTransport(for: group)
+    }
+
+    /// Dispatch a ranging sample from the seeking router into the
+    /// right downstream consumer. RSSI samples feed the compass
+    /// engine's gradient regression; UWB samples land in
+    /// `uwbReadings` so the compass dial's UWB-first cascade picks
+    /// them up. Wi-Fi Aware samples (when wired) carry both fields
+    /// and fan out to both consumers.
+    private func handleRangingSample(_ sample: RangingSample) {
+        if let rssi = sample.rssi {
+            compassEngine.recordRSSI(rssi, for: sample.memberID)
+        }
+        if sample.distance != nil || sample.direction != nil {
+            uwbReadings[sample.memberID] = UWBReading(
+                memberID: sample.memberID,
+                distance: sample.distance,
+                direction: sample.direction,
+                timestamp: sample.timestamp
+            )
+        }
     }
 
     /// Bring up the payload transport for `group` and start consuming
@@ -1643,6 +1683,9 @@ final class AppState {
     }
 
     func stopBLEPresence() {
+        seekingRouter.stop()
+        seekingRouterTask?.cancel()
+        seekingRouterTask = nil
         blePresenceService.stop()
         stopPayloadTransport()
     }
@@ -1658,6 +1701,14 @@ final class AppState {
                 guard let self else { return }
                 for await diag in self.blePresenceService.diagnostics {
                     self.bleDiagnostics = diag
+                }
+            }
+        }
+        if seekingDiagnosticsTask == nil {
+            seekingDiagnosticsTask = Task { [weak self] in
+                guard let self else { return }
+                for await diag in self.seekingRouter.diagnostics {
+                    self.seekingDiagnostics = diag
                 }
             }
         }
@@ -1720,9 +1771,17 @@ final class AppState {
     /// broadcasting in PeerPresence. The group-min across all
     /// members' snapshots picks the active transport.
     private static func localTransportCapability() -> TransportCapability {
-        TransportCapability(
-            wifiAware: WiFiAwareService.deviceSupportsWiFiAware(),
-            multipeer: true
+        let wa = WiFiAwareService.deviceSupportsWiFiAware()
+        return TransportCapability(
+            wifiAware: wa,
+            multipeer: true,
+            uwb: UWBSessionService.deviceSupportsUWB(),
+            // Wi-Fi Aware ranging rides on the same framework + entitlement
+            // as the payload transport — same gate today. The seeking
+            // router will treat them independently when (later) the
+            // entitlement story diverges.
+            wifiAwareRanging: wa,
+            bleRanging: true
         )
     }
 
@@ -1751,6 +1810,12 @@ final class AppState {
         if peerCapabilities[peer.memberID] != advertised {
             peerCapabilities[peer.memberID] = advertised
             recomputeGroupTransport()
+            // Seeking router picks per-peer channel based on shared
+            // capability bits; feed every new peer-capability decode
+            // so handoff can happen the moment a better tier is
+            // unlocked (e.g., peer foregrounds and UWB becomes
+            // available).
+            seekingRouter.setPeerCapability(advertised, for: peer.memberID)
         }
 
         // Fresh signal from a peer means the staleness window resets —

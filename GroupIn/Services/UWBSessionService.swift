@@ -59,6 +59,13 @@ final class UWBSessionService: NSObject, UWBSessionServicing {
     private(set) var localTokenData: Data?
 
     var isSupported: Bool {
+        Self.deviceSupportsUWB()
+    }
+
+    /// Static probe of UWB hardware. Mirrors `WiFiAwareService
+    /// .deviceSupportsWiFiAware()` so capability building doesn't have
+    /// to instantiate a session just to read the support bit.
+    nonisolated static func deviceSupportsUWB() -> Bool {
         NISession.deviceCapabilities.supportsPreciseDistanceMeasurement
     }
 

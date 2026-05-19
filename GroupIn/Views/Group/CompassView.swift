@@ -333,6 +333,14 @@ struct CompassView: View {
         }()
         let posCount = appState.compassEngine.positionSampleCount
         let spread = appState.compassEngine.positionSpreadMetres
+        let channelLabel: String = {
+            switch appState.seekingDiagnostics.activeChannel {
+            case .uwb: return "uwb"
+            case .wifiAwareRanging: return "wa"
+            case .bleRanging: return "ble"
+            case .none: return "—"
+            }
+        }()
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 diagnosticChip(label: "seen", value: "\(diag.discoveredPeripheralCount)")
@@ -342,6 +350,7 @@ struct CompassView: View {
                 diagnosticChip(label: "rssi", value: "\(rssiCount)·\(ageString)")
             }
             HStack(spacing: 8) {
+                diagnosticChip(label: "ch", value: channelLabel)
                 diagnosticChip(label: "pos", value: "\(posCount)")
                 diagnosticChip(label: "spread", value: String(format: "%.1fm", spread))
             }
