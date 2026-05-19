@@ -70,6 +70,16 @@ struct PeerPresence: Codable, Equatable {
     /// that.
     let transportCapability: TransportCapability?
 
+    /// NSKeyedArchiver-encoded `NIDiscoveryToken` for the sender's
+    /// local NISession. Required for UWB precision finding to
+    /// establish in offline mode — without it, a peer can't call
+    /// `NISession.run(NINearbyPeerConfiguration(peerToken:))` against
+    /// the other side. Previously this only flowed via CloudKit's
+    /// User record, so with CloudKit off UWB could never engage and
+    /// the indoor compass stayed pinned to BLE. Optional for
+    /// backwards-compat. Nil when the device has no UWB hardware.
+    let nearbyToken: Data?
+
     init(groupHash: UInt32,
          memberID: UUID,
          displayName: String? = nil,
@@ -81,7 +91,8 @@ struct PeerPresence: Codable, Equatable {
          positionSource: String? = nil,
          positionAnchorAt: Date? = nil,
          eventCursor: EventCursor? = nil,
-         transportCapability: TransportCapability? = nil) {
+         transportCapability: TransportCapability? = nil,
+         nearbyToken: Data? = nil) {
         self.groupHash = groupHash
         self.memberID = memberID
         self.displayName = displayName
@@ -95,6 +106,7 @@ struct PeerPresence: Codable, Equatable {
         self.eventCursorCreatedAt = eventCursor?.createdAt
         self.eventCursorID = eventCursor?.id
         self.transportCapability = transportCapability
+        self.nearbyToken = nearbyToken
     }
 
     /// Materialized event cursor, or nil if either field is missing.
@@ -121,6 +133,7 @@ struct PeerPresence: Codable, Equatable {
         self.eventCursorCreatedAt = try? c.decode(Date.self, forKey: .eventCursorCreatedAt)
         self.eventCursorID = try? c.decode(UUID.self, forKey: .eventCursorID)
         self.transportCapability = try? c.decode(TransportCapability.self, forKey: .transportCapability)
+        self.nearbyToken = try? c.decode(Data.self, forKey: .nearbyToken)
     }
 
     func encoded() -> Data? {

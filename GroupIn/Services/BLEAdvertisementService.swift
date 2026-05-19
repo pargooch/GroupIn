@@ -50,6 +50,12 @@ protocol BLEPresenceServicing: AnyObject {
     /// and decides whether to call `respondToJoinRequest`.
     var incomingJoinRequests: AsyncStream<JoinRequest> { get }
 
+    /// Incoming `SeekingSignal`s — a nearby central wrote one to
+    /// our `seekingSignal` characteristic to say they're actively
+    /// trying to find us. AppState consumes these to ramp our
+    /// presence broadcast cadence while the signal is unexpired.
+    var incomingSeekingSignals: AsyncStream<SeekingSignal> { get }
+
     /// Stream of diagnostics about the BLE pipe.
     var diagnostics: AsyncStream<BLEDiagnostics> { get }
 
@@ -91,6 +97,13 @@ protocol BLEPresenceServicing: AnyObject {
 
     /// Stop the polling Task for a member. Idempotent.
     func stopActiveRSSIPolling(for memberID: UUID)
+
+    /// Write a `SeekingSignal` to the peer's
+    /// `seekingSignal` characteristic. Caller is responsible for
+    /// refreshing on a cadence so the signal doesn't expire mid-
+    /// session — `expiresAt` should be a few seconds in the future.
+    /// Idempotent in the sense that an extra write is harmless.
+    func sendSeekingSignal(_ signal: SeekingSignal, to memberID: UUID)
 }
 
 struct BLEDiagnostics: Sendable, Equatable {
@@ -146,6 +159,12 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// in-range centrals don't pick up someone else's join answer.
     static let joinResponseCharacteristicUUID = CBUUID(string: "A5B7E1C5-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
 
+    /// Seekers write a `SeekingSignal` here to tell us they're
+    /// actively trying to find us. We use the freshness to ramp our
+    /// presence broadcast cadence (default GPS-tick rate → 10 Hz
+    /// for 10 s → 2 Hz for 20 s → back to default).
+    static let seekingSignalCharacteristicUUID = CBUUID(string: "A5B7E1C6-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
+
     /// iBeacon UUID for region monitoring. Different from the BLE service
     /// UUID because iBeacon advertisements use a manufacturer-data format
     /// while BLE service advertisements use the service-UUID list — iOS
@@ -170,11 +189,13 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     let rssiUpdates: AsyncStream<RSSIReading>
     let joinResponses: AsyncStream<JoinResponse>
     let incomingJoinRequests: AsyncStream<JoinRequest>
+    let incomingSeekingSignals: AsyncStream<SeekingSignal>
     let diagnostics: AsyncStream<BLEDiagnostics>
     private nonisolated let peerContinuation: AsyncStream<PeerPresence>.Continuation
     private nonisolated let rssiContinuation: AsyncStream<RSSIReading>.Continuation
     private nonisolated let joinResponseContinuation: AsyncStream<JoinResponse>.Continuation
     private nonisolated let incomingJoinRequestContinuation: AsyncStream<JoinRequest>.Continuation
+    private nonisolated let incomingSeekingSignalContinuation: AsyncStream<SeekingSignal>.Continuation
     private nonisolated let diagnosticsContinuation: AsyncStream<BLEDiagnostics>.Continuation
 
     private var currentDiagnostics = BLEDiagnostics(
@@ -191,6 +212,7 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private var presenceCharacteristic: CBMutableCharacteristic?
     private var joinRequestCharacteristic: CBMutableCharacteristic?
     private var joinResponseCharacteristic: CBMutableCharacteristic?
+    private var seekingSignalCharacteristic: CBMutableCharacteristic?
 
     /// Recent JoinResponses we've emitted, kept so we can replay them
     /// to centrals that subscribe AFTER we already responded.
@@ -295,16 +317,19 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         let (rssiStream, rssiCont) = AsyncStream.makeStream(of: RSSIReading.self)
         let (joinStream, joinCont) = AsyncStream.makeStream(of: JoinResponse.self)
         let (joinReqStream, joinReqCont) = AsyncStream.makeStream(of: JoinRequest.self)
+        let (seekStream, seekCont) = AsyncStream.makeStream(of: SeekingSignal.self)
         let (diagStream, diagCont) = AsyncStream.makeStream(of: BLEDiagnostics.self)
         self.peerUpdates = peerStream
         self.rssiUpdates = rssiStream
         self.joinResponses = joinStream
         self.incomingJoinRequests = joinReqStream
+        self.incomingSeekingSignals = seekStream
         self.diagnostics = diagStream
         self.peerContinuation = peerCont
         self.rssiContinuation = rssiCont
         self.joinResponseContinuation = joinCont
         self.incomingJoinRequestContinuation = joinReqCont
+        self.incomingSeekingSignalContinuation = seekCont
         self.diagnosticsContinuation = diagCont
         super.init()
         // State restoration on both managers. When iOS wakes the app
@@ -605,12 +630,22 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             value: nil,
             permissions: [.readable]
         )
+        // Seekers write a SeekingSignal here to tell us we're being
+        // actively tracked. Write-only — no need to read or notify
+        // since the sender knows what they sent.
+        let seekChar = CBMutableCharacteristic(
+            type: Self.seekingSignalCharacteristicUUID,
+            properties: [.write],
+            value: nil,
+            permissions: [.writeable]
+        )
         let svc = CBMutableService(type: Self.serviceUUID, primary: true)
-        svc.characteristics = [presence, joinReqChar, joinRespChar]
+        svc.characteristics = [presence, joinReqChar, joinRespChar, seekChar]
         peripheralManager.add(svc)
         presenceCharacteristic = presence
         joinRequestCharacteristic = joinReqChar
         joinResponseCharacteristic = joinRespChar
+        seekingSignalCharacteristic = seekChar
         advertisedService = svc
         serviceAdded = true
     }
@@ -873,6 +908,32 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
     /// `didDiscoverCharacteristicsFor` is best-effort — if it returns
     /// nil or the decode fails, no retry happens by default and RSSI
     /// samples for that peer are silently dropped forever.
+    // MARK: - Seeking signal (central writes to sought peer's GATT)
+
+    func sendSeekingSignal(_ signal: SeekingSignal, to memberID: UUID) {
+        guard let data = signal.encoded() else { return }
+        // Look up the connected peripheral mapped to this member ID.
+        // If we don't have a live connection yet (still discovering),
+        // the next mergeBLEPeer + connect cycle will trigger another
+        // write from the caller's refresh timer — this is best-effort.
+        guard let peripheralID = peripheralToMember.first(where: {
+            $0.value == memberID
+        })?.key,
+              let peripheral = connectedPeers[peripheralID],
+              let service = peripheral.services?.first(where: {
+                  $0.uuid == Self.serviceUUID
+              }),
+              let char = service.characteristics?.first(where: {
+                  $0.uuid == Self.seekingSignalCharacteristicUUID
+              })
+        else { return }
+        // .withResponse so we know if the peer is actually reachable;
+        // failures show up in `peripheral(_:didWriteValueFor:error:)`
+        // but the caller's refresh loop covers transient failures by
+        // re-writing every few seconds.
+        peripheral.writeValue(data, for: char, type: .withResponse)
+    }
+
     // MARK: - Active RSSI polling
 
     func startActiveRSSIPolling(for memberID: UUID) {
@@ -1000,7 +1061,8 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                 peripheral.discoverCharacteristics(
                     [Self.presenceCharacteristicUUID,
                      Self.joinRequestCharacteristicUUID,
-                     Self.joinResponseCharacteristicUUID],
+                     Self.joinResponseCharacteristicUUID,
+                     Self.seekingSignalCharacteristicUUID],
                     for: service
                 )
             }
@@ -1248,11 +1310,19 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
         // recommends for write batches.
         Task { @MainActor [weak self] in
             guard let self else { return }
-            for request in requests
-            where request.characteristic.uuid == Self.joinRequestCharacteristicUUID {
-                if let data = request.value,
-                   let joinRequest = JoinRequest.decoded(from: data) {
-                    self.incomingJoinRequestContinuation.yield(joinRequest)
+            for request in requests {
+                guard let data = request.value else { continue }
+                switch request.characteristic.uuid {
+                case Self.joinRequestCharacteristicUUID:
+                    if let joinRequest = JoinRequest.decoded(from: data) {
+                        self.incomingJoinRequestContinuation.yield(joinRequest)
+                    }
+                case Self.seekingSignalCharacteristicUUID:
+                    if let signal = SeekingSignal.decoded(from: data) {
+                        self.incomingSeekingSignalContinuation.yield(signal)
+                    }
+                default:
+                    break
                 }
             }
             if let first = requests.first {

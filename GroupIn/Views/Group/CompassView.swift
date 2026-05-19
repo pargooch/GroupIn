@@ -128,11 +128,19 @@ struct CompassView: View {
         .onAppear {
             appState.startBLEPresence()
             appState.startUWBTracking(targetMemberID: memberID)
+            // Tell the peer we're actively trying to find them — they
+            // ramp up presence broadcasts (10 Hz for 10 s, then 2 Hz)
+            // so the compass dial tracks their movement smoothly
+            // instead of GPS-fix cadence.
+            appState.startActiveSeeking(targetMemberID: memberID)
             // First reading should speak immediately rather than wait
             // out the throttle window.
             VoiceGuidance.shared.resetCompassThrottle()
         }
-        .onDisappear { appState.stopUWBTracking() }
+        .onDisappear {
+            appState.stopActiveSeeking()
+            appState.stopUWBTracking()
+        }
         .task(id: memberID) { await runHapticLoop() }
     }
 

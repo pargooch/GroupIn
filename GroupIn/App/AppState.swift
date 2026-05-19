@@ -295,6 +295,38 @@ final class AppState {
     private var seekingDiagnosticsTask: Task<Void, Never>?
     private var iCloudAccountChangeTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
+
+    // MARK: - Seeking signal cadence ramp
+    //
+    // Two tasks. As seeker (compass open against a peer):
+    //   • `seekingSignalRefreshTask` writes a SeekingSignal to that
+    //     peer's GATT every ~5 s while the compass is up. The signal
+    //     carries an `expiresAt` ~7 s in the future, so a single
+    //     dropped write doesn't immediately stop the cadence ramp.
+    // As sought (someone wrote a signal to us):
+    //   • `incomingSeekingSignalsTask` consumes those writes from
+    //     BLEAdvertisementService.
+    //   • `presenceRampTask` re-broadcasts our PeerPresence at a
+    //     ramped cadence (10 Hz for 10 s, then 2 Hz for 20 s) while
+    //     any seeker's signal is still unexpired, then exits and
+    //     hands control back to the regular 20 s heartbeat.
+
+    /// Peer we're actively writing seeking signals to, or nil when
+    /// no compass is open.
+    private var activelySeekingMember: UUID?
+    private var seekingSignalRefreshTask: Task<Void, Never>?
+    private var incomingSeekingSignalsTask: Task<Void, Never>?
+    private var presenceRampTask: Task<Void, Never>?
+    /// Latest expiresAt across all received seeking signals. The
+    /// ramp keeps running as long as this is in the future.
+    private var soughtUntil: Date = .distantPast
+
+    private static let seekingSignalRefreshInterval: TimeInterval = 5
+    private static let seekingSignalLifetime: TimeInterval = 7
+    private static let presenceFastRampDuration: TimeInterval = 10
+    private static let presenceFastRampInterval: TimeInterval = 0.1   // 10 Hz
+    private static let presenceSlowRampDuration: TimeInterval = 20
+    private static let presenceSlowRampInterval: TimeInterval = 0.5   // 2 Hz
     private var bleJoinRequestTask: Task<Void, Never>?
     private var deadReckoningTask: Task<Void, Never>?
     private var compassStepTask: Task<Void, Never>?
@@ -771,9 +803,103 @@ final class AppState {
         }
     }
 
+    // MARK: - Active seeking signal (seeker side)
+
+    /// Begin writing a SeekingSignal to the target peer's GATT every
+    /// few seconds. The peer uses the signal's `expiresAt` to ramp
+    /// their presence broadcast cadence — typically 10 Hz for ten
+    /// seconds, then 2 Hz for twenty, then back to the default GPS-
+    /// fix-driven schedule. The seeker's compass dial then has
+    /// near-realtime tracking of the peer's location for the duration
+    /// of active seeking, without making every member broadcast at
+    /// high frequency forever.
+    func startActiveSeeking(targetMemberID: UUID) {
+        stopActiveSeeking()
+        activelySeekingMember = targetMemberID
+        seekingSignalRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.writeSeekingSignal(to: targetMemberID)
+                try? await Task.sleep(
+                    for: .seconds(Self.seekingSignalRefreshInterval)
+                )
+            }
+        }
+    }
+
+    func stopActiveSeeking() {
+        seekingSignalRefreshTask?.cancel()
+        seekingSignalRefreshTask = nil
+        activelySeekingMember = nil
+    }
+
+    // MARK: - Active seeking signal (sought side — cadence ramp)
+
+    /// Apply an incoming SeekingSignal from a nearby seeker. Extends
+    /// `soughtUntil` if the signal's `expiresAt` is later than what
+    /// we already had, then starts the presence ramp task if it
+    /// isn't running. The task drives `broadcastBLEPresence()` at a
+    /// fast cadence (10 Hz) for ten seconds, then a moderate cadence
+    /// (2 Hz) for twenty more, then exits — letting the regular
+    /// heartbeat take over again.
+    private func handleIncomingSeekingSignal(_ signal: SeekingSignal) {
+        let now = Date()
+        guard signal.expiresAt > now else { return }
+        if signal.expiresAt > soughtUntil {
+            soughtUntil = signal.expiresAt
+        }
+        startPresenceRampIfNeeded()
+    }
+
+    private func startPresenceRampIfNeeded() {
+        guard presenceRampTask == nil else { return }
+        let startedAt = Date()
+        presenceRampTask = Task { @MainActor [weak self] in
+            defer { Task { @MainActor [weak self] in
+                self?.presenceRampTask = nil
+            } }
+            guard let self else { return }
+            // Phase 1: 10 Hz for `presenceFastRampDuration` (or until
+            // we're no longer being sought, whichever comes first).
+            let phase1End = startedAt.addingTimeInterval(Self.presenceFastRampDuration)
+            while !Task.isCancelled,
+                  Date() < phase1End,
+                  Date() < self.soughtUntil {
+                self.broadcastBLEPresence()
+                try? await Task.sleep(
+                    for: .seconds(Self.presenceFastRampInterval)
+                )
+            }
+            // Phase 2: 2 Hz for `presenceSlowRampDuration`.
+            let phase2End = Date().addingTimeInterval(Self.presenceSlowRampDuration)
+            while !Task.isCancelled,
+                  Date() < phase2End,
+                  Date() < self.soughtUntil {
+                self.broadcastBLEPresence()
+                try? await Task.sleep(
+                    for: .seconds(Self.presenceSlowRampInterval)
+                )
+            }
+            // Phase 3: done — let the heartbeat take over. If a fresh
+            // signal extended `soughtUntil` while we were in phase 2,
+            // the next signal handler will start a new ramp.
+        }
+    }
+
+    private func writeSeekingSignal(to memberID: UUID) {
+        guard let group = currentGroup else { return }
+        let me = membershipByGroupID[group.id] ?? currentUser.id
+        let signal = SeekingSignal(
+            requesterMemberID: me,
+            expiresAt: Date().addingTimeInterval(Self.seekingSignalLifetime)
+        )
+        blePresenceService.sendSeekingSignal(signal, to: memberID)
+    }
+
     /// Called when the compass view dismisses. Tears down UWB sessions
     /// and clears local readings so a re-open starts fresh.
     func stopUWBTracking() {
+        stopActiveSeeking()
         seekingRouter.stop()
         uwbSessionService.stop()
         uwbReadings.removeAll()
@@ -1477,6 +1603,19 @@ final class AppState {
     /// and join handshake.
     func startBLEPresence() {
         guard let group = currentGroup else { return }
+
+        // Bring up the local NISession as soon as BLE presence
+        // starts so the local NIDiscoveryToken is available to
+        // include in every PeerPresence broadcast. Without this,
+        // `makeLocalPresence` populates `nearbyToken` as nil, the
+        // peer's `mergeBLEPeer` can't call
+        // `uwbSessionService.track(memberID:tokenData:)`, and UWB
+        // sessions never establish — which is why indoor was stuck
+        // on `ch: ble` even when both sides have U1 chips.
+        // `start()` is idempotent and no-ops on devices without
+        // UWB hardware.
+        uwbSessionService.start()
+
         let presence = makeLocalPresence(for: group)
         blePresenceService.start(
             groupHash: presence.groupHash,
@@ -1488,6 +1627,15 @@ final class AppState {
                 guard let self else { return }
                 for await peer in self.blePresenceService.peerUpdates {
                     self.mergeBLEPeer(peer)
+                }
+            }
+        }
+
+        if incomingSeekingSignalsTask == nil {
+            incomingSeekingSignalsTask = Task { [weak self] in
+                guard let self else { return }
+                for await signal in self.blePresenceService.incomingSeekingSignals {
+                    self.handleIncomingSeekingSignal(signal)
                 }
             }
         }
@@ -1698,6 +1846,11 @@ final class AppState {
         seekingRouter.stop()
         seekingRouterTask?.cancel()
         seekingRouterTask = nil
+        incomingSeekingSignalsTask?.cancel()
+        incomingSeekingSignalsTask = nil
+        presenceRampTask?.cancel()
+        presenceRampTask = nil
+        stopActiveSeeking()
         blePresenceService.stop()
         stopPayloadTransport()
     }
@@ -1782,7 +1935,14 @@ final class AppState {
             positionSource: currentUser.positionSource?.rawValue,
             positionAnchorAt: currentUser.positionAnchorAt,
             eventCursor: eventCursors[group.id],
-            transportCapability: Self.localTransportCapability()
+            transportCapability: Self.localTransportCapability(),
+            // UWB discovery token. Without this travelling over BLE
+            // presence, UWB sessions can't establish offline — the
+            // peer has no way to call `NISession.run` against us. The
+            // token is opaque (NSKeyedArchiver-encoded
+            // NIDiscoveryToken) and ~100 bytes, fits comfortably in
+            // the BLE GATT MTU. Nil on devices without UWB hardware.
+            nearbyToken: uwbSessionService.localTokenData
         )
     }
 
@@ -1904,13 +2064,20 @@ final class AppState {
             group.members[idx].positionAnchorAt = peer.positionAnchorAt
             group.members[idx].eventCursorCreatedAt = peer.eventCursorCreatedAt
             group.members[idx].eventCursorID = peer.eventCursorID
+            // Apply nearbyToken updates — UWB session establishment
+            // depends on having the peer's token. As soon as we
+            // receive it, immediately call `track(memberID:tokenData:)`
+            // so the NISession runs against this peer. The seeking
+            // router has already engaged UWB if the capability bits
+            // match; the missing piece was the token.
+            applyNearbyToken(peer.nearbyToken, for: peer.memberID, into: &group.members[idx])
         } else {
             // Stub a member entry. Use the peer's broadcast display
             // name if present; fall back to a placeholder only if the
             // peer's still on an older build that didn't include the
             // field. The `memberJoined` event later upgrades or
             // confirms via the standard ingest path.
-            let stub = User(
+            var stub = User(
                 id: peer.memberID,
                 displayName: peer.displayName ?? "Member",
                 avatarData: nil,
@@ -1928,6 +2095,7 @@ final class AppState {
                 positionSourcePeerID: nil,
                 eventCursor: peer.eventCursor
             )
+            applyNearbyToken(peer.nearbyToken, for: peer.memberID, into: &stub)
             group.members.append(stub)
         }
 
@@ -1937,6 +2105,22 @@ final class AppState {
         // Cursor update may have caught a peer up to one of our
         // outgoing events — promote the delivery status if so.
         reevaluateDeliveryStatus(for: group.id)
+    }
+
+    /// Apply a freshly-received UWB discovery token to the member
+    /// record and immediately open / refresh the NISession against
+    /// the peer. The seeking router has already engaged UWB as a
+    /// concurrent channel (provided both capability bits match), but
+    /// without the peer's NIDiscoveryToken the session can't
+    /// establish — `track(memberID:tokenData:)` is the second half
+    /// of the handshake that CloudKit used to provide. With CloudKit
+    /// off, tokens flow over BLE presence; this is the apply path.
+    private func applyNearbyToken(_ token: Data?,
+                                  for memberID: UUID,
+                                  into member: inout User) {
+        guard let token, member.nearbyToken != token else { return }
+        member.nearbyToken = token
+        uwbSessionService.track(memberID: memberID, tokenData: token)
     }
 
     /// Throttled CloudKit publish: at most once every `publishInterval`
@@ -2849,6 +3033,21 @@ final class AppState {
 
     private func refreshCurrentGroup() async {
         guard let active = currentGroup else { return }
+
+        // Offline-only mode: LocalGroupService is not an authoritative
+        // member registry — it only stores groups the local device
+        // created or joined, with whatever member snapshots
+        // dispatchGroupSave/publish happened to write. The actual
+        // current members on each device are discovered through BLE
+        // presence + event-log gossip and live in `currentGroup`
+        // in-memory. Running the merge logic below against
+        // LocalGroupService's snapshot causes the "member disappears
+        // and reappears every 60s" flicker: on every refresh tick
+        // the indexing-delay safety net drops any in-memory member
+        // whose `lastSeen` has aged past 60s because LocalGroupService
+        // never had them. Skip the whole thing in offline mode.
+        guard groupService.supportsRemoteJoin else { return }
+
         do {
             guard var updated = try await groupService.fetchGroup(groupID: active.id) else {
                 // Two interpretations of `nil`:

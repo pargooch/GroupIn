@@ -233,21 +233,22 @@ final class JoinGroupViewModel {
         )
         appState.emit(event)
 
-        // Pop back to Home rather than auto-navigating to the
-        // dashboard. The previous flow mounted the dashboard in the
-        // same tick as `currentGroup` was set + `addOrUpdate`
-        // persisted + the emit pipeline ran — that burst of state
-        // mutations triggered a SwiftUI List diff bug that crashed
-        // the app on the joiner side. Popping to Home lets the user
-        // see the freshly-joined group in their list and tap to
-        // enter when state has settled — the dashboard mount then
-        // happens against fully-stable data with no concurrent
-        // mutations.
-        appState.path.removeAll()
-
         // Joined — clear the cached joiner so a future trip to this
         // screen mints a fresh identity.
         sessionJoiner = nil
+
+        // Defer the navigation pop to a separate runloop tick. The
+        // burst of @Observable mutations above (membership,
+        // currentUser, currentGroup, addOrUpdate, emit, dispatchGroupSave)
+        // all fire in one synchronous tick — letting SwiftUI fully
+        // settle the resulting render before we yank the navigation
+        // stack out from under JoinGroupView removes a class of
+        // ordering hazards (onDisappear cancelling a still-finishing
+        // task, view-tree diff against half-mutated state, etc).
+        Task { @MainActor in
+            await Task.yield()
+            appState.path.removeAll()
+        }
     }
 
     // MARK: - Timeout primitive
