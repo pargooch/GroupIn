@@ -28,9 +28,19 @@ struct CompassEngine {
     private var positions: [PositionSample] = []
     private var rssis: [UUID: [RSSISample]] = [:]
 
+    /// Running synthetic position used by `recordStep`. Indoor mode
+    /// can't rely on GPS or DR coordinates moving — we project a
+    /// fake lat/lon forward by each step's heading × stride and
+    /// store that into `positions`. Seeded from the most recent
+    /// real position on first call, otherwise starts at (0, 0)
+    /// which is fine since the regression only cares about relative
+    /// offsets.
+    private var syntheticAnchorLat: Double?
+    private var syntheticAnchorLon: Double?
+
     private let window: TimeInterval = 30
-    private let minPairs: Int = 5
-    private let minMovementMetres: Double = 2
+    private let minPairs: Int = 3
+    private let minMovementMetres: Double = 1
 
     /// Hampel-lite outlier rejection: when a raw RSSI sample differs
     /// from the running median by more than this many dB *and* arrives
@@ -46,6 +56,44 @@ struct CompassEngine {
     mutating func recordPosition(latitude: Double, longitude: Double) {
         let now = Date()
         positions.append(PositionSample(time: now, lat: latitude, lon: longitude))
+        // A real position resets the synthetic anchor so the next step
+        // projects from current ground truth rather than the prior
+        // synthetic ghost coordinate.
+        syntheticAnchorLat = latitude
+        syntheticAnchorLon = longitude
+        prune(now: now)
+    }
+
+    /// Append a synthetic position offset, computed from a step event.
+    /// Indoor mode lives off this path: GPS doesn't fire indoors and
+    /// DR refuses to project displacement without a GPS anchor, so
+    /// the only way to get position spread for the gradient is to
+    /// integrate steps × heading ourselves.
+    /// - Parameters:
+    ///   - headingDegrees: bearing clockwise from true north (CLHeading
+    ///     `trueHeading` convention). 0 = north, 90 = east.
+    ///   - stepLengthMetres: total displacement for this event. For a
+    ///     pedometer batch of `n` steps with stride `s`, pass
+    ///     `Double(n) * s`.
+    mutating func recordStep(headingDegrees: Double, stepLengthMetres: Double) {
+        guard stepLengthMetres > 0 else { return }
+        let now = Date()
+        let baseLat = syntheticAnchorLat ?? positions.last?.lat ?? 0
+        let baseLon = syntheticAnchorLon ?? positions.last?.lon ?? 0
+
+        let headingRad = headingDegrees * .pi / 180
+        let north = stepLengthMetres * cos(headingRad)
+        let east = stepLengthMetres * sin(headingRad)
+
+        let metresPerDegLat = 111_000.0
+        let metresPerDegLon = 111_000.0 * cos(baseLat * .pi / 180)
+        let newLat = baseLat + north / metresPerDegLat
+        let newLon = baseLon + east / max(metresPerDegLon, 1)
+
+        syntheticAnchorLat = newLat
+        syntheticAnchorLon = newLon
+
+        positions.append(PositionSample(time: now, lat: newLat, lon: newLon))
         prune(now: now)
     }
 
@@ -102,6 +150,35 @@ struct CompassEngine {
     /// Most recent RSSI for a peer, or nil if we have no fresh sample.
     func latestRSSI(for memberID: UUID) -> Double? {
         rssis[memberID]?.last?.rssi
+    }
+
+    /// Number of position samples currently in the rolling window.
+    /// Exposed for the indoor diagnostic strip: positions == 0 while
+    /// RSSI samples flood in means the regression has nothing to
+    /// anchor against and bearing will always be nil.
+    var positionSampleCount: Int { positions.count }
+
+    /// Spread of the position window in metres along the dominant axis.
+    /// Zero when fewer than two positions exist or when all positions
+    /// sit on the same point. The regression needs spread ≥
+    /// `minMovementMetres` to fit a direction.
+    var positionSpreadMetres: Double {
+        guard positions.count >= 2 else { return 0 }
+        let metresPerDegLat = 111_000.0
+        let refLat = positions.last?.lat ?? 0
+        let metresPerDegLon = 111_000.0 * cos(refLat * .pi / 180)
+        let xs = positions.map { $0.lon * metresPerDegLon }
+        let ys = positions.map { $0.lat * metresPerDegLat }
+        let xRange = (xs.max() ?? 0) - (xs.min() ?? 0)
+        let yRange = (ys.max() ?? 0) - (ys.min() ?? 0)
+        return sqrt(xRange * xRange + yRange * yRange)
+    }
+
+    /// Count of RSSI samples we hold for a specific peer in the rolling
+    /// window. Distinct from the BLE service's session-total counter —
+    /// this one is what the regression actually fits against.
+    func rssiSampleCount(for memberID: UUID) -> Int {
+        rssis[memberID]?.count ?? 0
     }
 
     /// Linear-regression gradient toward the peer.

@@ -11,16 +11,18 @@
 //  dashboard to your bundle ID so a leaked IPA can't burn your quota.
 //
 
-import Foundation
+import SwiftUI
 
 enum MapTilerConfig {
     /// MapTiler API key. Get one at https://maptiler.com/cloud/.
     /// Lock it to the GroupIn bundle ID in the MapTiler dashboard.
     static let apiKey: String = "byBBed0Bu0KkVlxOcMVg"
 
-    /// Custom MapTiler style ID (the UUID from the style editor URL).
-    /// Swap this when forking the style for design tweaks.
-    static let styleID: String = "019e1c8e-17f0-7b17-a0ea-80ae1819162d"
+    /// Custom MapTiler style IDs (the UUIDs from the style editor URL),
+    /// one per appearance. Swap these when forking the styles for
+    /// design tweaks.
+    static let lightStyleID: String = "019e1c8e-17f0-7b17-a0ea-80ae1819162d"
+    static let darkStyleID: String = "019e282a-364f-7c20-91d9-08d843064870"
 
     /// True once `apiKey` is non-empty. Callers decide whether to
     /// install the MapLibre map or fall back to a placeholder.
@@ -28,9 +30,12 @@ enum MapTilerConfig {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// Fully-qualified style.json URL that MapLibre loads at init.
-    static var styleURL: URL? {
+    /// Fully-qualified style.json URL for the given appearance — the
+    /// map view loads this at init and re-loads it when the system
+    /// switches between light and dark mode.
+    static func styleURL(for colorScheme: ColorScheme) -> URL? {
         guard isConfigured else { return nil }
-        return URL(string: "https://api.maptiler.com/maps/\(styleID)/style.json?key=\(apiKey)")
+        let id = colorScheme == .dark ? darkStyleID : lightStyleID
+        return URL(string: "https://api.maptiler.com/maps/\(id)/style.json?key=\(apiKey)")
     }
 }

@@ -10,6 +10,7 @@ import UIKit
 
 struct GroupDashboardView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.colorScheme) private var colorScheme
     @State private var viewModel: GroupDashboardViewModel
     @State private var didCopyInviteCode = false
     @State private var showsLocationHelp = false
@@ -25,6 +26,9 @@ struct GroupDashboardView: View {
     /// Bumped by the scope button to tell `MapLibreMapView` to re-fit
     /// every member into view. Counter-based so repeated taps work.
     @State private var fitAllTrigger: Int = 0
+    /// Detent of the Find My–style dashboard drawer over the map.
+    /// Opens at half height.
+    @State private var sheetDetent: PresentationDetent = .fraction(0.5)
     /// Last seen member-ID set, so we can fire a success haptic AND
     /// a VoiceOver announcement only when someone *new* joins (not
     /// when someone leaves), and name them in the announcement.
@@ -41,6 +45,16 @@ struct GroupDashboardView: View {
         content
             .toolbar { dashboardToolbar }
             .modifier(DashboardModifiers(viewModel: viewModel))
+    }
+
+    /// Presentation surfaces (sheets, full-screen cover, alerts) live
+    /// on the drawer rather than the root view: the drawer is always
+    /// the topmost presented view, so anything presented from the root
+    /// would otherwise be trapped behind it.
+    private func dashboardPresentations<Content: View>(
+        _ content: Content
+    ) -> some View {
+        content
             .sheet(isPresented: $showsLocationHelp) {
                 LocationHelpSheet()
                     .presentationDetents([.medium, .large])
@@ -134,66 +148,99 @@ struct GroupDashboardView: View {
         }
     }
 
-    /// Find My–style split: the neon map is pinned to the top half of
-    /// the screen, and everything else scrolls in the bottom half.
+    /// Find My–style layout: the neon map fills the whole screen and
+    /// the dashboard rides in a draggable drawer on top of it. The
+    /// drawer opens at half height; drag down to reveal the full map,
+    /// up for the full dashboard.
     @ViewBuilder
     private func groupList(group: GroupSession) -> some View {
-        VStack(spacing: 0) {
-            mapPane(group: group)
-                .frame(height: UIScreen.main.bounds.height * 0.5)
-                .clipped()
-            dashboardList(group: group)
+        mapPane(group: group)
+            .ignoresSafeArea()
+            .sheet(isPresented: .constant(true)) {
+                dashboardList(group: group)
+                    .presentationDetents(
+                        [.height(120), .fraction(0.5), .large],
+                        selection: $sheetDetent
+                    )
+                    .presentationBackgroundInteraction(
+                        .enabled(upThrough: .fraction(0.5))
+                    )
+                    .presentationDragIndicator(.visible)
+                    .presentationBackground(
+                        Color(uiColor: .systemBackground).opacity(0.4)
+                    )
+                    .interactiveDismissDisabled()
+            }
+    }
+
+    /// Non-scrolling header at the top of the drawer. Because it isn't
+    /// part of the scrollable List, the sheet can be dragged between
+    /// detents by grabbing anywhere on it — a far bigger target than
+    /// the thin drag indicator alone.
+    @ViewBuilder
+    private func drawerHeader(group: GroupSession) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(group.name)
+                .font(.title3.weight(.semibold))
+            Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        .ignoresSafeArea(edges: .top)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
+        .padding(.top, 26)
+        .padding(.bottom, 18)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(group.name), \(group.members.count) members")
     }
 
     @ViewBuilder
     private func dashboardList(group: GroupSession) -> some View {
-        List {
-            membersSection(group: group)
-            groupSection(group: group)
-            if viewModel.isOwner {
-                bannedSection(group: group)
+        dashboardPresentations(
+            VStack(spacing: 0) {
+                drawerHeader(group: group)
+
+                List {
+                    membersSection(group: group)
+                    groupSection(group: group)
+                    if viewModel.isOwner {
+                        bannedSection(group: group)
+                    }
+                    leaveGroupSection(group: group)
+                }
+                .scrollContentBackground(.hidden)
+            .onAppear {
+                lastMemberIDs = Set(group.members.map(\.id))
+                lastShouldPromptExtend = viewModel.shouldPromptOwnerToExtend
             }
-            leaveGroupSection(group: group)
-        }
-        .onAppear {
-            lastMemberIDs = Set(group.members.map(\.id))
-            lastShouldPromptExtend = viewModel.shouldPromptOwnerToExtend
-        }
-        .onChange(of: group.members.map(\.id)) { _, newIDs in
-            let newSet = Set(newIDs)
-            let added = newSet.subtracting(lastMemberIDs)
-            if !lastMemberIDs.isEmpty, !added.isEmpty {
-                HapticEngine.shared.notify(.success)
-                let names = added
-                    .compactMap { id in group.members.first(where: { $0.id == id })?.displayName }
-                    .joined(separator: ", ")
-                let phrase = added.count == 1
-                    ? "\(names) joined the group"
-                    : "\(names) joined the group"
-                VoiceGuidance.shared.announce(phrase)
+            .onChange(of: group.members.map(\.id)) { _, newIDs in
+                let newSet = Set(newIDs)
+                let added = newSet.subtracting(lastMemberIDs)
+                if !lastMemberIDs.isEmpty, !added.isEmpty {
+                    HapticEngine.shared.notify(.success)
+                    let names = added
+                        .compactMap { id in group.members.first(where: { $0.id == id })?.displayName }
+                        .joined(separator: ", ")
+                    let phrase = added.count == 1
+                        ? "\(names) joined the group"
+                        : "\(names) joined the group"
+                    VoiceGuidance.shared.announce(phrase)
+                }
+                lastMemberIDs = newSet
             }
-            lastMemberIDs = newSet
-        }
-        .onChange(of: viewModel.shouldPromptOwnerToExtend) { _, newValue in
-            if newValue, !lastShouldPromptExtend {
-                HapticEngine.shared.notify(.warning)
-                VoiceGuidance.shared.announce(
-                    "Group expires soon. You can extend it from the Group section.",
-                    priority: .high
-                )
+            .onChange(of: viewModel.shouldPromptOwnerToExtend) { _, newValue in
+                if newValue, !lastShouldPromptExtend {
+                    HapticEngine.shared.notify(.warning)
+                    VoiceGuidance.shared.announce(
+                        "Group expires soon. You can extend it from the Group section.",
+                        priority: .high
+                    )
+                }
+                lastShouldPromptExtend = newValue
             }
-            lastShouldPromptExtend = newValue
-        }
-        // Pull-to-refresh — forces a CloudKit fetch on demand so the
-        // user doesn't have to wait for the 10s polling tick or a
-        // silent-push delivery. Especially useful when CloudKit
-        // subscriptions are delayed (which they often are on first
-        // launch after a schema change).
-        .refreshable {
-            await appState.refreshCurrentGroupManually()
-        }
+            }
+        )
     }
 
     @ViewBuilder
@@ -231,6 +278,7 @@ struct GroupDashboardView: View {
             }
             .padding(.vertical, 6)
             .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
         } header: {
             Text("Group")
         }
@@ -327,7 +375,8 @@ struct GroupDashboardView: View {
                     currentMemberID: appState.currentUser.id,
                     now: context.date,
                     focusedMemberID: $routeTargetID,
-                    fitAllTrigger: $fitAllTrigger
+                    fitAllTrigger: $fitAllTrigger,
+                    colorScheme: colorScheme
                 )
             }
             fitAllButton
@@ -542,6 +591,7 @@ struct GroupDashboardView: View {
                 }
                 .accessibilityHint("Removes you from this group and stops sharing your location with its members")
             }
+            .listRowBackground(Color.clear)
         }
     }
 
@@ -562,6 +612,7 @@ struct GroupDashboardView: View {
                 Text("Banned members can't rejoin with the invite code. Tap Unban to let them back in.")
                     .font(.caption)
             }
+            .listRowBackground(Color.clear)
         }
     }
 
@@ -719,9 +770,9 @@ struct GroupDashboardView: View {
             showsChat = true
         } label: {
             Image(systemName: "bubble.left.and.bubble.right.fill")
-                .font(.subheadline.weight(.semibold))
+                .font(.body.weight(.semibold))
                 .foregroundStyle(.white)
-                .frame(width: 38, height: 38)
+                .frame(width: 46, height: 46)
                 .background(Color.accentColor, in: Circle())
                 .overlay(alignment: .topTrailing) {
                     if !appState.chatMessages.isEmpty {
@@ -872,7 +923,7 @@ struct GroupDashboardView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .background(
-            Color(uiColor: .secondarySystemBackground),
+            Color(uiColor: .systemBackground).opacity(0.4),
             in: RoundedRectangle(cornerRadius: 18, style: .continuous)
         )
         .overlay(

@@ -49,6 +49,19 @@ nonisolated struct TransportDiagnostics: Sendable, Equatable {
     var isActive: Bool
     var selection: TransportSelection?
 
+    /// Observability for the discovery layer (MPC browser / Wi-Fi
+    /// Aware subscriber). `discoveredPeerCount` counts every peer
+    /// we've seen advertising on the same service type — the count
+    /// staying at 0 while `isBrowsing == true` usually means Local
+    /// Network permission was denied. `invitedPeerCount` counts how
+    /// many of those we've sent session invitations to, useful for
+    /// telling "discovery works but invitations stall" apart from
+    /// "discovery itself never finds anyone".
+    var isBrowsing: Bool = false
+    var isAdvertising: Bool = false
+    var discoveredPeerCount: Int = 0
+    var invitedPeerCount: Int = 0
+
     static let inactive = TransportDiagnostics(
         connectedPeers: 0,
         isActive: false,

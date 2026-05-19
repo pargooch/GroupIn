@@ -80,7 +80,7 @@ final class HapticEngine {
     ///   degrees (0 = perfectly on-bearing). The caller is expected
     ///   to debounce so we're not invoked every frame.
     func compassAligned(bearingErrorDegrees: Double) {
-        guard isEnabled, supportsHaptics, let engine else { return }
+        guard isEnabled, supportsHaptics, engine != nil else { return }
         let clamped = max(0, min(30, bearingErrorDegrees))
         // Map 0..30° error → 1.0..0.2 intensity.
         let intensity = Float(1.0 - (clamped / 30.0) * 0.8)
@@ -101,7 +101,7 @@ final class HapticEngine {
     /// engine self-throttles so it can't fire more than once per
     /// minInterval (computed from distance).
     func proximityPulse(distanceMeters: Double) {
-        guard isEnabled, supportsHaptics, let engine else { return }
+        guard isEnabled, supportsHaptics, engine != nil else { return }
         let cadence = proximityCadence(distance: distanceMeters)
         let now = Date()
         if now.timeIntervalSince(lastProximityFire) < cadence.interval { return }

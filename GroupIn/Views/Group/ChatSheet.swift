@@ -31,6 +31,7 @@ struct ChatSheet: View {
         NavigationStack {
             VStack(spacing: 0) {
                 diagnosticBanner
+                transportDiagnosticStrip
                 if timeline.isEmpty {
                     emptyState
                 } else {
@@ -128,6 +129,53 @@ struct ChatSheet: View {
         .padding(.horizontal)
         .padding(.vertical, 8)
         .background(info.tint.opacity(0.08))
+    }
+
+    /// Live read-out of the payload transport stages — exposes the
+    /// difference between "no one nearby", "discovered but invitation
+    /// stalled", and "session up but no data". Without this strip, the
+    /// "No nearby members yet" banner conflates four distinct failure
+    /// modes into one message.
+    ///   browsing/advertising — service started successfully?
+    ///   seen — peers discovered on the same service type
+    ///   invited — peers we've sent an MPC invitation to
+    ///   connected — peers in a live session
+    /// `seen == 0` while browsing is a strong hint that the Local
+    /// Network permission was denied (Settings → Privacy → Local Network).
+    private var transportDiagnosticStrip: some View {
+        let diag = appState.transportDiagnostics
+        let transportName = diag.selection.map(transportLabel) ?? "—"
+        return HStack(spacing: 8) {
+            chip(label: "via", value: transportName)
+            chip(label: "br", value: diag.isBrowsing ? "on" : "off")
+            chip(label: "adv", value: diag.isAdvertising ? "on" : "off")
+            chip(label: "seen", value: "\(diag.discoveredPeerCount)")
+            chip(label: "inv", value: "\(diag.invitedPeerCount)")
+            chip(label: "live", value: "\(diag.connectedPeers)")
+            Spacer()
+        }
+        .font(.caption2.monospaced())
+        .foregroundStyle(.secondary)
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .background(Color(uiColor: .secondarySystemBackground))
+    }
+
+    private func transportLabel(_ selection: TransportSelection) -> String {
+        switch selection {
+        case .multipeer: return "MPC"
+        case .wifiAware: return "WA"
+        }
+    }
+
+    private func chip(label: String, value: String) -> some View {
+        HStack(spacing: 3) {
+            Text(label).foregroundStyle(.tertiary)
+            Text(value).foregroundStyle(.primary)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(.ultraThinMaterial, in: Capsule())
     }
 
     // MARK: - Empty state

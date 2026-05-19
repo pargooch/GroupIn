@@ -1,7 +1,7 @@
 {
   "images" : [
     {
-      "filename" : "Icon-white neon (1).png",
+      "filename" : "Iconlight1.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -13,7 +13,7 @@
           "value" : "dark"
         }
       ],
-      "filename" : "dimond .png",
+      "filename" : "Icondark.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"

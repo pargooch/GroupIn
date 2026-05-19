@@ -31,11 +31,14 @@ struct MapLibreMapView: UIViewRepresentable {
     let now: Date
     @Binding var focusedMemberID: UUID?
     @Binding var fitAllTrigger: Int
+    let colorScheme: ColorScheme
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeUIView(context: Context) -> MLNMapView {
-        let map = MLNMapView(frame: .zero, styleURL: MapTilerConfig.styleURL)
+        let map = MLNMapView(frame: .zero,
+                             styleURL: MapTilerConfig.styleURL(for: colorScheme))
+        context.coordinator.lastColorScheme = colorScheme
         map.delegate = context.coordinator
         map.logoView.isHidden = true
         map.attributionButton.tintColor = UIColor.white.withAlphaComponent(0.35)
@@ -75,6 +78,7 @@ struct MapLibreMapView: UIViewRepresentable {
     func updateUIView(_ map: MLNMapView, context: Context) {
         let coordinator = context.coordinator
         coordinator.parent = self
+        coordinator.applyColorSchemeIfNeeded(on: map, colorScheme: colorScheme)
         coordinator.syncAnnotations(on: map)
         coordinator.syncFocusedRoute(on: map)
         coordinator.handleFitAllIfNeeded(on: map, trigger: fitAllTrigger)
@@ -90,9 +94,28 @@ struct MapLibreMapView: UIViewRepresentable {
         private var lastFitTrigger: Int = -1
         private var hasFitInitial = false
         private weak var mapRef: MLNMapView?
+        /// Last appearance applied to the map — set in `makeUIView` and
+        /// compared on every update so we only reload the style when
+        /// the user actually flips light/dark mode.
+        var lastColorScheme: ColorScheme?
 
         init(_ parent: MapLibreMapView) {
             self.parent = parent
+        }
+
+        // MARK: Light / dark style
+
+        func applyColorSchemeIfNeeded(on map: MLNMapView,
+                                      colorScheme: ColorScheme) {
+            guard lastColorScheme != colorScheme else { return }
+            lastColorScheme = colorScheme
+            guard let url = MapTilerConfig.styleURL(for: colorScheme) else { return }
+            // Reloading the style drops custom style layers (the neon
+            // route line). Clear our reference so `didFinishLoading`
+            // rebuilds it against the freshly-loaded style. Annotations
+            // (member pins) are map-managed and survive the reload.
+            routeLayer = nil
+            map.styleURL = url
         }
 
         // MARK: Annotation diffing
@@ -256,7 +279,8 @@ struct MapLibreMapView: UIViewRepresentable {
 
             map.setVisibleCoordinateBounds(bounds,
                                            edgePadding: insets,
-                                           animated: animated)
+                                           animated: animated,
+                                           completionHandler: nil)
         }
 
         /// Diagonal of the bounding box in meters. Used as a rough

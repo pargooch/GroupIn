@@ -218,23 +218,21 @@ struct HomeView: View {
     private var createJoinSection: some View {
         Section {
             Button {
-                appState.path.append(.createGroup)
+                appState.path.append(needsProfileSetup ? .profileEditor : .createGroup)
             } label: {
                 Label("Create a Group", systemImage: "plus.circle.fill")
             }
-            .disabled(needsProfileSetup)
             .accessibilityHint(needsProfileSetup
-                               ? "Set up your profile first to create a group"
+                               ? "Opens profile setup first"
                                : "Starts a new group you can invite others to")
 
             Button {
-                appState.path.append(.joinGroup)
+                appState.path.append(needsProfileSetup ? .profileEditor : .joinGroup)
             } label: {
                 Label("Join a Group", systemImage: "person.badge.plus")
             }
-            .disabled(needsProfileSetup)
             .accessibilityHint(needsProfileSetup
-                               ? "Set up your profile first to join a group"
+                               ? "Opens profile setup first"
                                : "Join an existing group with an invite code")
         } footer: {
             if needsProfileSetup {

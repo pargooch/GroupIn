@@ -22,6 +22,7 @@
 import Foundation
 import CoreBluetooth
 import CoreLocation
+import UIKit
 
 /// One RSSI sample for a known peer. Emitted on every BLE scan callback
 /// for peripherals we've already mapped to a member ID via a prior GATT
@@ -83,6 +84,27 @@ struct BLEDiagnostics: Sendable, Equatable {
     /// has reported the real state. Driven down to false the moment
     /// either manager sees `.poweredOff` / `.unauthorized` / `.unsupported`.
     var bluetoothReady: Bool = true
+
+    /// Central-side observability — populated as we scan, connect, and
+    /// map peripherals to member IDs. The UI uses these to tell the
+    /// user which stage of the pipeline is stuck when RSSI samples
+    /// never arrive ("seen but not connected", "connected but not
+    /// mapped", etc).
+    var discoveredPeripheralCount: Int = 0
+    var connectedPeripheralCount: Int = 0
+    /// Connected peripherals that completed GATT service+characteristic
+    /// discovery. The gap between `connectedPeripheralCount` and this
+    /// field is "connected but discovery stalled" — typically a stale
+    /// GATT cache or a link that came up before encryption finished.
+    var servicesDiscoveredCount: Int = 0
+    var mappedMemberCount: Int = 0
+    /// Total RSSI samples yielded per memberID since the service last
+    /// started. Reset on `stop()`. Useful for confirming that scan
+    /// callbacks are still arriving for a known peer.
+    var rssiSampleCountByMember: [UUID: Int] = [:]
+    /// Most recent RSSI sample timestamp per memberID. Lets the UI
+    /// show "last sample 0.4s ago" without exposing the full buffer.
+    var lastRSSITimestampByMember: [UUID: Date] = [:]
 }
 
 @MainActor
@@ -168,8 +190,18 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
 
     /// Toggles the peripheral's advertised packet between Phase-1 GATT
     /// discovery (service UUID) and Phase-3 region wake (iBeacon).
+    /// Only runs while the app is backgrounded — foreground sessions
+    /// advertise service-UUID continuously so the seeker side isn't
+    /// blacked out for 4-second iBeacon windows.
     private var advertisingTask: Task<Void, Never>?
     private static let advertiseToggleInterval: TimeInterval = 4
+
+    /// Whether the host app is currently in the foreground. Drives the
+    /// advertise-mode choice: service-UUID continuously while foreground,
+    /// alternating with iBeacon while background. Maintained by the
+    /// `UIApplication.didBecomeActive` / `willResignActive` observers
+    /// hooked in `init`.
+    private var isForeground: Bool = true
 
     /// Peripherals we've called `connect()` on but haven't yet seen
     /// `didConnect`. Stored as a dict (not a Set of IDs) so we hold a
@@ -187,6 +219,33 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// we've successfully read a peer's presence characteristic, which
     /// tells us who they are. Lets us tag subsequent RSSI scan callbacks.
     private var peripheralToMember: [UUID: UUID] = [:]
+
+    /// Every CBPeripheral identifier we've ever seen via a scan callback
+    /// this session. Distinct from `connectedPeers` (subset that
+    /// completed a GATT connect) and `peripheralToMember` (subset whose
+    /// presence packet decoded). The three counts together tell us
+    /// which stage of the pipeline is failing.
+    private var discoveredPeripherals: Set<UUID> = []
+
+    /// Wall-clock time at which each peripheral connected. Used by
+    /// `retryPresenceReadIfStuck` to give up after a grace window and
+    /// re-read the presence characteristic — handles the case where
+    /// the first read returned empty or the decode failed.
+    private var connectTimestamps: [UUID: Date] = [:]
+    private var presenceRetryTask: Task<Void, Never>?
+    private static let presenceReadRetryDelay: TimeInterval = 3
+
+    /// Peripherals whose service discovery has completed at least once
+    /// in this session. Surfaces the gap between "GATT connected" and
+    /// "characteristics ready" in the diagnostic strip — the most
+    /// common silent failure between conn and map.
+    private var servicesDiscoveredFor: Set<UUID> = []
+
+    /// Last time we yielded a diagnostics snapshot driven by an RSSI
+    /// sample. RSSI callbacks fire many times per second; without this
+    /// throttle the diagnostics stream would dominate the run loop.
+    private var lastRSSIDiagnosticsEmit: Date = .distantPast
+    private static let rssiDiagnosticsMinInterval: TimeInterval = 0.5
 
     // MARK: - Init
 
@@ -228,6 +287,48 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
                     Self.peripheralRestoreIdentifier
             ]
         )
+
+        // Seed foreground state from UIApplication and listen for
+        // transitions. The advertise loop checks this flag to decide
+        // whether to alternate with iBeacon (background) or stay on
+        // service-UUID continuously (foreground).
+        self.isForeground = UIApplication.shared.applicationState == .active
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleForegroundChange(true)
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleForegroundChange(false)
+            }
+        }
+    }
+
+    /// Re-pick the advertising strategy when the app's foreground
+    /// state flips. Foreground: continuous service-UUID. Background:
+    /// alternate with iBeacon so region monitoring on the peer can
+    /// wake their suspended app.
+    private func handleForegroundChange(_ foreground: Bool) {
+        guard isForeground != foreground else { return }
+        isForeground = foreground
+        guard peripheralManager.state == .poweredOn,
+              activeGroupHash != nil else { return }
+        // Restart the advertising loop in the new mode. Cancelling the
+        // old task and starting fresh is cheap and avoids edge cases
+        // where the toggle could end up on the wrong phase.
+        advertisingTask?.cancel()
+        advertisingTask = nil
+        peripheralManager.stopAdvertising()
+        beginAdvertisingIfReady()
     }
 
     /// Push a fresh snapshot of the diagnostics stream.
@@ -291,6 +392,12 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         connectedPeers.removeAll()
         connectingPeers.removeAll()
         peripheralToMember.removeAll()
+        connectTimestamps.removeAll()
+        presenceRetryTask?.cancel()
+        presenceRetryTask = nil
+        discoveredPeripherals.removeAll()
+        servicesDiscoveredFor.removeAll()
+        lastRSSIDiagnosticsEmit = .distantPast
         activeGroupHash = nil
         localMemberID = nil
         currentDiagnostics = BLEDiagnostics(
@@ -341,7 +448,26 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         guard peripheralManager.state == .poweredOn,
               activeGroupHash != nil else { return }
         if !serviceAdded { setupService() }
-        startAlternatingAdvertisement()
+        if isForeground {
+            // Foreground: stay on service-UUID continuously so a
+            // searching central can find us at any moment. Indoor
+            // mode is unusable otherwise — the 4-second iBeacon
+            // windows make both phones mutually invisible ~75% of
+            // the time and starve the gradient regression of RSSI.
+            startContinuousServiceAdvertisement()
+        } else {
+            // Background: alternate so suspended peers' region
+            // monitors can detect the iBeacon and wake their app
+            // to a foreground BLE state.
+            startAlternatingAdvertisement()
+        }
+    }
+
+    private func startContinuousServiceAdvertisement() {
+        advertisingTask?.cancel()
+        advertisingTask = nil
+        peripheralManager.stopAdvertising()
+        advertiseAsService()
     }
 
     /// Toggle the peripheral between the Phase-1 service-UUID packet and
@@ -524,6 +650,12 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         let id = peripheral.identifier
         connectingPeers.removeValue(forKey: id)
         connectedPeers.removeValue(forKey: id)
+        connectTimestamps.removeValue(forKey: id)
+        if servicesDiscoveredFor.remove(id) != nil {
+            currentDiagnostics.servicesDiscoveredCount = servicesDiscoveredFor.count
+        }
+        currentDiagnostics.connectedPeripheralCount = connectedPeers.count
+        emitDiagnostics()
         // Don't remove the peripheral→member mapping here; we want to
         // keep emitting RSSI for that member if their iBeacon advert is
         // still detectable while we wait for a fresh GATT reconnect.
@@ -542,6 +674,8 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             // pointless link open.
             centralManager.cancelPeripheralConnection(peripheral)
             peripheralToMember.removeValue(forKey: peripheral.identifier)
+            currentDiagnostics.mappedMemberCount = peripheralToMember.count
+            emitDiagnostics()
             return
         }
         // In discovery mode, we keep the connection alive but don't
@@ -552,6 +686,8 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         // Now that we know which member this peripheral is, tag future
         // scan callbacks with their member ID for the RSSI stream.
         peripheralToMember[peripheral.identifier] = presence.memberID
+        currentDiagnostics.mappedMemberCount = peripheralToMember.count
+        emitDiagnostics()
         peerContinuation.yield(presence)
     }
 
@@ -609,15 +745,34 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
         let rssiValue = RSSI.doubleValue
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Track every distinct peripheral we ever see — the
+            // diagnostic strip uses this so the user can tell apart
+            // "haven't seen them at all" from "seen but can't connect".
+            let inserted = self.discoveredPeripherals.insert(peripheral.identifier).inserted
+            if inserted {
+                self.currentDiagnostics.discoveredPeripheralCount =
+                    self.discoveredPeripherals.count
+                self.emitDiagnostics()
+            }
             // Emit an RSSI sample if we already know which member this
             // peripheral belongs to. The compass uses these for gradient
             // bearing computation when GPS isn't viable.
             if let memberID = self.peripheralToMember[peripheral.identifier] {
+                let now = Date()
                 self.rssiContinuation.yield(RSSIReading(
                     memberID: memberID,
                     rssi: rssiValue,
-                    timestamp: .now
+                    timestamp: now
                 ))
+                self.currentDiagnostics.rssiSampleCountByMember[memberID, default: 0] += 1
+                self.currentDiagnostics.lastRSSITimestampByMember[memberID] = now
+                // Throttle: RSSI scan callbacks fire many times/sec, but
+                // the UI only needs an update every half-second.
+                if now.timeIntervalSince(self.lastRSSIDiagnosticsEmit)
+                    >= Self.rssiDiagnosticsMinInterval {
+                    self.lastRSSIDiagnosticsEmit = now
+                    self.emitDiagnostics()
+                }
             }
             self.considerConnect(to: peripheral)
         }
@@ -630,7 +785,66 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
             let id = peripheral.identifier
             self.connectingPeers.removeValue(forKey: id)
             self.connectedPeers[id] = peripheral
+            self.connectTimestamps[id] = Date()
+            self.currentDiagnostics.connectedPeripheralCount = self.connectedPeers.count
+            self.emitDiagnostics()
             peripheral.discoverServices([Self.serviceUUID])
+            self.schedulePresenceReadRetry()
+        }
+    }
+
+    /// Periodically inspect connected peripherals. Any one that's been
+    /// connected for more than `presenceReadRetryDelay` without ending
+    /// up in `peripheralToMember` gets a fresh `readValue` against its
+    /// presence characteristic. The initial read in
+    /// `didDiscoverCharacteristicsFor` is best-effort — if it returns
+    /// nil or the decode fails, no retry happens by default and RSSI
+    /// samples for that peer are silently dropped forever.
+    private func schedulePresenceReadRetry() {
+        if presenceRetryTask != nil { return }
+        presenceRetryTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self else { break }
+                self.retryPresenceReadIfStuck()
+                if self.connectedPeers.isEmpty { break }
+            }
+            self?.presenceRetryTask = nil
+        }
+    }
+
+    private func retryPresenceReadIfStuck() {
+        let now = Date()
+        for (id, peripheral) in connectedPeers {
+            guard peripheralToMember[id] == nil else { continue }
+            guard let since = connectTimestamps[id],
+                  now.timeIntervalSince(since) >= Self.presenceReadRetryDelay
+            else { continue }
+            // Reset the timestamp so we only retry once per window.
+            connectTimestamps[id] = now
+
+            // Two possible failure modes, both recoverable:
+            //
+            // 1. Service discovery never completed (didDiscoverServices
+            //    silently stalled — happens with stale GATT cache, or
+            //    when the link was up before encryption finished).
+            //    Symptom: peripheral.services is nil/empty.
+            //    Recovery: re-issue discoverServices.
+            //
+            // 2. Discovery completed but the initial read returned no
+            //    data or decode failed. Symptom: we have the
+            //    characteristic but no member mapping.
+            //    Recovery: re-issue readValue.
+            let service = peripheral.services?.first { $0.uuid == Self.serviceUUID }
+            let char = service?.characteristics?.first {
+                $0.uuid == Self.presenceCharacteristicUUID
+            }
+            if let char {
+                peripheral.readValue(for: char)
+            } else {
+                peripheral.delegate = self
+                peripheral.discoverServices([Self.serviceUUID])
+            }
         }
     }
 
@@ -659,7 +873,16 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
 
     nonisolated func peripheral(_ peripheral: CBPeripheral,
                                 didDiscoverServices error: Error?) {
-        Task { @MainActor in
+        let id = peripheral.identifier
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if error == nil {
+                if self.servicesDiscoveredFor.insert(id).inserted {
+                    self.currentDiagnostics.servicesDiscoveredCount =
+                        self.servicesDiscoveredFor.count
+                    self.emitDiagnostics()
+                }
+            }
             guard let services = peripheral.services else { return }
             for service in services where service.uuid == Self.serviceUUID {
                 // Discover BOTH characteristics. The previous single-
@@ -796,6 +1019,20 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
             if charUUID == Self.presenceCharacteristicUUID {
                 self.currentDiagnostics.presenceSubscribers += 1
                 self.emitDiagnostics()
+                // Push current presence right away so the subscriber
+                // doesn't need to issue a separate read. The central's
+                // initial read in `didDiscoverCharacteristicsFor` can
+                // race with the subscription on flaky links and miss
+                // its response — a fresh notify here guarantees the
+                // peer gets the presence packet at least once.
+                if let data = self.lastPresenceData,
+                   let char = self.presenceCharacteristic {
+                    self.peripheralManager.updateValue(
+                        data,
+                        for: char,
+                        onSubscribedCentrals: [central]
+                    )
+                }
             }
         }
     }
@@ -821,12 +1058,15 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
             guard let self else { return }
             switch charUUID {
             case Self.presenceCharacteristicUUID:
-                if let data = self.lastPresenceData {
-                    request.value = data
-                    peripheral.respond(to: request, withResult: .success)
-                } else {
-                    peripheral.respond(to: request, withResult: .attributeNotFound)
-                }
+                // Always respond with success — `attributeNotFound`
+                // leaves the central in a strange state where the
+                // characteristic exists but is "unreadable", and
+                // CoreBluetooth doesn't surface that cleanly to our
+                // delegate. An empty `Data()` decodes to nil presence
+                // on the central, which the retry watchdog handles
+                // by re-issuing the read once we have fresh data.
+                request.value = self.lastPresenceData ?? Data()
+                peripheral.respond(to: request, withResult: .success)
             default:
                 peripheral.respond(to: request, withResult: .attributeNotFound)
             }

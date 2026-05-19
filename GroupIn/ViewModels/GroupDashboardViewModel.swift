@@ -83,17 +83,12 @@ final class GroupDashboardViewModel {
     }
 
     func start() {
-        // Location is now driven by group membership (see AppState's
-        // currentGroup didSet) so it keeps flowing when the dashboard
-        // isn't visible. BLE and CloudKit polling stay tied to the
-        // dashboard since they're foreground-only by design.
         appState.startGroupRefresh()
         appState.startBLEPresence()
     }
 
     func stop() {
         appState.stopGroupRefresh()
-        appState.stopBLEPresence()
     }
 
     /// First time we have any member coordinates, frame all of them.

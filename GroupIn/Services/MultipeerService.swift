@@ -60,6 +60,18 @@ final class MultipeerService: NSObject, PayloadTransport {
     /// ID back to the MPC object.
     private var connectedByDisplayName: [String: MCPeerID] = [:]
 
+    /// Every MCPeerID display name we've seen via `foundPeer`, kept
+    /// for diagnostics. Separate from `connectedByDisplayName` —
+    /// "discovered" is a strict superset of "connected" and the gap
+    /// is the most useful signal for diagnosing Local Network
+    /// permission or invitation failures.
+    private var discoveredDisplayNames: Set<String> = []
+
+    /// Display names we've sent an MPC invitation to. The gap between
+    /// invited and connected is where invitation timeouts and
+    /// invitation refusals show up.
+    private var invitedDisplayNames: Set<String> = []
+
     private var currentDiagnostics = TransportDiagnostics(
         connectedPeers: 0,
         isActive: false,
@@ -121,7 +133,11 @@ final class MultipeerService: NSObject, PayloadTransport {
         currentDiagnostics = TransportDiagnostics(
             connectedPeers: 0,
             isActive: true,
-            selection: .multipeer
+            selection: .multipeer,
+            isBrowsing: true,
+            isAdvertising: true,
+            discoveredPeerCount: 0,
+            invitedPeerCount: 0
         )
         diagnosticsContinuation.yield(currentDiagnostics)
     }
@@ -141,6 +157,8 @@ final class MultipeerService: NSObject, PayloadTransport {
         localPeerID = nil
         activeRendezvousToken = nil
         connectedByDisplayName.removeAll()
+        discoveredDisplayNames.removeAll()
+        invitedDisplayNames.removeAll()
 
         currentDiagnostics = TransportDiagnostics(
             connectedPeers: 0,
@@ -172,6 +190,12 @@ final class MultipeerService: NSObject, PayloadTransport {
 
     private func updateConnectedCount() {
         currentDiagnostics.connectedPeers = connectedByDisplayName.count
+        diagnosticsContinuation.yield(currentDiagnostics)
+    }
+
+    private func updateDiscoveryCounts() {
+        currentDiagnostics.discoveredPeerCount = discoveredDisplayNames.count
+        currentDiagnostics.invitedPeerCount = invitedDisplayNames.count
         diagnosticsContinuation.yield(currentDiagnostics)
     }
 }
@@ -295,6 +319,7 @@ extension MultipeerService: MCNearbyServiceAdvertiserDelegate {
     ) {
         Task { @MainActor in
             self.currentDiagnostics.isActive = false
+            self.currentDiagnostics.isAdvertising = false
             self.diagnosticsContinuation.yield(self.currentDiagnostics)
         }
     }
@@ -310,7 +335,18 @@ extension MultipeerService: MCNearbyServiceBrowserDelegate {
         withDiscoveryInfo info: [String: String]?
     ) {
         let peerToken = info?[Self.discoveryKeyRendezvous]
+        let displayName = peerID.displayName
         Task { @MainActor in
+            // Count every peer that surfaces on our service type — the
+            // discovery layer is shared across all groups, so this can
+            // include peers we won't actually invite (different token).
+            // Still useful diagnostically: zero discoveries while
+            // browsing == true is a strong signal of a permission or
+            // service-type problem.
+            if self.discoveredDisplayNames.insert(displayName).inserted {
+                self.updateDiscoveryCounts()
+            }
+
             guard let token = self.activeRendezvousToken,
                   peerToken == token,
                   let session = self.session,
@@ -330,6 +366,9 @@ extension MultipeerService: MCNearbyServiceBrowserDelegate {
                 withContext: context,
                 timeout: 10
             )
+            if self.invitedDisplayNames.insert(displayName).inserted {
+                self.updateDiscoveryCounts()
+            }
         }
     }
 
@@ -349,6 +388,7 @@ extension MultipeerService: MCNearbyServiceBrowserDelegate {
     ) {
         Task { @MainActor in
             self.currentDiagnostics.isActive = false
+            self.currentDiagnostics.isBrowsing = false
             self.diagnosticsContinuation.yield(self.currentDiagnostics)
         }
     }

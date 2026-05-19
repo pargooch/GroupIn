@@ -39,6 +39,7 @@ struct CompassView: View {
     /// Tracks whether VoiceOver has already heard "Aligned with X"
     /// for this acquisition. Reset when alignment is lost.
     @State private var announcedAligned: Bool = false
+    @State private var seekerMode: SeekerMode = .auto
 
     /// Cyan-blue tone used for the orb ring + diamond gem. Fixed
     /// across all members — it's the "GroupIn brand" element of the
@@ -61,6 +62,13 @@ struct CompassView: View {
             VStack(spacing: 0) {
                 header(member: member, color: memberColor)
                     .padding(.top, 32)
+
+                if seekerMode == .indoor {
+                    indoorDiagnosticStrip(memberID: memberID)
+                        .padding(.horizontal, 24)
+                        .padding(.top, 8)
+                        .accessibilityHidden(true)
+                }
 
                 Spacer(minLength: 12)
 
@@ -118,6 +126,7 @@ struct CompassView: View {
                 .allowsHitTesting(false)
         }
         .onAppear {
+            appState.startBLEPresence()
             appState.startUWBTracking(targetMemberID: memberID)
             // First reading should speak immediately rather than wait
             // out the throttle window.
@@ -286,7 +295,70 @@ struct CompassView: View {
                 .foregroundStyle(.primary)
                 .shadow(color: color.opacity(colorScheme == .dark ? 0.4 : 0.0),
                         radius: 8)
+
+            Picker("Seeker mode", selection: $seekerMode) {
+                ForEach(SeekerMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 260)
         }
+    }
+
+    // MARK: - Indoor diagnostic strip
+
+    /// Live read-out of the BLE pipeline for the targeted member. Only
+    /// shown when the user explicitly picks `.indoor` — it's a
+    /// debugging aid, not part of the seeker UX. The four numbers map
+    /// directly to the four pipeline stages that must succeed for RSSI
+    /// samples to reach the compass:
+    ///   seen   — distinct peripherals discovered via scan
+    ///   conn   — GATT connections currently open
+    ///   map    — peripherals whose presence packet decoded (memberID
+    ///            mapped). Without this, RSSI samples are dropped.
+    ///   rssi   — samples received for *this* member, with age of the
+    ///            last sample.
+    @ViewBuilder
+    private func indoorDiagnosticStrip(memberID: UUID) -> some View {
+        let diag = appState.bleDiagnostics
+        let rssiCount = diag.rssiSampleCountByMember[memberID] ?? 0
+        let lastRSSI = diag.lastRSSITimestampByMember[memberID]
+        let ageString: String = {
+            guard let lastRSSI else { return "—" }
+            let age = Date().timeIntervalSince(lastRSSI)
+            if age < 1 { return "now" }
+            if age < 60 { return "\(Int(age))s" }
+            return "\(Int(age / 60))m"
+        }()
+        let posCount = appState.compassEngine.positionSampleCount
+        let spread = appState.compassEngine.positionSpreadMetres
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                diagnosticChip(label: "seen", value: "\(diag.discoveredPeripheralCount)")
+                diagnosticChip(label: "conn", value: "\(diag.connectedPeripheralCount)")
+                diagnosticChip(label: "svc", value: "\(diag.servicesDiscoveredCount)")
+                diagnosticChip(label: "map", value: "\(diag.mappedMemberCount)")
+                diagnosticChip(label: "rssi", value: "\(rssiCount)·\(ageString)")
+            }
+            HStack(spacing: 8) {
+                diagnosticChip(label: "pos", value: "\(posCount)")
+                diagnosticChip(label: "spread", value: String(format: "%.1fm", spread))
+            }
+        }
+        .font(.caption2.monospaced())
+        .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private func diagnosticChip(label: String, value: String) -> some View {
+        HStack(spacing: 3) {
+            Text(label).foregroundStyle(.tertiary)
+            Text(value).foregroundStyle(.primary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(.ultraThinMaterial, in: Capsule())
     }
 
     // MARK: - Compass dial
@@ -441,6 +513,22 @@ struct CompassView: View {
         case bluetooth   // RSSI gradient over our walking path; offline-capable
     }
 
+    private enum SeekerMode: String, CaseIterable, Identifiable {
+        case auto
+        case gps
+        case indoor
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .auto: return "Auto"
+            case .gps: return "GPS"
+            case .indoor: return "Indoor"
+            }
+        }
+    }
+
     private struct ArrowReading {
         let phoneFrameBearing: Double  // degrees clockwise; 0 = up on screen
         let distanceBand: String
@@ -453,17 +541,48 @@ struct CompassView: View {
         let confidence: Double         // 0–1; full opacity for GPS, R² for gradient
     }
 
+    private struct GPSQuality {
+        let hasCoordinate: Bool
+        let isFresh: Bool
+        let source: PositionSource
+        let accuracy: Double
+
+        var isReliableForCompass: Bool {
+            hasCoordinate
+                && isFresh
+                && source == .gps
+                && accuracy <= CompassView.maxReliableGPSAccuracy
+        }
+
+        var likelyIndoorOrUnreliable: Bool {
+            source != .gps || accuracy >= CompassView.likelyIndoorGPSAccuracy
+        }
+    }
+
+    private static let gpsFreshnessWindow: TimeInterval = 60
+    private static let maxReliableGPSAccuracy: Double = 35
+    private static let likelyIndoorGPSAccuracy: Double = 65
+
     private var currentMember: User? {
         appState.currentGroup?.members.first { $0.id == memberID }
+    }
+
+    private func gpsQuality(for user: User?, now: Date) -> GPSQuality {
+        let source = user?.positionSource ?? .gps
+        let accuracy = user?.accuracy ?? .infinity
+        let lastSeen = user?.lastSeen ?? .distantPast
+        return GPSQuality(
+            hasCoordinate: user?.coordinate != nil,
+            isFresh: now.timeIntervalSince(lastSeen) < Self.gpsFreshnessWindow,
+            source: source,
+            accuracy: accuracy
+        )
     }
 
     private func arrowReading() -> ArrowReading? {
         let myHeading = appState.currentUser.heading ?? 0
         let now = Date()
 
-        // Mode 0: UWB precision finding — centimeter accuracy and a
-        // direction vector that's already in device-frame, so we don't
-        // even need to subtract the phone's heading. Highest priority.
         if let uwb = appState.uwbReadings[memberID],
            let direction = uwb.direction,
            now.timeIntervalSince(uwb.timestamp) < 5 {
@@ -479,12 +598,14 @@ struct CompassView: View {
             )
         }
 
-        // Pre-compute a candidate GPS reading if both sides are fresh.
+        let myQuality = gpsQuality(for: appState.currentUser, now: now)
+        let theirQuality = gpsQuality(for: currentMember, now: now)
+
         var gpsCandidate: (worldBearing: Double, metres: Double)?
         if let myCoord = appState.currentUser.coordinate,
            let theirCoord = currentMember?.coordinate,
-           let lastSeen = currentMember?.lastSeen,
-           now.timeIntervalSince(lastSeen) < 60 {
+           myQuality.isFresh,
+           theirQuality.isFresh {
             let myCL = CLLocationCoordinate2D(
                 latitude: myCoord.latitude, longitude: myCoord.longitude
             )
@@ -497,29 +618,9 @@ struct CompassView: View {
             )
         }
 
-        // At close range (<30m), GPS noise (~5m) translates to large
-        // bearing error. If we have a confident RSSI gradient, prefer
-        // that — proximity-based signal beats GPS at short range.
-        if let gps = gpsCandidate, gps.metres < 30,
-           let gradient = appState.compassEngine.gradientBearing(toMember: memberID),
-           gradient.confidence > 0.3 {
-            let phoneFrame = (gradient.bearing - myHeading)
-                .truncatingRemainder(dividingBy: 360)
-            let band = appState.compassEngine.latestRSSI(for: memberID)
-                .map(CompassEngine.distanceBand(rssi:))
-                ?? CompassMath.distanceBand(metres: gps.metres)
-            return ArrowReading(
-                phoneFrameBearing: phoneFrame,
-                distanceBand: band,
-                metres: gps.metres,
-                isFresh: true,
-                mode: .bluetooth,
-                confidence: gradient.confidence
-            )
-        }
+        let gradient = appState.compassEngine.gradientBearing(toMember: memberID)
 
-        // Mode 1: position-based GPS bearing. Reliable from ~30m and up.
-        if let gps = gpsCandidate {
+        func gpsReading(_ gps: (worldBearing: Double, metres: Double)) -> ArrowReading {
             let phoneFrame = (gps.worldBearing - myHeading)
                 .truncatingRemainder(dividingBy: 360)
             return ArrowReading(
@@ -532,24 +633,57 @@ struct CompassView: View {
             )
         }
 
-        // Mode 2: gradient-only fallback when GPS isn't available at all.
-        if let gradient = appState.compassEngine.gradientBearing(toMember: memberID) {
+        func indoorReading(_ gradient: (bearing: Double, confidence: Double),
+                           isFresh: Bool) -> ArrowReading {
             let phoneFrame = (gradient.bearing - myHeading)
                 .truncatingRemainder(dividingBy: 360)
             let band = appState.compassEngine.latestRSSI(for: memberID)
                 .map(CompassEngine.distanceBand(rssi:))
+                ?? gpsCandidate.map { CompassMath.distanceBand(metres: $0.metres) }
                 ?? "Nearby"
             return ArrowReading(
                 phoneFrameBearing: phoneFrame,
                 distanceBand: band,
-                metres: nil,
-                isFresh: false,
+                metres: gpsCandidate?.metres,
+                isFresh: isFresh,
                 mode: .bluetooth,
                 confidence: gradient.confidence
             )
         }
 
-        return nil
+        switch seekerMode {
+        case .gps:
+            if let gps = gpsCandidate {
+                return gpsReading(gps)
+            }
+            return nil
+        case .indoor:
+            if let gradient {
+                return indoorReading(gradient, isFresh: true)
+            }
+            return nil
+        case .auto:
+            if let gradient {
+                let prefersIndoor = myQuality.likelyIndoorOrUnreliable
+                    || !myQuality.isReliableForCompass
+                    || !theirQuality.isReliableForCompass
+                let shouldUseIndoor = prefersIndoor
+                    || (gpsCandidate?.metres ?? .infinity) < 30
+                if shouldUseIndoor {
+                    return indoorReading(gradient, isFresh: true)
+                }
+            }
+
+            if let gps = gpsCandidate {
+                return gpsReading(gps)
+            }
+
+            if let gradient {
+                return indoorReading(gradient, isFresh: false)
+            }
+
+            return nil
+        }
     }
 
     private static func uwbDistanceBand(metres: Float?) -> String {

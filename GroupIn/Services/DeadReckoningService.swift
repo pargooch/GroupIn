@@ -32,6 +32,19 @@ protocol DeadReckoningServicing: AnyObject {
     /// GPS is stale.
     var positionUpdates: AsyncStream<PositionEstimate> { get }
 
+    /// Stream of step deltas from CMPedometer — yields the number of
+    /// *new* steps since the last yield. Fires whether or not there's
+    /// a GPS anchor (position estimates need an anchor, step deltas
+    /// don't), so this is the signal the compass engine uses to
+    /// integrate synthetic position spread for indoor finding.
+    var stepUpdates: AsyncStream<Int> { get }
+
+    /// Start CMPedometer step counting unconditionally — independent
+    /// of the GPS anchor that `reanchor(to:)` sets up. Used by
+    /// `stepUpdates` so the compass can advance synthetic positions
+    /// even when GPS never fires (indoors). Idempotent.
+    func startStepObservation()
+
     /// Re-anchor to a fresh GPS fix. Resets the displacement
     /// integrator and feeds the calibration window if the prior
     /// anchor's GPS run produced enough signal.
@@ -57,6 +70,16 @@ final class DeadReckoningService: DeadReckoningServicing {
 
     let positionUpdates: AsyncStream<PositionEstimate>
     private nonisolated let positionContinuation: AsyncStream<PositionEstimate>.Continuation
+    let stepUpdates: AsyncStream<Int>
+    private nonisolated let stepContinuation: AsyncStream<Int>.Continuation
+
+    /// Total CMPedometer step count observed since `startStepObservation`
+    /// first kicked off. Used to compute the delta each batch yields.
+    /// Distinct from the anchor-relative count `handlePedometerUpdate`
+    /// uses for displacement — that one resets every reanchor; this one
+    /// only resets on `stop()`.
+    private var lastObservedStepCount: Int = 0
+    private var stepObservationRunning: Bool = false
 
     // MARK: - State
 
@@ -128,6 +151,9 @@ final class DeadReckoningService: DeadReckoningServicing {
         let (stream, cont) = AsyncStream.makeStream(of: PositionEstimate.self)
         self.positionUpdates = stream
         self.positionContinuation = cont
+        let (stepStream, stepCont) = AsyncStream.makeStream(of: Int.self)
+        self.stepUpdates = stepStream
+        self.stepContinuation = stepCont
         self.defaults = defaults
         let stored = defaults.double(forKey: Self.calibrationKey)
         self.calibratedStepLength = stored > 0 ? stored : Self.defaultStepLength
@@ -174,16 +200,45 @@ final class DeadReckoningService: DeadReckoningServicing {
         lastHeading = heading
     }
 
+    func startStepObservation() {
+        guard !stepObservationRunning,
+              CMPedometer.isStepCountingAvailable() else { return }
+        stepObservationRunning = true
+        // From "now" rather than a historical date so the first batch
+        // doesn't dump backlog steps into the compass at once. We want
+        // step deltas that correspond to the user's current motion
+        // session, not the morning commute.
+        pedometer.startUpdates(from: Date()) { [weak self] data, _ in
+            guard let data else { return }
+            Task { @MainActor [weak self] in
+                self?.handlePedometerUpdate(data)
+            }
+        }
+    }
+
     func stop() {
         pedometer.stopUpdates()
         anchor = nil
         latestPedometerData = nil
         calibrationWindowStart = nil
+        stepObservationRunning = false
+        lastObservedStepCount = 0
     }
 
     // MARK: - Pedometer integration
 
     private func handlePedometerUpdate(_ data: CMPedometerData) {
+        // Yield a step delta unconditionally. The compass uses this to
+        // advance synthetic positions even when there's no GPS anchor
+        // — which is the only viable path indoors. Position estimation
+        // below still requires an anchor, as before.
+        let totalSteps = data.numberOfSteps.intValue
+        let delta = max(0, totalSteps - lastObservedStepCount)
+        if delta > 0 {
+            lastObservedStepCount = totalSteps
+            stepContinuation.yield(delta)
+        }
+
         guard let anchor else { return }
 
         // Total distance from anchor. Prefer CMPedometerData.distance

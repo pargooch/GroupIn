@@ -282,6 +282,7 @@ final class AppState {
     private var heartbeatTask: Task<Void, Never>?
     private var bleJoinRequestTask: Task<Void, Never>?
     private var deadReckoningTask: Task<Void, Never>?
+    private var compassStepTask: Task<Void, Never>?
 
     /// Payload-transport consumer task — decodes incoming `PayloadFrame`s
     /// and routes events into the same `handleGossipedEvent` pipeline
@@ -335,6 +336,7 @@ final class AppState {
     /// by `recomputeGroupTransport()` to pick the group-min transport
     /// — Wi-Fi Aware only if every member supports it.
     private var peerCapabilities: [UUID: TransportCapability] = [:]
+
     private static let heartbeatInterval: TimeInterval = 20
     /// Threshold under which the heartbeat skips work — if a real GPS
     /// fix updated `lastSeen` recently, no need to pile on extra writes.
@@ -436,6 +438,7 @@ final class AppState {
             startLocationTracking()
             startBeaconMonitoring()
             startPresenceHeartbeat()
+            startBLEPresence()
             // Re-confirm the CloudKit subscription for every group on
             // every launch — the CKDatabase persists subscriptions
             // server-side, so duplicates are no-ops. Cheap insurance
@@ -542,10 +545,12 @@ final class AppState {
             startLocationTracking()
             startBeaconMonitoring()
             startPresenceHeartbeat()
+            startBLEPresence()
         } else if !wasEmpty, isEmpty {
             stopLocationTracking()
             stopBeaconMonitoring()
             stopPresenceHeartbeat()
+            stopBLEPresence()
         }
 
         // Per-group subscription deltas — independent of the whole-
@@ -1334,6 +1339,27 @@ final class AppState {
                 }
             }
         }
+
+        // Start CMPedometer step observation independent of GPS
+        // anchor. The compass engine consumes step deltas to advance
+        // synthetic positions for the indoor gradient — the only
+        // mechanism that survives no-GPS + no-DR-anchor environments.
+        deadReckoningService.startStepObservation()
+
+        if compassStepTask == nil {
+            compassStepTask = Task { [weak self] in
+                guard let self else { return }
+                let stride = self.deadReckoningService.calibratedStepLength
+                for await delta in self.deadReckoningService.stepUpdates {
+                    let heading = self.currentUser.heading ?? 0
+                    let displacement = Double(delta) * stride
+                    self.compassEngine.recordStep(
+                        headingDegrees: heading,
+                        stepLengthMetres: displacement
+                    )
+                }
+            }
+        }
     }
 
     /// Apply a DR estimate to local state — but only when GPS is
@@ -1354,6 +1380,11 @@ final class AppState {
         me.positionAnchorAt = estimate.anchorAt
         me.lastSeen = estimate.computedAt
         currentUser = me
+
+        compassEngine.recordPosition(
+            latitude: estimate.coordinate.latitude,
+            longitude: estimate.coordinate.longitude
+        )
 
         // Patch the active group's member entry + push the next
         // BLE/CloudKit broadcast so peers see the DR position
@@ -1401,6 +1432,8 @@ final class AppState {
         locationService.stopUpdating()
         motionService.stop()
         deadReckoningService.stop()
+        compassStepTask?.cancel()
+        compassStepTask = nil
         // Reset session GPS state — leaving all groups means the next
         // membership starts fresh. Without this, a second "join later"
         // session would still think we'd had GPS at some point.
