@@ -18,6 +18,16 @@ struct PeerPresence: Codable, Equatable {
     /// The peer's per-group membership UUID.
     let memberID: UUID
 
+    /// Peer's display name. Carried in the BLE presence so receivers
+    /// can render an actual name immediately instead of stubbing the
+    /// member with "Member" and waiting on event-log gossip — that
+    /// gossip rides on the higher-tier payload transport which may
+    /// not be connected (Local Network permission declined, peer
+    /// backgrounded, transport not yet up). BLE presence is the only
+    /// always-on signaling channel; identity belongs here. Optional
+    /// for backwards-compat with older clients that didn't include it.
+    let displayName: String?
+
     let latitude: Double?
     let longitude: Double?
 
@@ -62,6 +72,7 @@ struct PeerPresence: Codable, Equatable {
 
     init(groupHash: UInt32,
          memberID: UUID,
+         displayName: String? = nil,
          latitude: Double?,
          longitude: Double?,
          heading: Double?,
@@ -73,6 +84,7 @@ struct PeerPresence: Codable, Equatable {
          transportCapability: TransportCapability? = nil) {
         self.groupHash = groupHash
         self.memberID = memberID
+        self.displayName = displayName
         self.latitude = latitude
         self.longitude = longitude
         self.heading = heading
@@ -98,6 +110,7 @@ struct PeerPresence: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.groupHash = try c.decode(UInt32.self, forKey: .groupHash)
         self.memberID = try c.decode(UUID.self, forKey: .memberID)
+        self.displayName = try? c.decode(String.self, forKey: .displayName)
         self.latitude = try? c.decode(Double.self, forKey: .latitude)
         self.longitude = try? c.decode(Double.self, forKey: .longitude)
         self.heading = try? c.decode(Double.self, forKey: .heading)

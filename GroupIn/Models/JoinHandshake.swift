@@ -64,6 +64,52 @@ struct JoinResponse: Codable, Hashable, Sendable {
     /// Member ID of the responding peer. Lets the joiner record where
     /// the response came from for diagnostics; not load-bearing.
     let responderMemberID: UUID
+    /// Display name of the responding peer. Carried so the joiner can
+    /// render the responder's actual name in their member list
+    /// immediately — without this, the joiner shows "Member" until
+    /// event-log gossip eventually delivers the responder's
+    /// `memberJoined` event, which depends on the payload transport
+    /// being connected. Optional for backwards-compat decoding.
+    let responderDisplayName: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case groupID, name, inviteCode, category, ownerID,
+             createdAt, expiresAt, responderMemberID, responderDisplayName
+    }
+
+    init(groupID: UUID,
+         name: String,
+         inviteCode: String,
+         category: String,
+         ownerID: UUID,
+         createdAt: Date,
+         expiresAt: Date,
+         responderMemberID: UUID,
+         responderDisplayName: String? = nil) {
+        self.groupID = groupID
+        self.name = name
+        self.inviteCode = inviteCode
+        self.category = category
+        self.ownerID = ownerID
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.responderMemberID = responderMemberID
+        self.responderDisplayName = responderDisplayName
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.groupID = try c.decode(UUID.self, forKey: .groupID)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.inviteCode = try c.decode(String.self, forKey: .inviteCode)
+        self.category = try c.decode(String.self, forKey: .category)
+        self.ownerID = try c.decode(UUID.self, forKey: .ownerID)
+        self.createdAt = try c.decode(Date.self, forKey: .createdAt)
+        self.expiresAt = try c.decode(Date.self, forKey: .expiresAt)
+        self.responderMemberID = try c.decode(UUID.self, forKey: .responderMemberID)
+        // Optional for backwards-compat with older clients.
+        self.responderDisplayName = try? c.decode(String.self, forKey: .responderDisplayName)
+    }
 
     func encoded() -> Data? {
         try? JSONEncoder().encode(self)
@@ -73,11 +119,25 @@ struct JoinResponse: Codable, Hashable, Sendable {
         try? JSONDecoder().decode(JoinResponse.self, from: data)
     }
 
-    /// Materialize a minimal `GroupSession` from the response. The
-    /// member list and banlist are empty — the joiner picks those up
-    /// via gossip immediately after this lands.
+    /// Materialize a minimal `GroupSession` from the response, seeded
+    /// with the responder as a member so the joiner has the host's
+    /// identity right away. Other members + banlist still catch up
+    /// via gossip after the join lands.
     func toGroupSession() -> GroupSession? {
         guard let category = GroupCategory(rawValue: category) else { return nil }
+        // If the responder included their display name, seed them as
+        // a member so the joiner's dashboard shows the host's name
+        // and avatar (avatar fills in via gossip / a later presence
+        // packet). The deterministic memberID matches the host's
+        // own membership, so the host's later memberJoined event for
+        // themselves merges cleanly via ingest-time dedup.
+        var seedMembers: [User] = []
+        if let name = responderDisplayName {
+            seedMembers.append(User(
+                id: responderMemberID,
+                displayName: name
+            ))
+        }
         return GroupSession(
             id: groupID,
             name: name,
@@ -86,7 +146,7 @@ struct JoinResponse: Codable, Hashable, Sendable {
             ownerID: ownerID,
             expiresAt: expiresAt,
             createdAt: createdAt,
-            members: [],
+            members: seedMembers,
             pendingExtension: nil,
             bannedMembers: []
         )

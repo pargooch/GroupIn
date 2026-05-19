@@ -14,6 +14,7 @@
 
 import Foundation
 import CoreLocation
+import CryptoKit
 import Observation
 
 enum AppRoute: Hashable {
@@ -1567,15 +1568,26 @@ final class AppState {
     }
 
     /// Derive a short, stable rendezvous token from an invite code.
-    /// SHA-256 hashed + truncated so the invite code itself isn't
-    /// broadcast in the transport's discovery info. Pre-encryption
-    /// (v2) it's just a disambiguator that keeps two GroupIn groups
-    /// running nearby from cross-talk.
+    /// SHA-256 of a salted form of the invite code, truncated to
+    /// 8 bytes / 16 hex chars. Two devices in the same group MUST
+    /// compute identical tokens — `MCNearbyServiceBrowser.foundPeer`
+    /// rejects every peer whose advertised token doesn't match the
+    /// browser's local token, so non-deterministic hashing means
+    /// zero connected peers, ever.
+    ///
+    /// **Don't** use Swift's `Hasher` here: it's intentionally seeded
+    /// with a process-random value (per Apple's docs, hashes are not
+    /// stable across launches or processes), which means every device
+    /// would compute a different token for the same invite code and
+    /// the payload transport (chat + event-log gossip) would silently
+    /// fail to connect any peer. This was the root cause of "chat
+    /// doesn't work" + most of the missing-identity / stale-out
+    /// symptoms — events that would carry display names and avatars
+    /// never crossed the wire.
     private static func rendezvousToken(forInviteCode inviteCode: String) -> String {
-        var hasher = Hasher()
-        hasher.combine("groupin.payload.rdv")
-        hasher.combine(inviteCode)
-        return String(UInt64(bitPattern: Int64(hasher.finalize())), radix: 16)
+        let salted = "groupin.payload.rdv." + inviteCode.uppercased()
+        let digest = SHA256.hash(data: Data(salted.utf8))
+        return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Peer-staleness threshold for the walk-around prompt. If every
@@ -1755,6 +1767,13 @@ final class AppState {
         return PeerPresence(
             groupHash: PeerPresence.groupHash(forInviteCode: group.inviteCode),
             memberID: memberID,
+            // Display name in the presence packet means receivers can
+            // render the peer's actual name immediately, without
+            // depending on event-log gossip via the payload transport
+            // — which is fragile (Local Network permission, peer
+            // foreground state, etc). BLE presence is the always-on
+            // signaling channel; identity belongs here.
+            displayName: localProfile.displayName,
             latitude: currentUser.coordinate?.latitude,
             longitude: currentUser.coordinate?.longitude,
             heading: currentUser.heading,
@@ -1865,6 +1884,16 @@ final class AppState {
                 return
             }
             group.members[idx].lastSeen = peer.lastSeen
+            // If we're still showing the "Member" placeholder for
+            // this peer (no memberJoined event ever arrived because
+            // MPC was down, say), upgrade the name from the freshly-
+            // decoded presence packet. Don't clobber a real name with
+            // nil if the peer's payload lacks the field.
+            if let name = peer.displayName,
+               group.members[idx].displayName == "Member"
+                || group.members[idx].displayName.isEmpty {
+                group.members[idx].displayName = name
+            }
             if let lat = peer.latitude, let lon = peer.longitude {
                 group.members[idx].coordinate = Coordinate(latitude: lat, longitude: lon)
             }
@@ -1876,13 +1905,14 @@ final class AppState {
             group.members[idx].eventCursorCreatedAt = peer.eventCursorCreatedAt
             group.members[idx].eventCursorID = peer.eventCursorID
         } else {
-            // Stub a placeholder member entry. Display name uses a
-            // best-effort placeholder; the `memberJoined` event for
-            // this peer will overwrite it once it arrives via gossip
-            // or CloudKit.
+            // Stub a member entry. Use the peer's broadcast display
+            // name if present; fall back to a placeholder only if the
+            // peer's still on an older build that didn't include the
+            // field. The `memberJoined` event later upgrades or
+            // confirms via the standard ingest path.
             let stub = User(
                 id: peer.memberID,
-                displayName: "Member",
+                displayName: peer.displayName ?? "Member",
                 avatarData: nil,
                 lastSeen: peer.lastSeen,
                 coordinate: (peer.latitude.flatMap { lat in
@@ -2080,7 +2110,12 @@ final class AppState {
             ownerID: group.ownerID,
             createdAt: group.createdAt,
             expiresAt: group.expiresAt,
-            responderMemberID: membershipByGroupID[group.id] ?? currentUser.id
+            responderMemberID: membershipByGroupID[group.id] ?? currentUser.id,
+            // Send our display name back so the joiner can show our
+            // actual name in their member list immediately. Without
+            // this they show a "Member" placeholder until event-log
+            // gossip arrives, which depends on MPC being up.
+            responderDisplayName: localProfile.displayName
         )
         blePresenceService.respondToJoinRequest(response)
     }
