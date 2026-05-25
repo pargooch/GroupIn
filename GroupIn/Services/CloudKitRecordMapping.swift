@@ -9,6 +9,15 @@
 import Foundation
 import CloudKit
 
+/// Sealed lat/lon/heading blob — what we store in `encLocation` instead
+/// of plaintext coordinate columns, so the public DB never holds a
+/// readable position.
+private struct EncryptedLocation: Codable {
+    let lat: Double
+    let lon: Double
+    let heading: Double?
+}
+
 extension GroupSession {
     static let recordType = "Group"
 
@@ -16,13 +25,27 @@ extension GroupSession {
         guard
             let idString = record["id"] as? String,
             let id = UUID(uuidString: idString),
-            let name = record["name"] as? String,
-            let inviteCode = record["inviteCode"] as? String,
             let createdAt = record["createdAt"] as? Date,
             let ownerIDString = record["ownerID"] as? String,
             let ownerID = UUID(uuidString: ownerIDString),
             let expiresAt = record["expiresAt"] as? Date
         else { return nil }
+
+        // Name is E2E-encrypted (`encName`) with the group key; decrypt
+        // when we hold it (keyed by group id). Falls back to legacy
+        // plaintext, then a placeholder — never fails the whole decode on
+        // name alone.
+        let name = (record["encName"] as? Data)
+            .flatMap { GroupCrypto.open($0, groupID: id) }
+            .flatMap { String(data: $0, encoding: .utf8) }
+            ?? (record["name"] as? String)
+            ?? "Group"
+
+        // The invite code is no longer stored in the clear — only its
+        // hash, for lookup. Legacy records may still carry the plaintext;
+        // read it if present, otherwise the caller (who holds the code
+        // they joined with) fills it in.
+        let inviteCode = (record["inviteCode"] as? String) ?? ""
 
         var pending: PendingExtension?
         if
@@ -71,8 +94,17 @@ extension GroupSession {
     /// Mutates the record's fields. Caller is responsible for `database.save`.
     func writeTo(record: CKRecord) {
         record["id"] = id.uuidString
-        record["name"] = name
-        record["inviteCode"] = inviteCode
+        // Name sealed with the group key; clear plaintext on overwrite.
+        if let sealed = GroupCrypto.seal(Data(name.utf8), groupID: id) {
+            record["encName"] = sealed
+            record["name"] = nil
+        } else {
+            record["name"] = name
+        }
+        // Store only the one-way hash for lookup; never the secret code
+        // itself (clearing any legacy plaintext on overwrite).
+        record["inviteCodeHash"] = GroupCrypto.inviteCodeHash(inviteCode)
+        record["inviteCode"] = nil
         record["category"] = category.rawValue
         record["createdAt"] = createdAt
         record["ownerID"] = ownerID.uuidString
@@ -112,14 +144,28 @@ extension User {
             let lastSeen = record["lastSeen"] as? Date
         else { return nil }
 
+        // Location: prefer the encrypted blob; fall back to legacy
+        // plaintext columns for records written before E2E.
         var coordinate: Coordinate?
-        if let lat = record["latitude"] as? Double,
-           let lon = record["longitude"] as? Double {
+        var heading = record["heading"] as? Double
+        if let enc = record["encLocation"] as? Data,
+           let opened = GroupCrypto.open(enc, groupID: groupID),
+           let loc = try? JSONDecoder().decode(EncryptedLocation.self, from: opened) {
+            coordinate = Coordinate(latitude: loc.lat, longitude: loc.lon)
+            heading = loc.heading ?? heading
+        } else if let lat = record["latitude"] as? Double,
+                  let lon = record["longitude"] as? Double {
             coordinate = Coordinate(latitude: lat, longitude: lon)
         }
 
-        let avatarData = record["avatarData"] as? Data
-        let heading = record["heading"] as? Double
+        // Avatar: try to decrypt; if it isn't ciphertext (legacy
+        // plaintext, or we lack the key) `open` fails closed and we keep
+        // the raw bytes. No separate flag — CloudKit Int round-tripping
+        // is unreliable and silently broke avatar decoding.
+        var avatarData = record["avatarData"] as? Data
+        if let raw = avatarData {
+            avatarData = GroupCrypto.open(raw, groupID: groupID) ?? raw
+        }
         let nearbyToken = record["nearbyToken"] as? Data
         let banHash = record["banHash"] as? String
 
@@ -168,15 +214,41 @@ extension User {
         record["groupID"] = CKRecord.Reference(recordID: groupRecordID, action: .deleteSelf)
         record["displayName"] = displayName
         record["lastSeen"] = lastSeen
-        record["avatarData"] = avatarData
-        if let coordinate {
-            record["latitude"] = coordinate.latitude
-            record["longitude"] = coordinate.longitude
+
+        // The group record's name is the group UUID, so we can resolve
+        // the group key for sealing the sensitive fields below.
+        let groupID = UUID(uuidString: groupRecordID.recordName)
+
+        // Avatar — sealed with the group key when we hold it; raw bytes
+        // otherwise. Decode auto-detects via trial decryption (no flag).
+        if let avatarData, let gid = groupID {
+            record["avatarData"] = GroupCrypto.seal(avatarData, groupID: gid) ?? avatarData
         } else {
+            record["avatarData"] = avatarData
+        }
+
+        // Location — seal lat/lon/heading into one blob and DROP the
+        // plaintext columns so the public DB never holds a readable
+        // coordinate. Only fall back to plaintext if we somehow lack
+        // the key (shouldn't happen — keys are derived from the code).
+        if let coordinate,
+           let gid = groupID,
+           let payload = try? JSONEncoder().encode(
+               EncryptedLocation(lat: coordinate.latitude,
+                                 lon: coordinate.longitude,
+                                 heading: heading)),
+           let sealed = GroupCrypto.seal(payload, groupID: gid) {
+            record["encLocation"] = sealed
             record["latitude"] = nil
             record["longitude"] = nil
+            record["heading"] = nil
+        } else {
+            record["encLocation"] = nil
+            record["latitude"] = coordinate?.latitude
+            record["longitude"] = coordinate?.longitude
+            record["heading"] = heading
         }
-        record["heading"] = heading
+
         record["nearbyToken"] = nearbyToken
         record["banHash"] = banHash
 

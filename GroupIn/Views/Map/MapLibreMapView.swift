@@ -138,7 +138,8 @@ struct MapLibreMapView: UIViewRepresentable {
 
             // Add / update.
             for (member, coord) in renderable {
-                let color = UIColor(Color.memberColor(for: member.id))
+                let color = UIColor(Color.memberColor(for: member.id,
+                                                       among: parent.members.map(\.id)))
                 if let existing = annotationsByMember[member.id] {
                     if !coordinatesAreEqual(existing.coordinate, coord) {
                         UIView.animate(withDuration: 0.45,

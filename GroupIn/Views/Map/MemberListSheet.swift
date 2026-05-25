@@ -38,11 +38,12 @@ struct MemberListSheet: View {
                                 : row.member.id
                         } label: {
                             MemberRow(row: row,
-                                      focused: focusedMemberID == row.member.id)
+                                      focused: focusedMemberID == row.member.id,
+                                      color: color(for: row.member.id))
                         }
                         .buttonStyle(.plain)
                         .listRowBackground(
-                            Color.memberColor(for: row.member.id)
+                            color(for: row.member.id)
                                 .opacity(focusedMemberID == row.member.id ? 0.45 : 0.28)
                         )
                     }
@@ -127,9 +128,15 @@ struct MemberListSheet: View {
         return atan2(y, x) * 180 / .pi
     }
 
+    /// Collision-free color for a member within this sheet's member set.
+    private func color(for memberID: UUID) -> Color {
+        Color.memberColor(for: memberID, among: members.map(\.id))
+    }
+
     private struct MemberRow: View {
         let row: Row
         let focused: Bool
+        let color: Color
 
         @Environment(AppState.self) private var appState
 
@@ -138,10 +145,10 @@ struct MemberListSheet: View {
                 AvatarView(data: row.member.avatarData,
                            name: row.member.displayName,
                            size: 40,
-                           tint: Color.memberColor(for: row.member.id))
+                           tint: color)
                     .overlay(
                         Circle().strokeBorder(
-                            Color.memberColor(for: row.member.id),
+                            color,
                             lineWidth: focused ? 2 : 1
                         )
                     )

@@ -179,6 +179,32 @@ struct GroupDashboardView: View {
     /// part of the scrollable List, the sheet can be dragged between
     /// detents by grabbing anywhere on it — a far bigger target than
     /// the thin drag indicator alone.
+    /// Live device-to-device link status. Green "N nearby" means the
+    /// peer-to-peer transport (MultipeerConnectivity) is connected, so
+    /// avatars / chat / group changes propagate instantly in person.
+    /// "Searching…" means we're advertising/browsing but no peer has
+    /// connected yet — if that persists with another member right next
+    /// to you, the local-network link isn't forming (Local Network
+    /// permission, same Wi-Fi, both foregrounded).
+    @ViewBuilder
+    private var linkStatusBadge: some View {
+        let diag = appState.transportDiagnostics
+        let connected = diag.connectedPeers
+        HStack(spacing: 3) {
+            Image(systemName: connected > 0
+                  ? "antenna.radiowaves.left.and.right"
+                  : "antenna.radiowaves.left.and.right.slash")
+            Text(connected > 0
+                 ? "\(connected) nearby"
+                 : (diag.isBrowsing || diag.isAdvertising ? "searching…" : "offline"))
+        }
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(connected > 0 ? Color.green : Color.secondary)
+        .accessibilityLabel(connected > 0
+                            ? "\(connected) members connected nearby"
+                            : "No nearby members connected")
+    }
+
     @ViewBuilder
     private func drawerHeader(group: GroupSession) -> some View {
         HStack(spacing: 12) {
@@ -199,9 +225,12 @@ struct GroupDashboardView: View {
                         .font(.title3.weight(.semibold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
-                    Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        linkStatusBadge
+                    }
                 }
             }
             .accessibilityElement(children: .combine)
@@ -276,7 +305,7 @@ struct GroupDashboardView: View {
     private func groupSection(group: GroupSession) -> some View {
         Section {
             VStack(alignment: .leading, spacing: 16) {
-                shareInviteButton(code: group.inviteCode)
+                shareInviteButton()
 
                 expiryRow(group: group)
             }
@@ -334,7 +363,7 @@ struct GroupDashboardView: View {
     /// here so the owner can read it at a glance without opening the
     /// sheet.
     @ViewBuilder
-    private func shareInviteButton(code: String) -> some View {
+    private func shareInviteButton() -> some View {
         Button {
             showsInviteQR = true
         } label: {
@@ -351,10 +380,12 @@ struct GroupDashboardView: View {
 
                 Spacer(minLength: 8)
 
-                Text(code)
-                    .font(.callout.weight(.semibold))
-                    .monospaced()
-                    .foregroundStyle(.primary)
+                // The code is long now (it doubles as the E2E key), so we
+                // don't show it inline — just a label. The full code + QR
+                // live in the sheet this opens.
+                Text("Invite code")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 4)
                     .background(Color.accentColor.opacity(0.12), in: Capsule())
@@ -369,7 +400,7 @@ struct GroupDashboardView: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Share invite, code \(code)")
+        .accessibilityLabel("Share invite")
         .accessibilityHint("Opens the invite sheet with a QR code and sharing options")
     }
 
@@ -477,7 +508,7 @@ struct GroupDashboardView: View {
     private func focusedMemberCard(group: GroupSession) -> some View {
         if let id = routeTargetID,
            let member = group.members.first(where: { $0.id == id }) {
-            let color = Color.memberColor(for: member.id)
+            let color = Color.memberColor(for: member.id, among: group.members.map(\.id))
             let distance = distanceFromCurrentUser(to: member, group: group)
             HStack(spacing: 12) {
                 AvatarView(data: member.avatarData,
@@ -857,7 +888,7 @@ struct GroupDashboardView: View {
         )
         let hasLocation = member.coordinate != nil
         let isMe = member.id == viewModel.currentUser.id
-        let memberColor = Color.memberColor(for: member.id)
+        let memberColor = Color.memberColor(for: member.id, among: group.members.map(\.id))
 
         HStack(spacing: 12) {
             Button {

@@ -94,6 +94,25 @@ final class AppState {
             reconcileTrackingLifecycle(previous: oldValue, current: myGroups)
         }
     }
+
+    /// Groups the user explicitly removed (left, deleted, or was kicked
+    /// from). Without this, a late BLE presence packet, a gossiped
+    /// event, or the next CloudKit refresh would silently re-add a group
+    /// the user just removed — it "won't disappear." `addOrUpdate` skips
+    /// any tombstoned group; the tombstone is cleared the instant the
+    /// user re-creates or re-joins (see `registerMembership`). Persisted
+    /// so a relaunch doesn't resurrect it either.
+    private(set) var removedGroupIDs: Set<UUID> = []
+
+    /// Avatars learned from `.profile` frames over the payload transport,
+    /// keyed by member ID. Lets us fill in a peer's picture the instant a
+    /// `.profile` arrives — and seed it onto a member who only appears
+    /// later via a BLE presence stub (which carries no avatar).
+    private var avatarCacheByMember: [UUID: Data] = [:]
+
+    /// Groups whose E2E key we've already derived + cached this session,
+    /// so we don't hit the Keychain on every `addOrUpdate` tick.
+    private var keyEnsuredGroupIDs: Set<UUID> = []
     private(set) var membershipByGroupID: [UUID: UUID] = [:] {
         didSet { persistMembershipMap() }
     }
@@ -434,6 +453,7 @@ final class AppState {
     private static let localProfileKey = "GroupIn.AppState.localProfile"
     private static let currentGroupKey = "GroupIn.AppState.currentGroup"
     private static let myGroupsKey = "GroupIn.AppState.myGroups"
+    private static let removedGroupIDsKey = "GroupIn.AppState.removedGroupIDs"
     private static let membershipMapKey = "GroupIn.AppState.membershipMap"
     private static let eventCursorsKey = "GroupIn.AppState.eventCursors"
     private static let oldestEventCursorsKey = "GroupIn.AppState.oldestEventCursors"
@@ -504,6 +524,16 @@ final class AppState {
         if let data = defaults.data(forKey: Self.myGroupsKey),
            let decoded = try? JSONDecoder().decode([GroupSession].self, from: data) {
             self.myGroups = decoded
+            // Make sure each restored group's E2E key is derived + cached.
+            for group in decoded {
+                GroupCrypto.ensureKey(forGroup: group.id, inviteCode: group.inviteCode)
+                keyEnsuredGroupIDs.insert(group.id)
+            }
+        }
+
+        if let data = defaults.data(forKey: Self.removedGroupIDsKey),
+           let decoded = try? JSONDecoder().decode(Set<UUID>.self, from: data) {
+            self.removedGroupIDs = decoded
         }
 
         if let data = defaults.data(forKey: Self.currentGroupKey),
@@ -1339,7 +1369,29 @@ final class AppState {
     }
 
     func registerMembership(groupID: UUID, memberID: UUID) {
+        // Re-creating or re-joining a group clears any prior tombstone so
+        // it's allowed back into `myGroups`.
+        clearGroupTombstone(groupID)
         membershipByGroupID[groupID] = memberID
+    }
+
+    /// Mark a group as explicitly removed so it can't be silently
+    /// re-added by late presence/events/refresh, and persist that.
+    private func tombstoneGroup(_ groupID: UUID) {
+        removedGroupIDs.insert(groupID)
+        persistRemovedGroupIDs()
+    }
+
+    private func clearGroupTombstone(_ groupID: UUID) {
+        if removedGroupIDs.remove(groupID) != nil {
+            persistRemovedGroupIDs()
+        }
+    }
+
+    private func persistRemovedGroupIDs() {
+        if let data = try? JSONEncoder().encode(removedGroupIDs) {
+            defaults.set(data, forKey: Self.removedGroupIDsKey)
+        }
     }
 
     /// Returns a copy of `user` with the per-group ban hash stamped
@@ -1383,16 +1435,35 @@ final class AppState {
             currentUser.displayName = localProfile.displayName
             currentUser.avatarData = localProfile.avatarData
         }
+
+        // Push the updated picture/name to peers connected right now so
+        // an avatar change shows up live, not just on their next connect.
+        broadcastSelfProfile()
     }
 
     // MARK: - Group management
 
     func addOrUpdate(group: GroupSession) {
+        // A group the user explicitly removed must not be silently
+        // re-added by a late presence packet, a gossiped event, or the
+        // next refresh. The tombstone is cleared on an explicit
+        // re-create / re-join via `registerMembership`.
+        guard !removedGroupIDs.contains(group.id) else { return }
+        ensureGroupKey(for: group)
         if let idx = myGroups.firstIndex(where: { $0.id == group.id }) {
             myGroups[idx] = group
         } else {
             myGroups.append(group)
         }
+    }
+
+    /// Derive + cache this group's E2E key (from its invite code) the
+    /// first time we see the group this session. Cheap and idempotent;
+    /// the in-memory set keeps it off the Keychain on every refresh tick.
+    private func ensureGroupKey(for group: GroupSession) {
+        guard !keyEnsuredGroupIDs.contains(group.id) else { return }
+        keyEnsuredGroupIDs.insert(group.id)
+        GroupCrypto.ensureKey(forGroup: group.id, inviteCode: group.inviteCode)
     }
 
     func remove(group: GroupSession) {
@@ -1407,6 +1478,7 @@ final class AppState {
             // `applyEventSideEffects(_:)`.
             emit(.groupDeleted, in: group.id)
 
+            tombstoneGroup(group.id)
             myGroups.removeAll { $0.id == group.id }
             membershipByGroupID.removeValue(forKey: group.id)
             if currentGroup?.id == group.id {
@@ -1467,21 +1539,11 @@ final class AppState {
         // cleanup detail.
         emit(.memberLeft(memberID: memberID), in: groupID)
 
-        // Server-side delete. If it fails, we still tear down local
-        // state so the user doesn't get stuck with a ghost group —
-        // the server-side record will be cleaned up on the next
-        // refresh / by expiry.
-        do {
-            try await groupService.leaveGroup(groupID: groupID, memberID: memberID)
-        } catch {
-            // Swallow — the local teardown below is still the right
-            // user-facing outcome.
-        }
-
         // Local teardown — drop the group from every cache that
         // referenced it. This is the same shape as `remove(group:)`
         // for the non-owner case, but kept as its own entry point so
         // call sites can be specific about intent.
+        tombstoneGroup(groupID)
         myGroups.removeAll { $0.id == groupID }
         membershipByGroupID.removeValue(forKey: groupID)
         if currentGroup?.id == groupID {
@@ -1498,6 +1560,15 @@ final class AppState {
             await notificationService.cancelAll(for: groupID)
         }
         path.removeAll()
+
+        // Server-side member-record delete is best-effort and runs in
+        // the background — the user shouldn't wait on a network
+        // round-trip to see the group disappear. If it fails, the
+        // record is reaped by the next refresh or by expiry, and peers
+        // already learned we left from the emitted event above.
+        Task { [groupService, groupID, memberID] in
+            try? await groupService.leaveGroup(groupID: groupID, memberID: memberID)
+        }
     }
 
     /// Owner-only kick. Removes the target member's record from the
@@ -2049,10 +2120,22 @@ final class AppState {
         payloadIncomingTask = Task { [weak self] in
             guard let self else { return }
             for await packet in self.payloadTransport.incoming {
-                guard let frame = PayloadFrame.decode(from: packet.data) else { continue }
+                // Try to decrypt with the active group key; fall back to
+                // the raw bytes for an older peer still sending plaintext
+                // frames (open() fails closed on non-ciphertext).
+                let payload: Data = {
+                    if let gid = self.activeTransportGroupID,
+                       let opened = GroupCrypto.open(packet.data, groupID: gid) {
+                        return opened
+                    }
+                    return packet.data
+                }()
+                guard let frame = PayloadFrame.decode(from: payload) else { continue }
                 switch frame {
                 case .event(let event):
                     self.handleGossipedEvent(event)
+                case .profile(let profile):
+                    self.handleGossipedProfile(profile)
                 }
             }
         }
@@ -2405,8 +2488,17 @@ final class AppState {
         if transportDiagnosticsTask == nil {
             transportDiagnosticsTask = Task { [weak self] in
                 guard let self else { return }
+                var lastConnected = 0
                 for await diag in self.payloadTransport.diagnostics {
+                    let previous = lastConnected
+                    lastConnected = diag.connectedPeers
                     self.transportDiagnostics = diag
+                    // A peer just joined the session — push our profile
+                    // (name + avatar) so they see our picture immediately,
+                    // not after the next CloudKit fetch.
+                    if diag.connectedPeers > previous {
+                        self.broadcastSelfProfile()
+                    }
                 }
             }
         }
@@ -2615,7 +2707,9 @@ final class AppState {
             var stub = User(
                 id: peer.memberID,
                 displayName: peer.displayName ?? "Member",
-                avatarData: nil,
+                // Seed the avatar from any `.profile` frame we've already
+                // received for this peer — presence packets carry none.
+                avatarData: avatarCacheByMember[peer.memberID],
                 lastSeen: peer.lastSeen,
                 coordinate: (peer.latitude.flatMap { lat in
                     peer.longitude.map { Coordinate(latitude: lat, longitude: $0) }
@@ -2741,6 +2835,32 @@ final class AppState {
         await refreshCurrentGroup()
         if let group = currentGroup {
             await syncEvents(for: group.id)
+        }
+    }
+
+    /// Check every remote-backed group in `myGroups` against CloudKit and
+    /// drop any whose record is gone — this is how a member sitting on
+    /// Home (not actively viewing the group) learns the owner deleted it.
+    /// The `.groupDeleted` event is unreliable for this because deleting
+    /// the Group record cascade-deletes the event before peers fetch it,
+    /// and `refreshCurrentGroup` only checks the *active* group. A direct
+    /// fetch-by-ID has no indexing delay, so `nil` means truly deleted.
+    func sweepRemoteGroupExistence() async {
+        guard groupService.supportsRemoteJoin else { return }
+        // Snapshot — `tearDownLocalGroup` mutates `myGroups`.
+        for group in myGroups {
+            // Don't remove a group we haven't confirmed is on the server
+            // yet (freshly created/joined, save still queued) — that would
+            // false-delete a group mid-upload.
+            if pendingGroupSaves.contains(where: { $0.group.id == group.id }) { continue }
+            do {
+                let fetched = try await groupService.fetchGroup(groupID: group.id)
+                if fetched == nil {
+                    tearDownLocalGroup(group.id, reason: .deleted)
+                }
+            } catch {
+                // Transient (offline / CloudKit error) — re-check next sweep.
+            }
         }
     }
 
@@ -3282,6 +3402,7 @@ final class AppState {
     private enum LocalGroupTeardownReason {
         case banned   // owner kicked us
         case left     // we (or some other device acting as us) left
+        case deleted  // owner hard-deleted the group
     }
 
     /// Drop a group from local state and surface the appropriate
@@ -3296,13 +3417,14 @@ final class AppState {
             return
         }
         let isActive = currentGroup?.id == groupID
+        tombstoneGroup(groupID)
         myGroups.removeAll { $0.id == groupID }
         membershipByGroupID.removeValue(forKey: groupID)
         if isActive {
             currentGroup = nil
             switch reason {
-            case .banned: bannedFromGroupName = group.name
-            case .left:   groupDeletedNotice = group.name
+            case .banned:           bannedFromGroupName = group.name
+            case .left, .deleted:   groupDeletedNotice = group.name
             }
             path.removeAll()
         }
@@ -3371,6 +3493,7 @@ final class AppState {
                 return
             }
             let isActive = currentGroup?.id == event.groupID
+            tombstoneGroup(event.groupID)
             myGroups.removeAll { $0.id == event.groupID }
             membershipByGroupID.removeValue(forKey: event.groupID)
             if isActive {
@@ -3416,8 +3539,78 @@ final class AppState {
     /// transport. Full event flows (no `strippedForBLE()` shrinkage)
     /// because MPC / Wi-Fi Aware can carry the avatar payload.
     private func sendEventToPayloadTransport(_ event: Event) {
-        guard let data = PayloadFrame.event(event).encoded() else { return }
-        payloadTransport.broadcast(data)
+        broadcastFrame(.event(event))
+    }
+
+    /// Encode + (E2E) seal a frame with the active group's key, then
+    /// broadcast. Sealing the whole frame keeps in-person MPC / Wi-Fi
+    /// Aware traffic (chat, joins, profiles) ciphertext on the wire too,
+    /// matching the CloudKit path.
+    private func broadcastFrame(_ frame: PayloadFrame) {
+        guard let data = frame.encoded() else { return }
+        if let gid = activeTransportGroupID,
+           let sealed = GroupCrypto.seal(data, groupID: gid) {
+            payloadTransport.broadcast(sealed)
+        } else {
+            payloadTransport.broadcast(data)
+        }
+    }
+
+    // MARK: - Profile (avatar) exchange over the payload transport
+
+    /// Broadcast our identity (name + avatar) to connected peers so they
+    /// render our profile picture immediately. Called when a peer
+    /// connects and whenever our profile changes. Sent over MPC / Wi-Fi
+    /// Aware, which has room for the avatar blob (BLE presence does not).
+    func broadcastSelfProfile() {
+        guard let groupID = activeTransportGroupID,
+              let memberID = membershipByGroupID[groupID] else { return }
+        let profile = MemberProfile(
+            groupID: groupID,
+            memberID: memberID,
+            displayName: localProfile.displayName,
+            avatarData: localProfile.avatarData
+        )
+        broadcastFrame(.profile(profile))
+    }
+
+    /// Apply a peer's `.profile` frame: cache the avatar (so a member who
+    /// only appears later via a presence stub still gets it) and patch
+    /// the live member record. Sticky — never overwrites a known field
+    /// with an empty one.
+    private func handleGossipedProfile(_ profile: MemberProfile) {
+        if let avatar = profile.avatarData {
+            avatarCacheByMember[profile.memberID] = avatar
+        }
+        applyProfile(profile, to: &currentGroup)
+        if let idx = myGroups.firstIndex(where: { $0.id == profile.groupID }) {
+            var group: GroupSession? = myGroups[idx]
+            if applyProfile(profile, to: &group), let group {
+                myGroups[idx] = group
+            }
+        }
+    }
+
+    /// Patch a single member's name/avatar inside `group` from a profile.
+    /// Returns whether anything changed. Avatar/name are sticky.
+    @discardableResult
+    private func applyProfile(_ profile: MemberProfile,
+                              to group: inout GroupSession?) -> Bool {
+        guard var g = group, g.id == profile.groupID,
+              let idx = g.members.firstIndex(where: { $0.id == profile.memberID })
+        else { return false }
+        var changed = false
+        if let avatar = profile.avatarData, g.members[idx].avatarData != avatar {
+            g.members[idx].avatarData = avatar
+            changed = true
+        }
+        if let name = profile.displayName, !name.isEmpty,
+           g.members[idx].displayName.isEmpty || g.members[idx].displayName == "Member" {
+            g.members[idx].displayName = name
+            changed = true
+        }
+        if changed { group = g }
+        return changed
     }
 
     /// Paginated scroll-to-top history fetch. Called by the timeline
@@ -3583,13 +3776,23 @@ final class AppState {
         // Merge: the reducer-derived snapshot carries authoritative
         // membership + banlist + expiry, but local member records hold
         // the freshest position/heading data. Patch the folded members
-        // with whichever copy has a newer `lastSeen`.
+        // with whichever copy has a newer `lastSeen` — but keep the
+        // avatar STICKY across the swap. A BLE presence stub refreshes
+        // lastSeen constantly yet carries no avatar, so a whole-record
+        // swap would wipe the avatar the `memberJoined` event just
+        // delivered. Never let a copy without an avatar overwrite one
+        // that has it.
         var merged = folded
         for i in merged.members.indices {
             let foldedMember = merged.members[i]
-            if let local = baseline.members.first(where: { $0.id == foldedMember.id }),
-               local.lastSeen > foldedMember.lastSeen {
-                merged.members[i] = local
+            guard let local = baseline.members.first(where: { $0.id == foldedMember.id })
+            else { continue }
+            if local.lastSeen > foldedMember.lastSeen {
+                var winner = local
+                if winner.avatarData == nil { winner.avatarData = foldedMember.avatarData }
+                merged.members[i] = winner
+            } else if merged.members[i].avatarData == nil {
+                merged.members[i].avatarData = local.avatarData
             }
         }
         // Carry the local invite code through — events don't always
@@ -3670,10 +3873,25 @@ final class AppState {
                 let cloudMember = updated.members[i]
                 let localCopy = active.members.first(where: { $0.id == cloudMember.id })
                 if let local = localCopy, local.lastSeen > cloudMember.lastSeen {
-                    updated.members[i] = local
+                    // Newest-wins for volatile fields (location, lastSeen),
+                    // but the avatar is STICKY: a BLE presence stub
+                    // refreshes lastSeen constantly yet carries no avatar,
+                    // so a whole-record swap would discard the avatar
+                    // CloudKit holds. Keep whichever copy actually has one.
+                    var merged = local
+                    if merged.avatarData == nil {
+                        merged.avatarData = cloudMember.avatarData
+                    }
+                    updated.members[i] = merged
                 } else if cloudMember.lastSeen > (localCopy?.lastSeen ?? .distantPast) {
                     // Cloud has fresher data — note that this peer is
-                    // currently reachable via the cloud transport.
+                    // currently reachable via the cloud transport. Still
+                    // carry over a local avatar if the cloud record hasn't
+                    // published one yet (its publish is throttled).
+                    if updated.members[i].avatarData == nil,
+                       let localAvatar = localCopy?.avatarData {
+                        updated.members[i].avatarData = localAvatar
+                    }
                     recordTransport(.cloud, for: cloudMember.id)
                 }
             }

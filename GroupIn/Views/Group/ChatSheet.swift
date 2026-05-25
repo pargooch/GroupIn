@@ -237,7 +237,10 @@ struct ChatSheet: View {
                             isLastInRun: Bool) -> some View {
         let myID = groupID.flatMap { appState.membershipByGroupID[$0] }
         let isMe = event.authorID == myID
-        let memberColor = Color.memberColor(for: event.authorID)
+        let memberColor = Color.memberColor(
+            for: event.authorID,
+            among: appState.currentGroup?.members.map(\.id) ?? []
+        )
         let member = appState.currentGroup?
             .members
             .first(where: { $0.id == event.authorID })

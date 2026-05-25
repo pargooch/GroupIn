@@ -33,6 +33,16 @@ struct HomeView: View {
         }
         .navigationTitle("GroupIn")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            // While Home is visible, periodically verify each group still
+            // exists server-side, so an owner's delete drops the group
+            // from this list even when we're not viewing it. Runs once on
+            // appear, then every 20s; cancelled when Home goes away.
+            while !Task.isCancelled {
+                await appState.sweepRemoteGroupExistence()
+                try? await Task.sleep(for: .seconds(20))
+            }
+        }
         #if DEBUG
         .toolbar {
             // Dev-only diagnostic surface. Tap to open the overlay
@@ -417,9 +427,10 @@ struct HomeView: View {
         let shown = Array(group.members.prefix(maxDots))
         let overflow = group.members.count - shown.count
 
+        let palette = Color.memberColors(among: group.members.map(\.id))
         HStack(spacing: -5) {
             ForEach(shown) { member in
-                let color = Color.memberColor(for: member.id)
+                let color = palette[member.id] ?? Color.memberColor(for: member.id)
                 let status = PresenceStatus(lastSeen: member.lastSeen,
                                             hasFix: member.coordinate != nil,
                                             now: now)

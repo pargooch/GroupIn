@@ -24,15 +24,27 @@ nonisolated enum PayloadFrame: Codable, Sendable {
     /// including avatars.
     case event(Event)
 
+    /// A member's identity (name + avatar) pushed directly to connected
+    /// peers. The event log already carries avatars inside `memberJoined`,
+    /// but those are stripped before persistence and a peer may connect
+    /// long after the join, so this frame lets a freshly-connected device
+    /// learn everyone's profile picture immediately — over MPC / Wi-Fi
+    /// Aware, which has capacity for the avatar blob — instead of waiting
+    /// on a CloudKit round-trip. It is NOT a timeline event: receivers
+    /// apply it to the member record and emit nothing.
+    case profile(MemberProfile)
+
     // MARK: Codable
 
     private enum CodingKeys: String, CodingKey {
         case type
         case event
+        case profile
     }
 
     private enum Kind: String, Codable {
         case event
+        case profile
     }
 
     init(from decoder: Decoder) throws {
@@ -42,6 +54,9 @@ nonisolated enum PayloadFrame: Codable, Sendable {
         case .event:
             let event = try container.decode(Event.self, forKey: .event)
             self = .event(event)
+        case .profile:
+            let profile = try container.decode(MemberProfile.self, forKey: .profile)
+            self = .profile(profile)
         }
     }
 
@@ -51,6 +66,9 @@ nonisolated enum PayloadFrame: Codable, Sendable {
         case .event(let event):
             try container.encode(Kind.event, forKey: .type)
             try container.encode(event, forKey: .event)
+        case .profile(let profile):
+            try container.encode(Kind.profile, forKey: .type)
+            try container.encode(profile, forKey: .profile)
         }
     }
 
@@ -63,4 +81,14 @@ nonisolated enum PayloadFrame: Codable, Sendable {
     static func decode(from data: Data) -> PayloadFrame? {
         try? JSONDecoder().decode(PayloadFrame.self, from: data)
     }
+}
+
+/// Identity payload for the `.profile` frame: who, in which group, with
+/// what name and avatar. Shared `groupID` / `memberID` match the values
+/// on the synced group, so receivers can patch the right member record.
+nonisolated struct MemberProfile: Codable, Sendable, Equatable {
+    let groupID: UUID
+    let memberID: UUID
+    let displayName: String?
+    let avatarData: Data?
 }

@@ -79,9 +79,18 @@ struct GroupSession: Identifiable, Hashable, Codable {
     /// complete GroupSession in-process without a CloudKit dependency.
     /// Alphabet excludes ambiguous characters (`0/O`, `1/I`) so the
     /// code is easier to share verbally.
-    static func generateInviteCode(length: Int = 6) -> String {
+    ///
+    /// Length is 16 because the invite code doubles as the end-to-end
+    /// encryption secret (the group key is `HKDF(code)`), and its
+    /// SHA-256 hash is stored in the public CloudKit DB for lookup. A
+    /// short code could be brute-forced from that hash and used to
+    /// derive the key, so we need real entropy: 16 × ~5 bits ≈ 80 bits,
+    /// which is infeasible to brute-force. Sharing is via QR / copy /
+    /// share-sheet; verbal sharing of a 16-char code isn't the path.
+    static func generateInviteCode(length: Int = 16) -> String {
         let alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-        return String((0..<length).map { _ in alphabet.randomElement()! })
+        var rng = SystemRandomNumberGenerator()  // CSPRNG on Apple platforms
+        return String((0..<length).map { _ in alphabet.randomElement(using: &rng)! })
     }
 
     /// True if `memberID` has accepted the current pending extension

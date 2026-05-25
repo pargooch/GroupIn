@@ -77,7 +77,15 @@ enum EventReducer {
                 // (the join event has no positional info), just refresh
                 // identity bits.
                 state.members[idx].displayName = displayName
-                state.members[idx].avatarData = avatarData
+                // Avatar is sticky: we strip avatars from `memberJoined`
+                // events before persistence (to stay under the
+                // UserDefaults ceiling), so a replayed/stripped join
+                // carries `nil`. Only overwrite when this event actually
+                // has an avatar — otherwise we'd wipe one already learned
+                // from CloudKit or a live (un-stripped) event.
+                if let avatarData {
+                    state.members[idx].avatarData = avatarData
+                }
                 state.members[idx].banHash = banHash
             } else {
                 state.members.append(user)

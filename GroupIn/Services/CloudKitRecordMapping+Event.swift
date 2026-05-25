@@ -40,8 +40,15 @@ extension Event {
             let authorIDString = record["authorID"] as? String,
             let authorID = UUID(uuidString: authorIDString),
             let createdAt = record["createdAt"] as? Date,
-            let payloadData = record["payload"] as? Data,
-            let payload = try? JSONDecoder().decode(EventPayload.self, from: payloadData)
+            let rawPayload = record["payload"] as? Data
+        else { return nil }
+
+        // Payload (chat text, member names, etc.): try to decrypt with
+        // the group key; legacy plaintext payloads fail `open` (fail
+        // closed) and fall back to the raw bytes. No Int flag — CloudKit
+        // Int round-tripping is unreliable.
+        let payloadData = GroupCrypto.open(rawPayload, groupID: groupID) ?? rawPayload
+        guard let payload = try? JSONDecoder().decode(EventPayload.self, from: payloadData)
         else { return nil }
 
         self.init(
@@ -67,7 +74,10 @@ extension Event {
         record["createdAt"] = createdAt
         record["type"] = typeIdentifier
         if let payloadData = try? JSONEncoder().encode(payload) {
-            record["payload"] = payloadData
+            // Seal the payload with the group key so chat/identity
+            // content is never plaintext in the public DB. Raw fallback
+            // if no key; decode auto-detects via trial decryption.
+            record["payload"] = GroupCrypto.seal(payloadData, groupID: groupID) ?? payloadData
         }
     }
 }

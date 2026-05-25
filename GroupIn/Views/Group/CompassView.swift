@@ -68,7 +68,10 @@ struct CompassView: View {
 
     var body: some View {
         let member = currentMember
-        let memberColor = Color.memberColor(for: memberID)
+        let memberColor = Color.memberColor(
+            for: memberID,
+            among: appState.currentGroup?.members.map(\.id) ?? []
+        )
         // Live reading first; if absent, fall back to the cached
         // reading inside the 30 s stale window. `cachedReading` is
         // refreshed every time a live reading lands (see

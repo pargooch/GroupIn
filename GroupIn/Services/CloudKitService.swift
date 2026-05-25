@@ -148,28 +148,49 @@ final class CloudKitService: CloudKitServicing {
             .uppercased()
         guard !normalized.isEmpty else { throw GroupServiceError.invalidCode }
 
-        let predicate = NSPredicate(format: "inviteCode == %@", normalized)
-        let query = CKQuery(recordType: GroupSession.recordType, predicate: predicate)
-
-        let matchResults: [(CKRecord.ID, Result<CKRecord, Error>)]
+        // Look up by the one-way hash (zero-knowledge — the backend
+        // never sees the code). Fall back to the legacy plaintext query
+        // so groups created before E2E are still joinable until their
+        // record is re-saved with the hash.
+        let record: CKRecord
         do {
-            let result = try await database.records(matching: query, resultsLimit: 1)
-            matchResults = result.matchResults
+            if let hashed = try await firstGroupRecord(
+                matching: NSPredicate(format: "inviteCodeHash == %@",
+                                      GroupCrypto.inviteCodeHash(normalized))) {
+                record = hashed
+            } else if let legacy = try await firstGroupRecord(
+                matching: NSPredicate(format: "inviteCode == %@", normalized)) {
+                record = legacy
+            } else {
+                throw GroupServiceError.groupNotFound
+            }
         } catch let error as CKError {
             throw mapCKError(error)
         }
 
-        guard let firstResult = matchResults.first?.1 else {
-            throw GroupServiceError.groupNotFound
+        // Derive the group key FIRST — the record's name and the member
+        // records are all sealed with it, so decoding needs it cached.
+        // The group record's name is the group UUID.
+        if let gid = UUID(uuidString: record.recordID.recordName) {
+            GroupCrypto.ensureKey(forGroup: gid, inviteCode: normalized)
         }
+        guard var group = GroupSession(record: record) else {
+            throw CloudKitError.invalidRecord
+        }
+        // The record no longer carries the code — stamp the one we joined
+        // with so local state has it.
+        group.inviteCode = normalized
+        group.members = try await fetchMembers(groupRecordID: record.recordID, groupID: group.id)
+        return group
+    }
 
-        switch firstResult {
-        case .success(let record):
-            guard var group = GroupSession(record: record) else {
-                throw CloudKitError.invalidRecord
-            }
-            group.members = try await fetchMembers(groupRecordID: record.recordID, groupID: group.id)
-            return group
+    /// First Group record matching `predicate`, or nil if none.
+    private func firstGroupRecord(matching predicate: NSPredicate) async throws -> CKRecord? {
+        let query = CKQuery(recordType: GroupSession.recordType, predicate: predicate)
+        let result = try await database.records(matching: query, resultsLimit: 1)
+        guard let first = result.matchResults.first?.1 else { return nil }
+        switch first {
+        case .success(let record): return record
         case .failure(let error):
             if let ckError = error as? CKError { throw mapCKError(ckError) }
             throw error

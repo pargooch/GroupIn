@@ -36,11 +36,14 @@ struct InviteQRSheet: View {
                     } label: {
                         HStack(spacing: 10) {
                             Text(inviteCode)
-                                .font(.system(size: 32, weight: .bold, design: .monospaced))
-                                .tracking(4)
+                                .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                .tracking(2)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.4)
                             Image(systemName: didCopy ? "checkmark.circle.fill" : "doc.on.doc")
                                 .foregroundStyle(didCopy ? Color.green : Color.accentColor)
                         }
+                        .padding(.horizontal, 24)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Invite code \(inviteCode), tap to copy")
