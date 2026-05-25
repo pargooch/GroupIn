@@ -272,7 +272,12 @@ struct HomeView: View {
             Button {
                 appState.path.append(needsProfileSetup ? .profileEditor : .createGroup)
             } label: {
-                Label("Create a Group", systemImage: "plus.circle.fill")
+                HStack(spacing: 12) {
+                    Image(systemName: "plus.circle.fill")
+                        .frame(width: 28)
+                    Text("Create a Group")
+                    Spacer(minLength: 0)
+                }
             }
             .buttonStyle(.neon)
             .listRowBackground(Color.clear)
@@ -285,7 +290,12 @@ struct HomeView: View {
             Button {
                 appState.path.append(needsProfileSetup ? .profileEditor : .joinGroup)
             } label: {
-                Label("Join a Group", systemImage: "person.badge.plus")
+                HStack(spacing: 12) {
+                    Image(systemName: "person.badge.plus")
+                        .frame(width: 28)
+                    Text("Join a Group")
+                    Spacer(minLength: 0)
+                }
             }
             .buttonStyle(.neonSecondary)
             .listRowBackground(Color.clear)

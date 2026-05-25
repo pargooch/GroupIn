@@ -150,6 +150,8 @@ struct MemberListSheet: View {
                     Text(row.member.displayName)
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                     HStack(spacing: 6) {
                         Text(distanceText)
                             .font(.caption.monospacedDigit())

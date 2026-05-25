@@ -27,11 +27,15 @@ struct ChatSheet: View {
 
     private static let maxLength = 240
 
+    /// Fixed deep cyan for my own bubbles. We can't use `.accentColor`
+    /// here: in dark mode the brand accent is bright cyan, and white
+    /// text on it fails contrast. This deeper tone keeps white text
+    /// readable in both light and dark while still reading as brand.
+    private static let myBubbleColor = Color(red: 0.0, green: 0.48, blue: 0.62)
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                diagnosticBanner
-                transportDiagnosticStrip
                 if timeline.isEmpty {
                     emptyState
                 } else {
@@ -85,99 +89,6 @@ struct ChatSheet: View {
         return appState.groupsAtStartOfHistory.contains(id)
     }
 
-    // MARK: - Banner
-
-    private struct BannerInfo {
-        let icon: String
-        let label: String
-        let tint: Color
-    }
-
-    private var bannerInfo: BannerInfo {
-        if appState.bleDiagnostics.serviceAddFailed {
-            return BannerInfo(
-                icon: "exclamationmark.triangle.fill",
-                label: "Bluetooth setup failed — try toggling Bluetooth off/on.",
-                tint: .red
-            )
-        }
-        let count = appState.transportDiagnostics.connectedPeers
-        if count == 0 {
-            return BannerInfo(
-                icon: "antenna.radiowaves.left.and.right.slash",
-                label: "No nearby members yet — messages still sync via iCloud and replay when peers come into range.",
-                tint: .orange
-            )
-        }
-        return BannerInfo(
-            icon: "antenna.radiowaves.left.and.right",
-            label: "Connected to \(count) nearby \(count == 1 ? "member" : "members").",
-            tint: .green
-        )
-    }
-
-    private var diagnosticBanner: some View {
-        let info = bannerInfo
-        return HStack(spacing: 8) {
-            Image(systemName: info.icon)
-                .foregroundStyle(info.tint)
-            Text(info.label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(info.tint.opacity(0.08))
-    }
-
-    /// Live read-out of the payload transport stages — exposes the
-    /// difference between "no one nearby", "discovered but invitation
-    /// stalled", and "session up but no data". Without this strip, the
-    /// "No nearby members yet" banner conflates four distinct failure
-    /// modes into one message.
-    ///   browsing/advertising — service started successfully?
-    ///   seen — peers discovered on the same service type
-    ///   invited — peers we've sent an MPC invitation to
-    ///   connected — peers in a live session
-    /// `seen == 0` while browsing is a strong hint that the Local
-    /// Network permission was denied (Settings → Privacy → Local Network).
-    private var transportDiagnosticStrip: some View {
-        let diag = appState.transportDiagnostics
-        let transportName = diag.selection.map(transportLabel) ?? "—"
-        return HStack(spacing: 8) {
-            chip(label: "via", value: transportName)
-            chip(label: "br", value: diag.isBrowsing ? "on" : "off")
-            chip(label: "adv", value: diag.isAdvertising ? "on" : "off")
-            chip(label: "seen", value: "\(diag.discoveredPeerCount)")
-            chip(label: "inv", value: "\(diag.invitedPeerCount)")
-            chip(label: "live", value: "\(diag.connectedPeers)")
-            Spacer()
-        }
-        .font(.caption2.monospaced())
-        .foregroundStyle(.secondary)
-        .padding(.horizontal)
-        .padding(.vertical, 6)
-        .background(Color(uiColor: .secondarySystemBackground))
-    }
-
-    private func transportLabel(_ selection: TransportSelection) -> String {
-        switch selection {
-        case .multipeer: return "MPC"
-        case .wifiAware: return "WA"
-        }
-    }
-
-    private func chip(label: String, value: String) -> some View {
-        HStack(spacing: 3) {
-            Text(label).foregroundStyle(.tertiary)
-            Text(value).foregroundStyle(.primary)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(.ultraThinMaterial, in: Capsule())
-    }
-
     // MARK: - Empty state
 
     @ViewBuilder
@@ -194,16 +105,19 @@ struct ChatSheet: View {
 
     @ViewBuilder
     private var timelineList: some View {
+        let events = timeline
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
+                // Spacing is controlled per-row (tight within a sender's
+                // run, looser between runs), so the stack itself is 0.
+                LazyVStack(alignment: .leading, spacing: 0) {
                     // Top sentinel: appearing in the visible region
                     // means the user scrolled to the very top — kick
                     // off an older-batch fetch (unless we're already
                     // loading or have reached the start).
                     topSentinel
-                    ForEach(timeline) { event in
-                        row(for: event)
+                    ForEach(Array(events.enumerated()), id: \.element.id) { index, event in
+                        row(for: event, at: index, in: events)
                             .id(event.id)
                     }
                 }
@@ -274,66 +188,120 @@ struct ChatSheet: View {
 
     // MARK: - Row dispatch
 
+    /// Avatar gutter width for incoming messages — the avatar size plus
+    /// its trailing spacing. Empty (clear) on non-last bubbles of a run
+    /// so a sender's clustered messages stay left-aligned under their
+    /// single avatar.
+    private static let avatarSize: CGFloat = 28
+
     @ViewBuilder
-    private func row(for event: Event) -> some View {
+    private func row(for event: Event, at index: Int, in events: [Event]) -> some View {
         switch event.payload {
         case .chatMessage(let text):
-            chatBubble(event: event, text: text)
+            let first = isFirstInRun(at: index, in: events)
+            let last = isLastInRun(at: index, in: events)
+            chatBubble(event: event, text: text, isFirstInRun: first, isLastInRun: last)
+                // Tight gap inside a run, larger gap when a new sender
+                // (or a system event) starts a fresh block.
+                .padding(.top, first ? 10 : 2)
         default:
             systemRow(event: event)
+                .padding(.top, 10)
         }
     }
 
+    /// Two adjacent chat events belong to the same visual cluster when
+    /// they're from the same author and close in time. A system event
+    /// between them naturally breaks the run (it isn't a chat message).
+    private func sameRun(_ a: Event, _ b: Event) -> Bool {
+        guard case .chatMessage = a.payload,
+              case .chatMessage = b.payload else { return false }
+        return a.authorID == b.authorID
+            && abs(b.createdAt.timeIntervalSince(a.createdAt)) < 5 * 60
+    }
+
+    private func isFirstInRun(at index: Int, in events: [Event]) -> Bool {
+        guard index > 0 else { return true }
+        return !sameRun(events[index - 1], events[index])
+    }
+
+    private func isLastInRun(at index: Int, in events: [Event]) -> Bool {
+        guard index < events.count - 1 else { return true }
+        return !sameRun(events[index], events[index + 1])
+    }
+
     @ViewBuilder
-    private func chatBubble(event: Event, text: String) -> some View {
+    private func chatBubble(event: Event,
+                            text: String,
+                            isFirstInRun: Bool,
+                            isLastInRun: Bool) -> some View {
         let myID = groupID.flatMap { appState.membershipByGroupID[$0] }
         let isMe = event.authorID == myID
         let memberColor = Color.memberColor(for: event.authorID)
-        let senderName = appState.currentGroup?
+        let member = appState.currentGroup?
             .members
-            .first(where: { $0.id == event.authorID })?
-            .displayName
-            // Fall back to historical events if the member already
-            // left the group: walk our own event log for a
-            // `memberJoined` carrying this author's displayName.
+            .first(where: { $0.id == event.authorID })
+        // Fall back to historical events if the member already left the
+        // group: walk our own event log for a `memberJoined` carrying
+        // this author's displayName.
+        let senderName = member?.displayName
             ?? historicalDisplayName(for: event.authorID)
             ?? "Member"
 
         HStack(alignment: .bottom, spacing: 8) {
-            if isMe { Spacer(minLength: 48) }
+            if isMe {
+                Spacer(minLength: 48)
+            } else {
+                // Avatar appears once per run, beside the last bubble.
+                if isLastInRun {
+                    AvatarView(data: member?.avatarData,
+                               name: senderName,
+                               size: Self.avatarSize,
+                               tint: memberColor)
+                        .overlay(
+                            Circle().strokeBorder(memberColor.opacity(0.6), lineWidth: 1)
+                        )
+                } else {
+                    Color.clear.frame(width: Self.avatarSize, height: Self.avatarSize)
+                }
+            }
 
             VStack(alignment: isMe ? .trailing : .leading, spacing: 3) {
-                if !isMe {
+                // Sender name only at the top of an incoming run.
+                if !isMe, isFirstInRun {
                     Text(senderName)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(memberColor)
+                        .padding(.leading, 4)
                 }
                 Text(text)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 9)
                     .background(
                         isMe
-                            ? Color.accentColor
-                            : memberColor.opacity(0.18),
-                        in: RoundedRectangle(cornerRadius: 16)
+                            ? AnyShapeStyle(Self.myBubbleColor)
+                            : AnyShapeStyle(memberColor.opacity(0.18)),
+                        in: RoundedRectangle(cornerRadius: 19, style: .continuous)
                     )
                     .foregroundStyle(isMe ? Color.white : Color.primary)
-                // Time + delivery dot row. Dots render only on our
-                // own outgoing bubbles — others' status is not ours
-                // to display.
-                HStack(spacing: 4) {
-                    Text(event.createdAt, style: .time)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    if isMe,
-                       let status = appState.deliveryStatus(for: event) {
-                        deliveryDot(for: status)
+                // Time + delivery dot only on the last bubble of a run,
+                // so a burst of messages isn't repeated under each line.
+                if isLastInRun {
+                    HStack(spacing: 4) {
+                        Text(event.createdAt, style: .time)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        if isMe,
+                           let status = appState.deliveryStatus(for: event) {
+                            deliveryDot(for: status)
+                        }
                     }
                 }
             }
 
             if !isMe { Spacer(minLength: 48) }
         }
+        .frame(maxWidth: .infinity, alignment: isMe ? .trailing : .leading)
     }
 
     /// Three-state WhatsApp-style delivery indicator. The single
@@ -418,7 +386,6 @@ struct ChatSheet: View {
     private var inputBar: some View {
         HStack(spacing: 10) {
             TextField("Message", text: $draft, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
                 .focused($inputFocused)
                 .onSubmit { send() }
@@ -427,15 +394,17 @@ struct ChatSheet: View {
                         draft = String(newValue.prefix(Self.maxLength))
                     }
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(
+                    Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
 
             Button(action: send) {
                 Image(systemName: "paperplane.fill")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 36, height: 36)
-                    .background(canSend ? Color.accentColor : Color.secondary.opacity(0.3),
-                                in: Circle())
-                    .foregroundStyle(.white)
             }
+            .buttonStyle(.neonIcon(tint: .accentColor, diameter: 40))
             .disabled(!canSend)
             .accessibilityLabel("Send")
         }

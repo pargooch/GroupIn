@@ -136,7 +136,10 @@ struct GroupDashboardView: View {
     private var content: some View {
         if let group = viewModel.group {
             groupList(group: group)
-                .navigationTitle(group.name)
+                // No nav-bar title: the group name + member count are
+                // already shown once in the drawer header (which stays
+                // visible even when the drawer is collapsed), so a
+                // nav-bar title would just duplicate it over the map.
                 .navigationBarTitleDisplayMode(.inline)
         } else {
             ContentUnavailableView(
@@ -178,20 +181,41 @@ struct GroupDashboardView: View {
     /// the thin drag indicator alone.
     @ViewBuilder
     private func drawerHeader(group: GroupSession) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(group.name)
-                .font(.title3.weight(.semibold))
-            Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+            // The ONLY place the group's identity is shown: category
+            // symbol + name + member count.
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(group.category.tint.opacity(0.18))
+                    Image(systemName: group.category.systemImage)
+                        .foregroundStyle(group.category.tint)
+                }
+                .frame(width: 44, height: 44)
+                .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(group.name)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(group.name), \(group.members.count) members")
+
+            Spacer(minLength: 8)
+
+            messagesButton
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 20)
         .padding(.top, 26)
         .padding(.bottom, 18)
         .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(group.name), \(group.members.count) members")
     }
 
     @ViewBuilder
@@ -252,31 +276,6 @@ struct GroupDashboardView: View {
     private func groupSection(group: GroupSession) -> some View {
         Section {
             VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 12) {
-                    HStack(spacing: 12) {
-                        ZStack {
-                            Circle()
-                                .fill(group.category.tint.opacity(0.18))
-                            Image(systemName: group.category.systemImage)
-                                .foregroundStyle(group.category.tint)
-                        }
-                        .frame(width: 40, height: 40)
-                        .accessibilityHidden(true)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(group.name)
-                                .font(.headline)
-                            Text(group.category.label)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(group.category.tint)
-                        }
-                        Spacer(minLength: 8)
-                    }
-                    .accessibilityElement(children: .combine)
-
-                    messagesButton
-                }
-
                 shareInviteButton(code: group.inviteCode)
 
                 expiryRow(group: group)
@@ -284,8 +283,6 @@ struct GroupDashboardView: View {
             .padding(.vertical, 6)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
-        } header: {
-            Text("Group")
         }
     }
 
@@ -494,6 +491,8 @@ struct GroupDashboardView: View {
                     Text(member.displayName)
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                     HStack(spacing: 6) {
                         if let distance {
                             Text(distance)
@@ -714,8 +713,6 @@ struct GroupDashboardView: View {
                     }
                 }
             }
-        } header: {
-            Text("Members (\(group.members.count))")
         } footer: {
             if group.members.isEmpty {
                 Text("No members yet").foregroundStyle(.secondary)
@@ -797,22 +794,19 @@ struct GroupDashboardView: View {
             showsChat = true
         } label: {
             Image(systemName: "bubble.left.and.bubble.right.fill")
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.white)
-                .frame(width: 46, height: 46)
-                .background(Color.accentColor, in: Circle())
-                .overlay(alignment: .topTrailing) {
-                    if !appState.chatMessages.isEmpty {
-                        Circle()
-                            .fill(.red)
-                            .frame(width: 11, height: 11)
-                            .overlay(
-                                Circle().strokeBorder(Color(.systemBackground), lineWidth: 2)
-                            )
-                    }
-                }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.neonIcon(tint: .accentColor, diameter: 46))
+        .overlay(alignment: .topTrailing) {
+            if !appState.chatMessages.isEmpty {
+                Circle()
+                    .fill(.red)
+                    .frame(width: 11, height: 11)
+                    .overlay(
+                        Circle().strokeBorder(Color(.systemBackground), lineWidth: 2)
+                    )
+                    .allowsHitTesting(false)
+            }
+        }
         .accessibilityLabel(appState.chatMessages.isEmpty
                             ? "Messages"
                             : "Messages, \(appState.chatMessages.count) unread")
@@ -887,11 +881,13 @@ struct GroupDashboardView: View {
                                 lineWidth: 2.5
                             )
                         )
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
                             Text(member.displayName)
                                 .font(.body.weight(.medium))
                                 .foregroundStyle(.primary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
                             if isMe {
                                 Text("You")
                                     .font(.caption2.weight(.semibold))
@@ -906,22 +902,25 @@ struct GroupDashboardView: View {
                                     .foregroundStyle(.orange)
                             }
                         }
-                        if !hasLocation {
-                            Text("No location yet")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        // Presence (and any "no location" note) sits on
+                        // a second line so the name always has the full
+                        // row width and never has to squeeze.
+                        HStack(spacing: 6) {
+                            PresenceBadge(status: status)
+                                .accessibilityHidden(true)
+                            if !hasLocation {
+                                Text("No location yet")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
+                    Spacer(minLength: 8)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!hasLocation || isMe)
-
-            Spacer()
-
-            PresenceBadge(status: status)
-                .accessibilityHidden(true)
 
             // Compass / Find is available regardless of whether the
             // peer currently has a coordinate. Indoors, no member
