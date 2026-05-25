@@ -234,7 +234,14 @@ struct HomeView: View {
                 }
             }
         } header: {
-            Text("Your groups")
+            // Hide the section header when there are no groups so the
+            // empty-state hero below stands on its own instead of
+            // sitting under a lonely "Your groups" label. Header
+            // content can vary freely — it isn't counted in the List
+            // row diff, so this can't trip the section-count assertion.
+            if !appState.myGroups.isEmpty {
+                Text("Your groups")
+            }
         } footer: {
             if appState.myGroups.isEmpty {
                 emptyGroupsState
@@ -281,29 +288,25 @@ struct HomeView: View {
     /// ForEach swap.
     @ViewBuilder
     private var emptyGroupsState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "person.3.sequence.fill")
-                .font(.system(size: 52, weight: .semibold))
-                .symbolRenderingMode(.palette)
-                .foregroundStyle(.cyan, .pink, .green)
-                .shadow(color: .cyan.opacity(0.7), radius: 7)
-                .shadow(color: .pink.opacity(0.6), radius: 11)
-                .accessibilityHidden(true)
+        VStack(spacing: 20) {
+            EmptyGroupsHero()
 
-            Text("No groups yet")
-                .font(.headline)
-                .foregroundStyle(.primary)
+            VStack(spacing: 8) {
+                Text("Find your people")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.primary)
 
-            Text("Create one or join with a code to start finding your friends in real time — online or off.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 12)
+                Text("Create a group or join with a code — then see everyone in real time, online or off.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("No groups yet. Create one or join with a code.")
+        .accessibilityLabel("No groups yet. Create a group or join with a code to find your friends.")
     }
 
     @ViewBuilder
@@ -318,13 +321,18 @@ struct HomeView: View {
             .frame(width: 40, height: 40)
             .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(group.name)
                     .font(.headline)
-                Text("Code \(group.inviteCode) · \(group.members.count) member\(group.members.count == 1 ? "" : "s")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                expiryLine(group: group)
+                // Live presence bridges Home to the neon dashboard /
+                // compass: each member shows as a colored dot in their
+                // assigned color, glowing when they're live. Recompute
+                // on a 15 s tick so freshness decays even while Home
+                // stays open.
+                TimelineView(.periodic(from: .now, by: 15)) { context in
+                    presenceRow(group: group, now: context.date)
+                }
+                metaLine(group: group)
             }
             Spacer()
             Image(systemName: "chevron.right")
@@ -334,23 +342,247 @@ struct HomeView: View {
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(group.category.label) group \(group.name)")
+        .accessibilityLabel(rowAccessibilityLabel(group))
     }
 
+    /// Member-color dot cluster + a "sharing" summary. The dots use the
+    /// same per-member palette as the map markers and compass, so a
+    /// group's people are recognizable across every surface.
     @ViewBuilder
-    private func expiryLine(group: GroupSession) -> some View {
+    private func presenceRow(group: GroupSession, now: Date) -> some View {
+        let statuses = group.members.map {
+            PresenceStatus(lastSeen: $0.lastSeen,
+                           hasFix: $0.coordinate != nil,
+                           now: now)
+        }
+        let activeCount = statuses.filter(\.isActivelySharing).count
+
+        HStack(spacing: 8) {
+            memberDots(group: group, now: now)
+
+            if activeCount > 0 {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(.green)
+                        .frame(width: 6, height: 6)
+                    Text("\(activeCount) active")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green)
+                }
+            } else {
+                Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Up to four overlapping member-color dots, with a "+N" overflow.
+    /// Live members are fully saturated and glow; everyone else is
+    /// dimmed — the dot brightness honestly tracks `lastSeen` freshness.
+    @ViewBuilder
+    private func memberDots(group: GroupSession, now: Date) -> some View {
+        let maxDots = 4
+        let shown = Array(group.members.prefix(maxDots))
+        let overflow = group.members.count - shown.count
+
+        HStack(spacing: -5) {
+            ForEach(shown) { member in
+                let color = Color.memberColor(for: member.id)
+                let status = PresenceStatus(lastSeen: member.lastSeen,
+                                            hasFix: member.coordinate != nil,
+                                            now: now)
+                Circle()
+                    .fill(color.opacity(status.isActivelySharing ? 1.0 : 0.4))
+                    .frame(width: 13, height: 13)
+                    .overlay(
+                        Circle().strokeBorder(
+                            Color(uiColor: .secondarySystemGroupedBackground),
+                            lineWidth: 1.5
+                        )
+                    )
+                    .shadow(color: status.isLive ? color.opacity(0.9) : .clear,
+                            radius: status.isLive ? 3 : 0)
+            }
+            if overflow > 0 {
+                Text("+\(overflow)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 9)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    /// Invite code + expiry on one muted line. Expiry turns orange when
+    /// the group is within 30 minutes of ending (or has a pending
+    /// extension); the code stays secondary regardless.
+    @ViewBuilder
+    private func metaLine(group: GroupSession) -> some View {
+        let urgent = group.expiresAt.timeIntervalSinceNow < 30 * 60
+        let expiryTint: Color = urgent ? .orange : .secondary
+
         HStack(spacing: 4) {
+            Text("Code \(group.inviteCode)")
+                .foregroundStyle(.secondary)
+            Text("·")
+                .foregroundStyle(.tertiary)
             Image(systemName: group.hasPendingExtension ? "clock.arrow.circlepath" : "clock")
-                .font(.caption2)
+                .foregroundStyle(expiryTint)
             Text("Expires \(group.expiresAt, style: .relative)")
-                .font(.caption2)
+                .foregroundStyle(expiryTint)
             if group.hasPendingExtension {
                 Text("· extension pending")
-                    .font(.caption2)
                     .foregroundStyle(.orange)
             }
         }
-        .foregroundStyle(group.expiresAt.timeIntervalSinceNow < 30 * 60 ? .orange : .secondary)
+        .font(.caption2)
+    }
+
+    /// Spoken summary for the whole row: category, name, how many
+    /// members are active, and when it expires.
+    private func rowAccessibilityLabel(_ group: GroupSession) -> String {
+        let count = group.members.count
+        let activeCount = group.members.filter {
+            PresenceStatus(lastSeen: $0.lastSeen,
+                           hasFix: $0.coordinate != nil).isActivelySharing
+        }.count
+
+        var parts = ["\(group.category.label) group \(group.name)"]
+        parts.append("\(count) member\(count == 1 ? "" : "s")")
+        if activeCount > 0 {
+            parts.append("\(activeCount) active")
+        }
+        parts.append("expires \(group.expiresAt.formatted(.relative(presentation: .named)))")
+        return parts.joined(separator: ", ")
+    }
+}
+
+// MARK: - Empty-state radar hero
+
+/// The first-run hero: a neon "radar" that visualizes what GroupIn
+/// does — *you* at the center (the glowing cyan core), and friends
+/// (member-color dots) waiting to be found, with sonar pulses sweeping
+/// outward across faint range rings. It reuses the compass's electric-
+/// cyan accent and the same per-member palette as the map markers, so
+/// the empty screen already feels like the rest of the app.
+///
+/// Every animation is gated behind `accessibilityReduceMotion`: with
+/// Reduce Motion on, the pulses are dropped and the dots/core render
+/// as a single still frame — the radar still looks complete, it just
+/// stops moving.
+private struct EmptyGroupsHero: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Electric cyan — the compass's "reactor core" accent. Kept in
+    /// sync with `CompassView.orbAccent` so the brand color reads the
+    /// same on the first screen as on the finding screen.
+    private static let accent = Color(red: 0.30, green: 0.92, blue: 1.00)
+
+    private let canvas: CGFloat = 210
+    private static let ringDiameters: [CGFloat] = [84, 144, 204]
+
+    /// Orbiting "friends," spaced ~120° apart at varied radii so the
+    /// composition reads as a scatter rather than a clock face. Colors
+    /// are drawn straight from the member palette.
+    private let dots: [(color: Color, angle: Double, radius: CGFloat)] = [
+        (.cyan,  20,  96),
+        (.green, 140, 88),
+        (.pink,  250, 80)
+    ]
+
+    var body: some View {
+        ZStack {
+            RadialGradient(
+                colors: [Self.accent.opacity(0.16), .clear],
+                center: .center,
+                startRadius: 4,
+                endRadius: canvas / 2
+            )
+
+            rangeRings
+
+            if !reduceMotion {
+                TimelineView(.animation) { context in
+                    let t = context.date.timeIntervalSinceReferenceDate
+                    ZStack {
+                        sonarPulse(phase: phase(t, offset: 0))
+                        sonarPulse(phase: phase(t, offset: 0.5))
+                    }
+                }
+            }
+
+            memberDots
+            core
+        }
+        .frame(width: canvas, height: canvas)
+        .accessibilityHidden(true)
+    }
+
+    private var rangeRings: some View {
+        ZStack {
+            ForEach(Self.ringDiameters, id: \.self) { d in
+                Circle()
+                    .strokeBorder(Self.accent.opacity(0.14), lineWidth: 1)
+                    .frame(width: d, height: d)
+            }
+        }
+    }
+
+    /// 0→1 saw wave with a phase offset, so two pulses can ride the
+    /// same clock half a cycle apart for a continuous sweep.
+    private func phase(_ t: TimeInterval, offset: Double) -> Double {
+        let period = 3.4
+        return ((t / period) + offset).truncatingRemainder(dividingBy: 1)
+    }
+
+    /// One expanding ring that grows from the core and fades as it
+    /// reaches the outer range ring.
+    private func sonarPulse(phase: Double) -> some View {
+        let scale = 0.2 + phase * 0.8          // 0.2 → 1.0
+        let opacity = (1 - phase) * 0.4
+        return Circle()
+            .strokeBorder(Self.accent.opacity(opacity), lineWidth: 1.5)
+            .frame(width: canvas, height: canvas)
+            .scaleEffect(scale)
+    }
+
+    private var memberDots: some View {
+        TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1.0 / 30,
+                                paused: reduceMotion)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            ZStack {
+                ForEach(Array(dots.enumerated()), id: \.offset) { index, dot in
+                    let breath = reduceMotion
+                        ? 1.0
+                        : (0.88 + 0.12 * sin(t * 1.8 + Double(index) * 1.3))
+                    let rad = dot.angle * .pi / 180
+                    Circle()
+                        .fill(dot.color)
+                        .frame(width: 14, height: 14)
+                        .shadow(color: dot.color.opacity(0.9), radius: 6)
+                        .shadow(color: dot.color.opacity(0.5), radius: 13)
+                        .scaleEffect(breath)
+                        .offset(x: dot.radius * CGFloat(sin(rad)),
+                                y: -dot.radius * CGFloat(cos(rad)))
+                }
+            }
+        }
+    }
+
+    /// "You" — the radar origin. A bright cyan core inside a soft halo.
+    private var core: some View {
+        ZStack {
+            Circle()
+                .fill(Self.accent.opacity(0.25))
+                .frame(width: 42, height: 42)
+                .blur(radius: 9)
+            Circle()
+                .fill(Self.accent)
+                .frame(width: 16, height: 16)
+                .overlay(Circle().strokeBorder(.white.opacity(0.7), lineWidth: 1))
+                .shadow(color: Self.accent.opacity(0.9), radius: 8)
+        }
     }
 }
 

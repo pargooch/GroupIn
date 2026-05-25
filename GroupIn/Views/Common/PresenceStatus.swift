@@ -50,6 +50,24 @@ enum PresenceStatus {
         }
     }
 
+    /// True only for a fresh real-time fix (< 30 s). Drives the bright
+    /// glow on a member dot.
+    var isLive: Bool {
+        if case .live = self { return true }
+        return false
+    }
+
+    /// True when the member is live OR was seen in the last few minutes
+    /// — "recently sharing." Deliberately broader than `isLive` so the
+    /// Home summary stays stable instead of flickering as fixes land,
+    /// and honest: it never claims real-time, only recent activity.
+    var isActivelySharing: Bool {
+        switch self {
+        case .live, .recent: return true
+        case .stale, .offline: return false
+        }
+    }
+
     var label: String {
         switch self {
         case .live:                return "Live"
