@@ -12,7 +12,6 @@ struct GroupDashboardView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.colorScheme) private var colorScheme
     @State private var viewModel: GroupDashboardViewModel
-    @State private var didCopyInviteCode = false
     @State private var showsLocationHelp = false
     @State private var compassMember: User?
     @State private var showsChat = false
@@ -278,7 +277,7 @@ struct GroupDashboardView: View {
                     messagesButton
                 }
 
-                inviteCodeButton(code: group.inviteCode)
+                shareInviteButton(code: group.inviteCode)
 
                 expiryRow(group: group)
             }
@@ -331,44 +330,55 @@ struct GroupDashboardView: View {
         }
     }
 
+    /// Single entry point for inviting people. Replaces the old
+    /// copy-pill + separate QR button pair: every invite path (QR for
+    /// in-person, copyable code, system share sheet) now lives behind
+    /// this one control, inside `InviteQRSheet`. The code stays visible
+    /// here so the owner can read it at a glance without opening the
+    /// sheet.
     @ViewBuilder
-    private func inviteCodeButton(code: String) -> some View {
-        HStack(spacing: 12) {
-            Button {
-                copyInviteCode(code)
-            } label: {
-                HStack(spacing: 8) {
-                    Text("Invite Code")
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    Text(code)
-                        .font(.callout.weight(.semibold))
-                        .monospaced()
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(Color.accentColor.opacity(0.12), in: Capsule())
-                    Image(systemName: didCopyInviteCode ? "checkmark.circle.fill" : "doc.on.doc")
-                        .foregroundStyle(didCopyInviteCode ? Color.green : Color.accentColor)
-                        .accessibilityHidden(true)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Invite code \(code), tap to copy")
-
-            Button {
-                showsInviteQR = true
-            } label: {
-                Image(systemName: "qrcode")
-                    .font(.title3)
+    private func shareInviteButton(code: String) -> some View {
+        Button {
+            showsInviteQR = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.body.weight(.semibold))
                     .foregroundStyle(Color.accentColor)
-                    .frame(width: 36, height: 36)
-                    .contentShape(Rectangle())
+                    .frame(width: 28)
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Share Invite")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text("QR code, link, or copy the code")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Text(code)
+                    .font(.callout.weight(.semibold))
+                    .monospaced()
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    .accessibilityHidden(true)
+
+                Image(systemName: "chevron.right")
+                    .font(.footnote)
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Show invite QR code")
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Share invite, code \(code)")
+        .accessibilityHint("Opens the invite sheet with a QR code and sharing options")
     }
 
     /// The map pane pinned to the top half of the dashboard.
@@ -850,16 +860,6 @@ struct GroupDashboardView: View {
         }
     }
 
-    private func copyInviteCode(_ code: String) {
-        UIPasteboard.general.string = code
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
-        didCopyInviteCode = true
-        Task {
-            try? await Task.sleep(for: .seconds(2))
-            didCopyInviteCode = false
-        }
-    }
-
     // MARK: - Member row
 
     @ViewBuilder
@@ -933,7 +933,17 @@ struct GroupDashboardView: View {
             PresenceBadge(status: status)
                 .accessibilityHidden(true)
 
-            if hasLocation && !isMe {
+            // Compass / Find is available regardless of whether the
+            // peer currently has a coordinate. Indoors, no member
+            // has a coordinate (CoreLocation can't fix), so gating
+            // this button on `hasLocation` is exactly wrong — that's
+            // the moment the user most needs the BLE / UWB indoor
+            // compass. The compass view's own bearing cascade handles
+            // missing-GPS gracefully and falls through to BLE gradient
+            // or UWB direction. The route-on-map button above still
+            // needs `hasLocation` (it draws a line on the map and a
+            // missing coordinate is meaningless there).
+            if !isMe {
                 Button {
                     compassMember = member
                 } label: {
@@ -982,7 +992,9 @@ struct GroupDashboardView: View {
             routeTargetID = willClear ? nil : member.id
         }
         .accessibilityAction(named: "Open compass to find \(member.displayName)") {
-            guard hasLocation, !isMe else { return }
+            // Compass works without a coordinate (BLE / UWB fallback);
+            // don't gate on hasLocation. See sibling button above.
+            guard !isMe else { return }
             compassMember = member
         }
     }

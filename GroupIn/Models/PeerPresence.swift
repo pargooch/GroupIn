@@ -80,6 +80,15 @@ struct PeerPresence: Codable, Equatable {
     /// backwards-compat. Nil when the device has no UWB hardware.
     let nearbyToken: Data?
 
+    /// Sender's most recent RSSI measurement of every group member
+    /// they've seen recently, keyed by that member's per-group UUID.
+    /// The compass engine on the *receiving* side pulls out
+    /// `rssiOfPeers[myMemberID]` — "what the peer thinks our RSSI
+    /// is" — and fuses it with its own local measurement to denoise
+    /// via bilateral agreement. Optional for backwards-compat with
+    /// clients that don't yet ship the field.
+    let rssiOfPeers: [UUID: Double]?
+
     init(groupHash: UInt32,
          memberID: UUID,
          displayName: String? = nil,
@@ -92,7 +101,8 @@ struct PeerPresence: Codable, Equatable {
          positionAnchorAt: Date? = nil,
          eventCursor: EventCursor? = nil,
          transportCapability: TransportCapability? = nil,
-         nearbyToken: Data? = nil) {
+         nearbyToken: Data? = nil,
+         rssiOfPeers: [UUID: Double]? = nil) {
         self.groupHash = groupHash
         self.memberID = memberID
         self.displayName = displayName
@@ -107,6 +117,7 @@ struct PeerPresence: Codable, Equatable {
         self.eventCursorID = eventCursor?.id
         self.transportCapability = transportCapability
         self.nearbyToken = nearbyToken
+        self.rssiOfPeers = rssiOfPeers
     }
 
     /// Materialized event cursor, or nil if either field is missing.
@@ -134,6 +145,7 @@ struct PeerPresence: Codable, Equatable {
         self.eventCursorID = try? c.decode(UUID.self, forKey: .eventCursorID)
         self.transportCapability = try? c.decode(TransportCapability.self, forKey: .transportCapability)
         self.nearbyToken = try? c.decode(Data.self, forKey: .nearbyToken)
+        self.rssiOfPeers = try? c.decode([UUID: Double].self, forKey: .rssiOfPeers)
     }
 
     func encoded() -> Data? {

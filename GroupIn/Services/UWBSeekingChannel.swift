@@ -37,32 +37,30 @@ final class UWBSeekingChannel: SeekingChannel {
     }
 
     func engage(targetMemberID memberID: UUID) {
-        guard engagedMembers.insert(memberID).inserted else { return }
-        uwbService.start()
-        // Token exchange is handled by AppState's existing
-        // `startUWBTracking` flow — we don't re-invent it here. The
-        // router calls into the seeking channel to engage; AppState
-        // handles the side effect of publishing the local token to
-        // CloudKit and opening the session against the peer's token
-        // once it's known.
+        // We only gate which members' readings get FORWARDED to the dial.
+        // The NISession lifecycle (start/stop) and `track` are owned by
+        // AppState, tied to BLE presence + token exchange — NOT the
+        // compass. Recreating the session on every compass open/close
+        // minted a new discovery token each time, which broke the
+        // bilateral NISession pairing and left one phone with zero
+        // readings. Keeping the session stable across open/close is the
+        // fix; here we just start/stop forwarding.
+        engagedMembers.insert(memberID)
     }
 
     func disengage(targetMemberID memberID: UUID) {
-        guard engagedMembers.remove(memberID) != nil else { return }
-        uwbService.untrack(memberID: memberID)
-        if engagedMembers.isEmpty {
-            uwbService.stop()
-        }
+        // Stop forwarding this member's readings to the dial, but leave
+        // the NISession ranging so the link stays warm for re-open and so
+        // the peer keeps getting readings from us (ranging is bilateral).
+        engagedMembers.remove(memberID)
     }
 
     func stop() {
-        for member in engagedMembers {
-            uwbService.untrack(memberID: member)
-        }
+        // Channel teardown = stop forwarding only. The session itself is
+        // torn down by AppState on `stopBLEPresence`. The consumer task
+        // stays alive (it's bound to the channel's lifetime) so a later
+        // re-engage resumes forwarding without re-subscribing.
         engagedMembers.removeAll()
-        uwbService.stop()
-        consumerTask?.cancel()
-        consumerTask = nil
         lastReadingByMember.removeAll()
     }
 

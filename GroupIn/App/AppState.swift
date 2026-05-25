@@ -224,6 +224,29 @@ final class AppState {
     let motionService: MotionActivityServicing
     let uwbSessionService: UWBSessionServicing
     let deadReckoningService: DeadReckoningServicing
+    /// High-rate device-motion + activity sensing. Feeds the compass
+    /// step pipeline two signals: (a) buffered attitude so each step
+    /// projects in the heading the device was actually pointing at
+    /// when it happened, and (b) a PCA-derived walking-direction
+    /// inference for windows where CMAttitude heading is unreliable
+    /// (low magnetic field quality, phone-in-pocket misalignment).
+    let orientationService = OrientationService()
+    /// Read-only HealthKit aggregates (today's steps + distance) for
+    /// the debug telemetry panel. Best-effort; no-ops without the
+    /// HealthKit entitlement.
+    let healthKitService = HealthKitService()
+    /// ARKit visual-inertial odometry — drift-free cm-scale ego-motion,
+    /// the prediction input the relative-pose EKF needs to triangulate
+    /// the peer's bearing from UWB range. Runs ONLY while the compass is
+    /// open (started in `startRelativePoseFusion`, stopped on close), so
+    /// the camera never streams in the background.
+    let visualOdometry = VisualOdometryService()
+    /// EKF that *fuses* all seeking channels (UWB range+direction,
+    /// BLE gradient bearing, RSSI path-loss distance) plus our own
+    /// motion into one relative-position estimate with covariance.
+    /// This is the channel fuser that supersedes the channel selector
+    /// for the actively-sought peer.
+    let relativePoseFilter = RelativePoseFilter()
     /// Router that picks the best seeking channel (UWB → Wi-Fi Aware
     /// → BLE) per peer based on shared capability bits, and forwards
     /// ranging samples upward under one stable stream.
@@ -244,6 +267,9 @@ final class AppState {
     private var lastLocationPublishAt: Date?
     private static let publishInterval: TimeInterval = 10
     private var bleConsumerTask: Task<Void, Never>?
+    /// Consumer of peers' UWB tokens arriving over the dedicated
+    /// nearby-token GATT characteristic. Drives `uwbSessionService.track`.
+    private var nearbyTokenTask: Task<Void, Never>?
     /// Consumer of the seeking router's unified ranging stream.
     /// Replaces the old per-channel `bleRSSITask` and
     /// `uwbReadingsTask` — every channel's samples now arrive here.
@@ -253,10 +279,26 @@ final class AppState {
     private var pushTask: Task<Void, Never>?
     private var headingBuffer: [Double] = []
     private static let headingSmoothingWindow = 5
+    /// Throttle for mirroring heading into `currentGroup` (whose didSet
+    /// persists). Keeps the per-degree CLHeading stream from triggering a
+    /// UserDefaults write storm on the main actor.
+    private var lastHeadingGroupMirrorAt: Date = .distantPast
 
     /// Compass gradient state. Public so view models can query bearings;
     /// AppState owns the writes.
     private(set) var compassEngine = CompassEngine()
+
+    #if DEBUG
+    /// DEBUG-only telemetry streamer — POSTs the indoor-compass debug
+    /// snapshot to a LAN collector at ~1 Hz while BLE presence is up, so
+    /// the signal pipeline can be diagnosed live across two phones.
+    /// Compiled out of release builds entirely.
+    private let debugUploader = DebugTelemetryUploader()
+    private var debugTelemetryTask: Task<Void, Never>?
+    /// Count of full-presence merges over GATT (debug). Distinguishes
+    /// "presence delivered" from "only the connectionless RSSI token."
+    private(set) var debugPresenceMerges = 0
+    #endif
 
     /// Most recent UWB reading per peer. The compass view reads this to
     /// override its GPS/RSSI bearing when a fresh reading is present.
@@ -672,13 +714,6 @@ final class AppState {
     private func tickHeartbeat() {
         guard !myGroups.isEmpty else { return }
 
-        // Adaptive "walk a few steps" prompt: when we're a seeker in
-        // an active group and every known peer's last-seen has gone
-        // stale, the compass arrow is decaying. Schedule a notification
-        // asking the user to move. Cancelled on the next fresh peer
-        // update via `mergeBLEPeer`.
-        checkPeerStalenessForPrompt()
-
         // Skip if a real location fix already kept us fresh — keeps the
         // CloudKit write rate from doubling when we're moving.
         let now = Date()
@@ -777,21 +812,11 @@ final class AppState {
         guard uwbSessionService.isSupported else { return }
         uwbSessionService.start()
 
-        // Publish the fresh token so the peer can fetch it on their next
-        // refresh / push and start a session targeting us.
-        if let tokenData = uwbSessionService.localTokenData {
-            currentUser.nearbyToken = tokenData
-            if var group = currentGroup,
-               let idx = group.members.firstIndex(where: { $0.id == currentUser.id }) {
-                group.members[idx].nearbyToken = tokenData
-                currentGroup = group
-                addOrUpdate(group: group)
-                let me = currentUser
-                Task { [groupService = self.groupService, me, group] in
-                    try? await groupService.publish(user: me, in: group)
-                }
-            }
-        }
+        // Publish our token on the dedicated nearby-token GATT
+        // characteristic so the peer reads it and opens a NISession
+        // against us (the offline, BLE-only path now that the token no
+        // longer rides in presence).
+        blePresenceService.updateNearbyToken(uwbSessionService.localTokenData)
 
         // If we already have the target's token cached, start the
         // peer session immediately. Otherwise the next CloudKit refresh
@@ -825,12 +850,210 @@ final class AppState {
                 )
             }
         }
+        startRelativePoseFusion(targetMemberID: targetMemberID)
     }
 
     func stopActiveSeeking() {
         seekingSignalRefreshTask?.cancel()
         seekingSignalRefreshTask = nil
         activelySeekingMember = nil
+        stopRelativePoseFusion()
+    }
+
+    // MARK: - Relative-pose fusion (EKF)
+    //
+    // The fuser supersedes the channel selector for the actively-sought
+    // peer. Observations flow in from `handleRangingSample` (UWB / BLE);
+    // our own motion drives the prediction step from the pedometer-
+    // derived delta accumulated in `handleStepBatch`. A 5 Hz loop runs
+    // predict + the weaker (bearing / RSSI-range) corrections; the strong
+    // UWB correction is applied event-driven the instant a UWB sample
+    // lands.
+
+    private var poseTargetMemberID: UUID?
+    private var relativePoseTask: Task<Void, Never>?
+    private var lastPosePredictAt: Date?
+    /// World-frame displacement accumulated from the step pipeline since
+    /// the last predict. Metres.
+    private var pendingMotionEast: Double = 0
+    private var pendingMotionNorth: Double = 0
+    /// When UWB last delivered a range to the EKF. While this is fresh we
+    /// suppress the noisy RSSI path-loss range (±many metres) so it can't
+    /// fight UWB's centimetre-grade range — the EKF triangulates bearing
+    /// from clean UWB range + our own motion.
+    private var lastUWBRangeAt: Date?
+    private static let uwbRangeFreshness: TimeInterval = 3
+    /// Upper bound on plausible human speed (m/s) used to reject ARKit
+    /// relocalization jumps from the EKF prediction. ~7 m/s is a sprint;
+    /// anything above is a tracking discontinuity, not real motion.
+    private static let maxPlausibleSpeed: Double = 7.0
+    /// Wall-clock mark for the last VIO displacement query, so each tick
+    /// pulls the motion since the previous tick.
+    private var lastVIODisplacementAt: Date?
+    // EKF diagnostics (debug telemetry) — confirm it's being fed.
+    private(set) var debugEKFRangeUpdates = 0
+    private(set) var debugEKFPredicts = 0
+    private(set) var debugLastMotionMag: Double = 0
+
+    private static let posePredictInterval: TimeInterval = 0.2  // 5 Hz
+    /// RSSI→distance path-loss model for the weak range correction:
+    /// d = d0 · 10^((RSSI0 − RSSI) / (10·n)). Indoor exponent n ≈ 2.5.
+    private static let rssiRefDBm: Double = -45     // RSSI0 at d0 = 1 m
+    private static let rssiPathLossN: Double = 2.5
+    private static let rssiRangeSigma: Double = 6.0 // metres — deliberately loose
+
+    private func startRelativePoseFusion(targetMemberID: UUID) {
+        poseTargetMemberID = targetMemberID
+        relativePoseFilter.reset()
+        lastPosePredictAt = Date()
+        lastVIODisplacementAt = Date()
+        pendingMotionEast = 0
+        pendingMotionNorth = 0
+        lastUWBRangeAt = nil
+        debugEKFRangeUpdates = 0
+        debugEKFPredicts = 0
+        debugLastMotionMag = 0
+        // NOTE: VIO is NOT started here. The camera should only run when
+        // indoor positioning is actually the active strategy — the
+        // compass drives that via `setIndoorPositioningActive` (indoor
+        // mode, or auto having fallen to indoor). The EKF still runs and
+        // fuses UWB; it just uses the pedometer for prediction until VIO
+        // comes up.
+
+        relativePoseTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.posePredictInterval))
+                guard let self else { return }
+                self.tickRelativePoseFusion()
+            }
+        }
+    }
+
+    private func stopRelativePoseFusion() {
+        relativePoseTask?.cancel()
+        relativePoseTask = nil
+        poseTargetMemberID = nil
+        visualOdometry.stop()
+        relativePoseFilter.reset()
+    }
+
+    /// Drive camera-assisted UWB based on whether indoor positioning is
+    /// the active compass strategy. Called by the compass: true in indoor
+    /// mode (manual) or when auto has fallen to indoor (GPS unreliable);
+    /// false in GPS mode or with a good GPS fix — so the camera only runs
+    /// when it's actually helping find someone indoors.
+    func setIndoorPositioningActive(_ active: Bool) {
+        guard poseTargetMemberID != nil else {
+            uwbSessionService.setCameraAssistance(false)
+            visualOdometry.stop()
+            return
+        }
+        // Use the camera for UWB DIRECTION (camera-assisted ranging), NOT
+        // a separate VIO ARSession. NISession owns the single camera — the
+        // earlier crashes were VIO's ARSession conflicting with NISession's
+        // camera assistance. If camera assistance can't run on this device,
+        // UWBSessionService latches it off and falls back to raw ranging.
+        // VIO stays off (its only job was EKF ego-motion, which we don't
+        // need when UWB gives direction directly).
+        visualOdometry.stop()
+        uwbSessionService.setCameraAssistance(active)
+    }
+
+    /// 5 Hz: predict from our motion, then apply the weak BLE-bearing
+    /// and RSSI-range corrections. UWB corrections are event-driven
+    /// (see `feedPoseFilter`).
+    private func tickRelativePoseFusion() {
+        guard let target = poseTargetMemberID else { return }
+        let now = Date()
+
+        // Prediction: our own world-frame displacement since the last
+        // tick. Prefer VIO's drift-free cm-scale displacement; fall back
+        // to the pedometer-accumulated delta only when VIO isn't tracking
+        // (camera occluded / starting up). VIO is what makes range-only
+        // bearing triangulation actually converge.
+        let dt = now.timeIntervalSince(lastPosePredictAt ?? now)
+        var east: Double
+        var north: Double
+        if visualOdometry.isTracking,
+           let vio = visualOdometry.horizontalDisplacement(since: lastVIODisplacementAt ?? now) {
+            east = vio.east
+            north = vio.north
+            lastVIODisplacementAt = now
+            // Reject ARKit relocalization JUMPS — a multi-metre step in a
+            // single 0.2 s tick is physically impossible (>~7 m/s) and is
+            // a tracking discontinuity, not real motion. Feeding it would
+            // teleport the EKF estimate. Drop the delta (treat as no
+            // motion this tick); the next tick measures from the new
+            // post-jump origin.
+            let mag = (east * east + north * north).squareRoot()
+            let maxStep = Self.maxPlausibleSpeed * max(dt, 0.01)
+            if mag > maxStep {
+                east = 0
+                north = 0
+            }
+            // Pedometer fallback is unused this tick; clear it so it
+            // doesn't double-count later.
+            pendingMotionEast = 0
+            pendingMotionNorth = 0
+        } else {
+            east = pendingMotionEast
+            north = pendingMotionNorth
+            pendingMotionEast = 0
+            pendingMotionNorth = 0
+        }
+        relativePoseFilter.predict(ourDeltaEast: east, ourDeltaNorth: north, dt: max(dt, 0.01))
+        lastPosePredictAt = now
+        debugEKFPredicts += 1
+        debugLastMotionMag = (east * east + north * north).squareRoot()
+
+        // Weak correction 1 — BLE gradient bearing (already world-frame).
+        if let gradient = compassEngine.gradientBearing(toMember: target) {
+            relativePoseFilter.updateBearing(degrees: gradient.bearing,
+                                             confidence: gradient.confidence)
+        }
+        // Weak correction 2 — coarse RSSI path-loss range, but ONLY when
+        // UWB isn't currently ranging. UWB range is ~100× more accurate;
+        // letting the ±many-metre RSSI estimate run alongside it just
+        // injects noise and was a big part of the EKF "garbage" before.
+        let uwbFresh = lastUWBRangeAt.map {
+            now.timeIntervalSince($0) < Self.uwbRangeFreshness
+        } ?? false
+        if !uwbFresh, let rssi = compassEngine.latestRSSI(for: target) {
+            let d = pow(10.0, (Self.rssiRefDBm - rssi) / (10.0 * Self.rssiPathLossN))
+            if d.isFinite, d > 0.3, d < 200 {
+                relativePoseFilter.updateRangeRSSI(distance: d, sigma: Self.rssiRangeSigma)
+            }
+        }
+    }
+
+    /// Strong, event-driven correction from a UWB sample. Called from
+    /// `handleRangingSample` the instant UWB delivers, so we don't wait
+    /// for the 5 Hz tick to inject our most precise observation.
+    private func feedPoseFilterUWB(_ sample: RangingSample) {
+        guard sample.memberID == poseTargetMemberID,
+              let distance = sample.distance else { return }
+        if let dir = sample.direction {
+            // UWB direction is device-frame (x = right, y = up,
+            // z = out of screen toward user). Phone-frame bearing =
+            // atan2(x, -z); world bearing adds our heading.
+            let phoneBearing = atan2(Double(dir.x), Double(-dir.z))
+            let heading = (currentUser.heading ?? 0) * .pi / 180
+            let worldBearing = phoneBearing + heading
+            relativePoseFilter.updateUWB(
+                distance: Double(distance),
+                directionEast: sin(worldBearing),
+                directionNorth: cos(worldBearing),
+                sigma: 0.3
+            )
+        } else {
+            // Distance-only (the common case — direction needs camera
+            // assistance). UWB range is centimetre-grade, so trust it
+            // tightly; combined with our own motion over a short walk the
+            // EKF triangulates the bearing without any direction vector.
+            relativePoseFilter.updateRange(distance: Double(distance), sigma: 0.3)
+        }
+        lastUWBRangeAt = Date()
+        debugEKFRangeUpdates += 1
     }
 
     // MARK: - Active seeking signal (sought side — cadence ramp)
@@ -899,23 +1122,17 @@ final class AppState {
     /// Called when the compass view dismisses. Tears down UWB sessions
     /// and clears local readings so a re-open starts fresh.
     func stopUWBTracking() {
+        // Compass closed: stop the cadence ramp and the seeking router's
+        // forwarding/polling, and clear the dial's cached readings. We do
+        // NOT stop the NISession or clear our token here — the session
+        // lifecycle is tied to BLE presence (see `stopBLEPresence`) so it
+        // stays alive and stable across compass open/close. Recreating it
+        // on every close minted a fresh discovery token, which broke the
+        // bilateral NISession pairing and left one phone with zero
+        // readings.
         stopActiveSeeking()
         seekingRouter.stop()
-        uwbSessionService.stop()
         uwbReadings.removeAll()
-        // Clear our published token. Peers fetching after this point
-        // get a stale-token failure rather than a phantom session.
-        currentUser.nearbyToken = nil
-        if var group = currentGroup,
-           let idx = group.members.firstIndex(where: { $0.id == currentUser.id }) {
-            group.members[idx].nearbyToken = nil
-            currentGroup = group
-            addOrUpdate(group: group)
-            let me = currentUser
-            Task { [groupService = self.groupService, me, group] in
-                try? await groupService.publish(user: me, in: group)
-            }
-        }
     }
 
     // MARK: - CloudKit subscriptions
@@ -1089,6 +1306,36 @@ final class AppState {
         User(id: UUID(),
              displayName: localProfile.displayName,
              avatarData: localProfile.avatarData)
+    }
+
+    /// Like `makeMembership()` but with a STABLE, deterministic member ID
+    /// derived from this device's identity + the group's invite code. Re-
+    /// joining the same group on the same device always yields the SAME
+    /// id, so a rejoin updates the existing member record instead of
+    /// minting a fresh UUID that lingers as a duplicate "ghost" (the bug
+    /// behind one person appearing 3× in a peer's member list, which made
+    /// the compass seek a dead identity). Prefer this everywhere we mint
+    /// a membership.
+    func makeMembership(forInviteCode inviteCode: String) -> User {
+        User(id: Self.stableMembershipID(forInviteCode: inviteCode),
+             displayName: localProfile.displayName,
+             avatarData: localProfile.avatarData)
+    }
+
+    /// Deterministic per-device, per-group membership UUID. SHA-256 of the
+    /// Keychain stable identity + the invite code, formatted as an
+    /// RFC-4122 v4 UUID. Stable across relaunch + reinstall (Keychain
+    /// survives), distinct per device, identical for repeated joins of the
+    /// same group.
+    static func stableMembershipID(forInviteCode inviteCode: String) -> UUID {
+        let salted = "groupin.membership." + LocalIdentityStore.stableID()
+            + ":" + inviteCode.uppercased()
+        let digest = SHA256.hash(data: Data(salted.utf8))
+        var b = Array(digest.prefix(16))
+        b[6] = (b[6] & 0x0F) | 0x40   // version 4
+        b[8] = (b[8] & 0x3F) | 0x80   // variant 1
+        return UUID(uuid: (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]))
     }
 
     func registerMembership(groupID: UUID, memberID: UUID) {
@@ -1457,23 +1704,29 @@ final class AppState {
                 for await heading in self.locationService.headingUpdates {
                     let smoothed = self.smoothHeading(heading)
 
+                    // `currentUser` is cheap to update (no persistence on
+                    // its setter) and is what the compass arrow reads —
+                    // so updating it on EVERY heading tick gives the
+                    // real-time arrow rotation we want.
                     var me = self.currentUser
                     me.heading = smoothed
                     self.currentUser = me
 
                     // Feed DR so step-projection uses the latest
-                    // compass direction. Heading updates are far
-                    // more frequent than pedometer ticks, so this
-                    // keeps the projected vector aligned with the
-                    // user's actual motion.
+                    // compass direction.
                     self.deadReckoningService.updateHeading(smoothed)
 
-                    // Mirror into the active group's local member entry so
-                    // the local pin's cone updates immediately. Heading is
-                    // also picked up by the next BLE/CloudKit broadcast
-                    // (which fires on location updates, not heading).
-                    if var group = self.currentGroup,
+                    // Mirror into the active group only a few times a
+                    // second. `currentGroup`'s didSet JSON-encodes the
+                    // whole group to UserDefaults; doing that on every 1°
+                    // heading change was a main-actor persist storm that
+                    // made the compass (and the whole app) feel janky.
+                    // The map pin's cone is fine at ~2 Hz.
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastHeadingGroupMirrorAt) >= 0.5,
+                       var group = self.currentGroup,
                        let idx = group.members.firstIndex(where: { $0.id == me.id }) {
+                        self.lastHeadingGroupMirrorAt = now
                         group.members[idx].heading = smoothed
                         self.currentGroup = group
                     }
@@ -1499,16 +1752,88 @@ final class AppState {
         if compassStepTask == nil {
             compassStepTask = Task { [weak self] in
                 guard let self else { return }
-                let stride = self.deadReckoningService.calibratedStepLength
-                for await delta in self.deadReckoningService.stepUpdates {
-                    let heading = self.currentUser.heading ?? 0
-                    let displacement = Double(delta) * stride
-                    self.compassEngine.recordStep(
-                        headingDegrees: heading,
-                        stepLengthMetres: displacement
-                    )
+                for await batch in self.deadReckoningService.stepUpdates {
+                    self.handleStepBatch(batch)
                 }
             }
+        }
+    }
+
+    /// Per-step compass projection. Splits the pedometer batch across
+    /// its `[startDate, endDate]` window so each synthetic step lands
+    /// in the heading the device was actually pointing at when it
+    /// happened. Falls back in priority order:
+    ///   1. `OrientationService.headingDegrees(at:)` — buffered
+    ///      attitude lookup, reliable-flag gated.
+    ///   2. `OrientationService.motionHeading()` — PCA on world-frame
+    ///      acceleration. Used when the per-step attitude lookup
+    ///      returns nil (low magnetic field quality, or step lands
+    ///      outside the buffer's window). Gated on confidence ≥ 0.4.
+    ///   3. `currentUser.heading` — the smoothed CLHeading we were
+    ///      already using. Pre-precision-motion behaviour.
+    /// Cumulative steps + metres observed this seeking session, shown
+    /// in the debug telemetry panel alongside HealthKit's all-device
+    /// daily totals. Reset when BLE presence (and thus the step
+    /// pipeline) stops.
+    private(set) var debugSessionSteps: Int = 0
+    private(set) var debugSessionMeters: Double = 0
+
+    private func handleStepBatch(_ batch: StepBatch) {
+        guard batch.delta > 0 else { return }
+        let stride = deadReckoningService.calibratedStepLength
+        debugSessionSteps += batch.delta
+        debugSessionMeters += Double(batch.delta) * stride
+
+        // Clamp the per-batch synthetic-position count. A pedometer
+        // glitch (or a first batch covering a long pre-open window)
+        // could otherwise report hundreds/thousands of steps and block
+        // the main actor with that many recordStep + prune passes. The
+        // gradient only needs spatial spread, not one position per
+        // literal step, so capping is harmless.
+        let positionsToRecord = min(batch.delta, 60)
+
+        let windowSeconds = batch.endDate.timeIntervalSince(batch.startDate)
+        // Pedometer can occasionally hand us a zero-or-negative window
+        // (clock skew, or first batch where lastYieldedEndDate seeded
+        // to data.startDate but the new endDate isn't strictly later).
+        // In that case stack every step on endDate.
+        let effectiveSpan = max(0, windowSeconds)
+
+        // Compute the PCA motion-heading fallback ONCE per batch, not
+        // once per step — it scans a ~500-sample window each call and
+        // calling it inside the loop was the per-iteration cost that
+        // could stall a large batch.
+        let motionFallback = orientationService.motionHeading()
+        // Spread the recorded positions evenly across the batch window
+        // even though we may record fewer than `batch.delta` of them.
+        let stridePerRecorded = Double(batch.delta) / Double(positionsToRecord) * stride
+
+        for i in 0..<positionsToRecord {
+            let frac = (Double(i) + 0.5) / Double(positionsToRecord)
+            let t_i = batch.startDate.addingTimeInterval(frac * effectiveSpan)
+
+            let chosen: Double
+            if let attitudeHeading = orientationService.headingDegrees(at: t_i) {
+                chosen = attitudeHeading
+            } else if let motion = motionFallback, motion.confidence >= 0.4 {
+                chosen = motion.degrees
+            } else {
+                chosen = currentUser.heading ?? 0
+            }
+
+            compassEngine.recordStep(
+                at: t_i,
+                headingDegrees: chosen,
+                stepLengthMetres: stridePerRecorded
+            )
+
+            // Accumulate our own world-frame displacement for the EKF
+            // prediction step. `tickRelativePoseFusion` drains and zeroes
+            // these each tick. heading is clockwise from north, so
+            // east = sin·d, north = cos·d.
+            let headingRad = chosen * .pi / 180.0
+            pendingMotionEast += sin(headingRad) * stridePerRecorded
+            pendingMotionNorth += cos(headingRad) * stridePerRecorded
         }
     }
 
@@ -1606,15 +1931,24 @@ final class AppState {
 
         // Bring up the local NISession as soon as BLE presence
         // starts so the local NIDiscoveryToken is available to
-        // include in every PeerPresence broadcast. Without this,
-        // `makeLocalPresence` populates `nearbyToken` as nil, the
-        // peer's `mergeBLEPeer` can't call
-        // `uwbSessionService.track(memberID:tokenData:)`, and UWB
-        // sessions never establish — which is why indoor was stuck
-        // on `ch: ble` even when both sides have U1 chips.
-        // `start()` is idempotent and no-ops on devices without
-        // UWB hardware.
+        // include in our advertised UWB token. The token no longer
+        // rides in PeerPresence (too big — see `makeLocalPresence`); it
+        // is published on its own GATT characteristic via
+        // `updateNearbyToken`, which a peer reads to open a NISession
+        // against us. `start()` is idempotent and no-ops on devices
+        // without UWB hardware.
         uwbSessionService.start()
+        blePresenceService.updateNearbyToken(uwbSessionService.localTokenData)
+
+        // Bring up precision motion sensing alongside UWB so the
+        // compass step consumer has a populated attitude buffer
+        // when the first pedometer batch lands. `start()` is
+        // idempotent.
+        orientationService.start()
+
+        // Start HealthKit aggregation for the debug panel (best-effort;
+        // no-ops without the entitlement). Idempotent.
+        healthKitService.start()
 
         let presence = makeLocalPresence(for: group)
         blePresenceService.start(
@@ -1639,6 +1973,19 @@ final class AppState {
                 }
             }
         }
+
+        if nearbyTokenTask == nil {
+            nearbyTokenTask = Task { [weak self] in
+                guard let self else { return }
+                for await update in self.blePresenceService.nearbyTokenUpdates {
+                    self.handleNearbyTokenUpdate(update)
+                }
+            }
+        }
+
+        #if DEBUG
+        startDebugTelemetry()
+        #endif
 
         if seekingRouterTask == nil {
             seekingRouterTask = Task { [weak self] in
@@ -1669,6 +2016,10 @@ final class AppState {
                 direction: sample.direction,
                 timestamp: sample.timestamp
             )
+            // Strong, event-driven EKF correction. Don't wait for the
+            // 5 Hz fusion tick — inject our most precise observation the
+            // instant UWB (or any direct-range channel) delivers it.
+            feedPoseFilterUWB(sample)
         }
     }
 
@@ -1736,43 +2087,6 @@ final class AppState {
         let salted = "groupin.payload.rdv." + inviteCode.uppercased()
         let digest = SHA256.hash(data: Data(salted.utf8))
         return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// Peer-staleness threshold for the walk-around prompt. If every
-    /// member in the active group has a `lastSeen` older than this,
-    /// schedule the prompt. 90 s balances "the user notices we lost
-    /// signal" against "we're not nagging during a normal lull."
-    private static let peerStalenessThreshold: TimeInterval = 90
-    /// Delay before the prompt actually fires after scheduling, giving
-    /// the next heartbeat or peer update a chance to cancel it. Keeps
-    /// transient gaps from producing noise notifications.
-    private static let walkAroundPromptDelay: TimeInterval = 15
-
-    private func checkPeerStalenessForPrompt() {
-        guard role == .seeker,
-              let group = currentGroup,
-              !group.members.isEmpty else { return }
-        let myID = membershipByGroupID[group.id]
-        let now = Date()
-        // Look at members other than ourselves. If they're all stale
-        // *and* we have at least one of them tracked, prompt.
-        let peers = group.members.filter { $0.id != myID }
-        guard !peers.isEmpty else { return }
-        let allStale = peers.allSatisfy { peer in
-            now.timeIntervalSince(peer.lastSeen) > Self.peerStalenessThreshold
-        }
-        if allStale {
-            Task { [notificationService, groupID = group.id] in
-                await notificationService.scheduleWalkAroundPrompt(
-                    for: groupID,
-                    after: Self.walkAroundPromptDelay
-                )
-            }
-        } else {
-            Task { [notificationService, groupID = group.id] in
-                await notificationService.cancelWalkAroundPrompt(for: groupID)
-            }
-        }
     }
 
     /// Apply a SwiftUI scene-phase change. Foreground → seeker (full
@@ -1848,12 +2162,223 @@ final class AppState {
         seekingRouterTask = nil
         incomingSeekingSignalsTask?.cancel()
         incomingSeekingSignalsTask = nil
+        nearbyTokenTask?.cancel()
+        nearbyTokenTask = nil
         presenceRampTask?.cancel()
         presenceRampTask = nil
         stopActiveSeeking()
+        // The NISession lifecycle lives here (with BLE presence), not with
+        // the compass — so it stays stable across compass open/close.
+        uwbSessionService.stop()
+        blePresenceService.updateNearbyToken(nil)
         blePresenceService.stop()
         stopPayloadTransport()
+        orientationService.stop()
+        #if DEBUG
+        stopDebugTelemetry()
+        #endif
     }
+
+    #if DEBUG
+    // MARK: - Debug telemetry streaming (DEBUG only)
+    //
+    // Mirrors everything the on-screen DebugTelemetryView shows, but
+    // POSTs it to a LAN collector at 1 Hz so two phones can be diagnosed
+    // side by side while walking. Compiled out of release builds.
+
+    private func startDebugTelemetry() {
+        guard debugUploader.isActive, debugTelemetryTask == nil else { return }
+        debugTelemetryTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.debugUploader.send(self.buildDebugPayload())
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private func stopDebugTelemetry() {
+        debugTelemetryTask?.cancel()
+        debugTelemetryTask = nil
+    }
+
+    /// Coerce a Double into a JSON-safe value (JSONSerialization throws
+    /// on NaN/Inf). Non-finite → NSNull.
+    private func jsonNum(_ v: Double?) -> Any {
+        guard let v, v.isFinite else { return NSNull() }
+        return v
+    }
+
+    private func gradientStatusString(_ s: CompassEngine.GradientStatus) -> String {
+        switch s {
+        case .ready: return "ready"
+        case .needSamples(let have): return "needSamples(\(have))"
+        case .needPositions: return "needPositions"
+        case .needMovement(let m): return String(format: "needMovement(%.1fm)", m)
+        case .singular: return "singular(collinear)"
+        case .degenerate: return "degenerate"
+        case .multipathHeavy: return "multipathHeavy"
+        }
+    }
+
+    private func buildDebugPayload() -> [String: Any] {
+        let now = Date()
+        let snap = orientationService.debugSnapshot()
+        let diag = bleDiagnostics
+        let seek = seekingDiagnostics
+
+        func channel(_ k: SeekingChannelKind) -> [String: Any] {
+            guard let t = seek.telemetryByChannel[k] else { return ["present": false] }
+            return [
+                "present": true,
+                "rssi": jsonNum(t.rssi),
+                "dist": jsonNum(t.distance.map(Double.init)),
+                "dir": t.hasDirection,
+                "n": t.sampleCount,
+                "ageMs": t.lastSample.map { Int(now.timeIntervalSince($0) * 1000) } ?? -1
+            ]
+        }
+
+        // Per-peer gradient / RSSI for every other member of the group.
+        var peers: [[String: Any]] = []
+        if let group = currentGroup {
+            let myID = membershipByGroupID[group.id]
+            for m in group.members where m.id != myID {
+                let bearing = compassEngine.gradientBearing(toMember: m.id)
+                peers.append([
+                    "id": m.id.uuidString.prefix(8).description,
+                    "name": m.displayName,
+                    "rssiN": compassEngine.rssiSampleCount(for: m.id),
+                    "rssi": jsonNum(compassEngine.latestRSSI(for: m.id)),
+                    "status": gradientStatusString(compassEngine.gradientStatus(toMember: m.id)),
+                    "bearing": jsonNum(bearing?.bearing),
+                    "conf": jsonNum(bearing?.confidence),
+                    "sought": (m.id == activelySeekingMember)
+                ])
+            }
+        }
+
+        var payload: [String: Any] = [
+            "device": debugUploader.deviceName,
+            "profile": localProfile.displayName,
+            "role": role == .seeker ? "seeker" : "sought",
+            "online": isOnline,
+            "seekingTarget": activelySeekingMember?.uuidString.prefix(8).description ?? "none",
+            "soughtActive": now < soughtUntil,
+            // Self motion / heading
+            "clHeading": jsonNum(currentUser.heading),
+            "attHeading": jsonNum(snap.attitudeHeading),
+            "attReliable": snap.headingReliable,
+            "motHeading": jsonNum(snap.motionHeading),
+            "motConf": jsonNum(snap.motionConfidence),
+            "gyroMag": jsonNum(sqrt(snap.rotationRate.x * snap.rotationRate.x
+                                    + snap.rotationRate.y * snap.rotationRate.y
+                                    + snap.rotationRate.z * snap.rotationRate.z)),
+            "activity": snap.activity,
+            "activityConf": snap.activityConfidence,
+            "attBuf": snap.bufferCount,
+            // Steps / spread (gradient inputs)
+            "sessSteps": debugSessionSteps,
+            "sessMeters": jsonNum(debugSessionMeters),
+            "stride": jsonNum(deadReckoningService.calibratedStepLength),
+            "posN": compassEngine.positionSampleCount,
+            "spread": jsonNum(compassEngine.positionSpreadMetres),
+            // BLE pipeline
+            "ble": [
+                "seen": diag.discoveredPeripheralCount,
+                "conn": diag.connectedPeripheralCount,
+                "svc": diag.servicesDiscoveredCount,
+                "mapped": diag.mappedMemberCount,
+                "subs": diag.presenceSubscribers,
+                "ready": diag.bluetoothReady,
+                // Presence-read pipeline instrumentation — where GATT
+                // presence delivery breaks (read fires? bytes? decode?
+                // groupHash? delivered?).
+                "prCallbacks": diag.presenceReadCallbacks,
+                "prBytes": diag.presenceReadBytes,
+                "prSentBytes": diag.presenceSentBytes,
+                "prDecodeFail": diag.presenceDecodeFailures,
+                "prHashMismatch": diag.presenceGroupHashMismatches,
+                "prDelivered": diag.presenceDelivered
+            ],
+            // Channels (all engaged concurrently)
+            "activeChannel": {
+                switch seek.activeChannel {
+                case .uwb: return "uwb"
+                case .wifiAwareRanging: return "wifi"
+                case .bleRanging: return "ble"
+                case .none: return "none"
+                }
+            }(),
+            "chUwb": channel(.uwb),
+            "chWifi": channel(.wifiAwareRanging),
+            "chBle": channel(.bleRanging),
+            "peers": peers
+        ]
+
+        // Capability / UWB readiness — reveals whether UWB is even
+        // possible (hardware on both sides + token exchanged) or whether
+        // we're permanently on the BLE-RSSI floor.
+        let localCap = Self.localTransportCapability()
+        var caps: [String: Any] = [
+            "uwbHW": uwbSessionService.isSupported,
+            "uwbTokenReady": uwbSessionService.localTokenData != nil,
+            "localUWB": localCap.uwb,
+            "localWifiAwareRanging": localCap.wifiAwareRanging
+        ]
+        if let tgt = activelySeekingMember, let pc = peerCapabilities[tgt] {
+            caps["peerUWB"] = pc.uwb
+            caps["peerWifiAwareRanging"] = pc.wifiAwareRanging
+            caps["peerKnown"] = true
+        } else {
+            caps["peerKnown"] = false
+        }
+        // Deep UWB-path diagnostics: did the full presence ever arrive
+        // over GATT, how many capability entries do we hold + their UWB
+        // bits, did we receive the sought peer's nearbyToken, and did
+        // `track` actually fire (peer session opened)?
+        caps["presenceMerges"] = debugPresenceMerges
+        caps["peerCapCount"] = peerCapabilities.count
+        caps["peerCapsUWB"] = peerCapabilities.reduce(into: [String: Bool]()) {
+            $0[$1.key.uuidString.prefix(8).description] = $1.value.uwb
+        }
+        if let tgt = activelySeekingMember {
+            let soughtToken = currentGroup?.members
+                .first(where: { $0.id == tgt })?.nearbyToken
+            caps["soughtTokenReady"] = (soughtToken != nil)
+        }
+        caps["uwbTracking"] = uwbSessionService.trackedMemberID?
+            .uuidString.prefix(8).description ?? "none"
+        // NISession internals — distinguish "session never fires" from
+        // "fires but nil distance" from "invalidated" for the asymmetric
+        // ranging investigation.
+        caps["uwbSessionAlive"] = uwbSessionService.hasLiveSession
+        caps["uwbRunCount"] = uwbSessionService.debugRunCount
+        caps["uwbUpdateCount"] = uwbSessionService.debugUpdateCount
+        caps["uwbRangedCount"] = uwbSessionService.debugRangedCount
+        caps["uwbInvalidation"] = uwbSessionService.debugLastInvalidation ?? "none"
+        caps["uwbCameraSupported"] = UWBSessionService.deviceSupportsCameraAssistance()
+        caps["uwbCameraActive"] = uwbSessionService.cameraAssistanceActive
+        payload["caps"] = caps
+
+        // EKF fused estimate (for the actively-sought peer) + feed health.
+        var ekf: [String: Any] = [
+            "init": relativePoseFilter.isInitialized,
+            "rangeUpdates": debugEKFRangeUpdates,
+            "predicts": debugEKFPredicts,
+            "motionMag": jsonNum(debugLastMotionMag)
+        ]
+        if let est = relativePoseFilter.estimate {
+            ekf["bearing"] = jsonNum(est.bearingDegrees)
+            ekf["dist"] = jsonNum(est.distanceMetres)
+            ekf["std"] = jsonNum(est.positionStdDevMetres)
+            ekf["converged"] = est.isConverged
+        }
+        payload["ekf"] = ekf
+
+        return payload
+    }
+    #endif
 
     /// Consume the BLE diagnostics stream for the lifetime of the app,
     /// not just while the dashboard is open. The Home status banner
@@ -1917,6 +2442,7 @@ final class AppState {
         // is keyed by whatever group is currently in focus). Receivers
         // match on the per-group ID when merging via `mergeBLEPeer`.
         let memberID = membershipByGroupID[group.id] ?? currentUser.id
+
         return PeerPresence(
             groupHash: PeerPresence.groupHash(forInviteCode: group.inviteCode),
             memberID: memberID,
@@ -1936,13 +2462,18 @@ final class AppState {
             positionAnchorAt: currentUser.positionAnchorAt,
             eventCursor: eventCursors[group.id],
             transportCapability: Self.localTransportCapability(),
-            // UWB discovery token. Without this travelling over BLE
-            // presence, UWB sessions can't establish offline — the
-            // peer has no way to call `NISession.run` against us. The
-            // token is opaque (NSKeyedArchiver-encoded
-            // NIDiscoveryToken) and ~100 bytes, fits comfortably in
-            // the BLE GATT MTU. Nil on devices without UWB hardware.
-            nearbyToken: uwbSessionService.localTokenData
+            // The UWB discovery token does NOT ride in the presence
+            // packet anymore. Archived NIDiscoveryToken base64s to
+            // ~530 bytes, which pushed the JSON presence past the
+            // ~512-byte ATT characteristic read limit — the central
+            // could only read the first ~512 bytes, so EVERY presence
+            // decode failed and capability/token never crossed. The
+            // token now travels on its own dedicated GATT characteristic
+            // as raw bytes (see `updateNearbyToken`). `rssiOfPeers` is
+            // also dropped from BLE for the same size reason (it's a
+            // denoising nicety, and grows with group size).
+            nearbyToken: nil,
+            rssiOfPeers: nil
         )
     }
 
@@ -1969,6 +2500,11 @@ final class AppState {
     private func broadcastBLEPresence() {
         guard let group = currentGroup else { return }
         blePresenceService.update(localPresence: makeLocalPresence(for: group))
+        // Keep our advertised UWB token fresh. The NISession token may
+        // not be ready the instant BLE presence starts, so publishing it
+        // here (idempotent — no-op when unchanged) guarantees peers can
+        // read it once it exists, without needing us to open the compass.
+        blePresenceService.updateNearbyToken(uwbSessionService.localTokenData)
     }
 
     /// Merge a freshly-read peer presence into `currentGroup.members`.
@@ -1976,6 +2512,13 @@ final class AppState {
     /// version — same "newest wins" rule we use for CloudKit refresh.
     private func mergeBLEPeer(_ peer: PeerPresence) {
         guard var group = currentGroup else { return }
+
+        #if DEBUG
+        // Proves the GATT full-presence path is delivering (vs. only the
+        // connectionless RSSI token). If this stays 0 while RSSI flows,
+        // the presence read is broken.
+        debugPresenceMerges += 1
+        #endif
 
         // Transport bookkeeping runs unconditionally — we want the
         // "we're hearing this peer on Bluetooth" signal regardless of
@@ -1995,14 +2538,6 @@ final class AppState {
             // unlocked (e.g., peer foregrounds and UWB becomes
             // available).
             seekingRouter.setPeerCapability(advertised, for: peer.memberID)
-        }
-
-        // Fresh signal from a peer means the staleness window resets —
-        // cancel any pending "walk a few steps" prompt.
-        if let groupID = currentGroup?.id {
-            Task { [notificationService] in
-                await notificationService.cancelWalkAroundPrompt(for: groupID)
-            }
         }
 
         // Cursor tracking + cursor-mismatch push run unconditionally
@@ -2099,6 +2634,22 @@ final class AppState {
             group.members.append(stub)
         }
 
+        // Bilateral RSSI: pull the peer's measurement of *us* out of
+        // their presence packet (if they included one) and hand it
+        // to the compass engine. This is the inbound half of the
+        // exchange seeded by `makeLocalPresence`'s `rssiOfPeers`
+        // field; both sides feed each other so the gradient fit can
+        // denoise via cross-agreement. Look up our member ID for
+        // this group — `membershipByGroupID` is the canonical map
+        // (currentUser.id is keyed by dashboard focus and won't
+        // match here if we're merging a peer from a non-focused
+        // group).
+        if let myMemberID = membershipByGroupID[group.id],
+           let theirRSSIofUs = peer.rssiOfPeers?[myMemberID] {
+            compassEngine.recordRemoteRSSI(theirRSSIofUs,
+                                            fromMemberID: peer.memberID)
+        }
+
         currentGroup = group
         addOrUpdate(group: group)
 
@@ -2121,6 +2672,28 @@ final class AppState {
         guard let token, member.nearbyToken != token else { return }
         member.nearbyToken = token
         uwbSessionService.track(memberID: memberID, tokenData: token)
+    }
+
+    /// A peer's UWB token arrived on its dedicated GATT characteristic
+    /// (the path that replaced cramming the token into presence). Cache it
+    /// on the member and open a NISession against them. `track` is
+    /// idempotent on an unchanged token, so repeated reads/notifies are
+    /// cheap. This is what finally makes UWB pair bilaterally: each side
+    /// reads the other's token here and runs a config against it.
+    private func handleNearbyTokenUpdate(_ update: NearbyTokenUpdate) {
+        // Always open the session — UWB ranging is symmetric, so even a
+        // peer we're not actively seeking must be tracked for the link
+        // to come up when we (or they) do start seeking.
+        uwbSessionService.track(memberID: update.memberID, tokenData: update.tokenData)
+
+        // Cache on the member record so the compass/EKF know the token
+        // exists and so we don't re-track an unchanged one.
+        guard var group = currentGroup,
+              let idx = group.members.firstIndex(where: { $0.id == update.memberID }),
+              group.members[idx].nearbyToken != update.tokenData else { return }
+        group.members[idx].nearbyToken = update.tokenData
+        currentGroup = group
+        addOrUpdate(group: group)
     }
 
     /// Throttled CloudKit publish: at most once every `publishInterval`

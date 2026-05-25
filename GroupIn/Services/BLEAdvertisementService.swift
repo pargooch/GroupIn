@@ -33,10 +33,22 @@ struct RSSIReading: Sendable {
     let timestamp: Date
 }
 
+/// A peer's UWB discovery token, read from their dedicated nearby-token
+/// GATT characteristic. Carried separately from `PeerPresence` because
+/// the archived token (~530 bytes base64) blows past the ~512-byte ATT
+/// characteristic read limit when stuffed into the presence JSON.
+struct NearbyTokenUpdate: Sendable {
+    let memberID: UUID
+    let tokenData: Data
+}
+
 @MainActor
 protocol BLEPresenceServicing: AnyObject {
     var peerUpdates: AsyncStream<PeerPresence> { get }
     var rssiUpdates: AsyncStream<RSSIReading> { get }
+    /// A peer's UWB discovery token arriving over its own GATT
+    /// characteristic. Drives `UWBSessionService.track`.
+    var nearbyTokenUpdates: AsyncStream<NearbyTokenUpdate> { get }
 
     /// JoinResponse payloads received from in-range peers while in
     /// discovery mode. AppState consumes these to short-circuit the
@@ -61,6 +73,11 @@ protocol BLEPresenceServicing: AnyObject {
 
     func start(groupHash: UInt32, localPresence: PeerPresence)
     func update(localPresence: PeerPresence)
+    /// Publish our local UWB discovery token (raw archived bytes) on the
+    /// dedicated nearby-token characteristic so in-range peers can read
+    /// it and open a NISession against us. Pass nil to clear. Stable for
+    /// the session, so it doesn't churn like presence.
+    func updateNearbyToken(_ data: Data?)
     func stop()
 
     /// Enter join-discovery mode: scan + connect to nearby GroupIn
@@ -135,6 +152,16 @@ struct BLEDiagnostics: Sendable, Equatable {
     /// Most recent RSSI sample timestamp per memberID. Lets the UI
     /// show "last sample 0.4s ago" without exposing the full buffer.
     var lastRSSITimestampByMember: [UUID: Date] = [:]
+
+    /// Debug instrumentation for the GATT presence-read pipeline — pins
+    /// down exactly where presence delivery breaks: did the read deliver
+    /// bytes at all, did they decode, and did the group-hash check pass.
+    var presenceReadCallbacks: Int = 0
+    var presenceReadBytes: Int = 0
+    var presenceSentBytes: Int = 0
+    var presenceDecodeFailures: Int = 0
+    var presenceGroupHashMismatches: Int = 0
+    var presenceDelivered: Int = 0
 }
 
 @MainActor
@@ -165,6 +192,13 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// for 10 s → 2 Hz for 20 s → back to default).
     static let seekingSignalCharacteristicUUID = CBUUID(string: "A5B7E1C6-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
 
+    /// Carries the raw NSKeyedArchiver-encoded `NIDiscoveryToken` for
+    /// UWB. Its own characteristic (separate from presence) because the
+    /// token is large (~400 bytes raw) and stable — keeping it out of the
+    /// frequently-mutating, size-capped presence packet is what lets both
+    /// the presence AND the token actually transfer.
+    static let nearbyTokenCharacteristicUUID = CBUUID(string: "A5B7E1C7-9F3D-4E2A-8B6F-1D7C5E9A4F8B")
+
     /// iBeacon UUID for region monitoring. Different from the BLE service
     /// UUID because iBeacon advertisements use a manufacturer-data format
     /// while BLE service advertisements use the service-UUID list — iOS
@@ -187,12 +221,14 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
 
     let peerUpdates: AsyncStream<PeerPresence>
     let rssiUpdates: AsyncStream<RSSIReading>
+    let nearbyTokenUpdates: AsyncStream<NearbyTokenUpdate>
     let joinResponses: AsyncStream<JoinResponse>
     let incomingJoinRequests: AsyncStream<JoinRequest>
     let incomingSeekingSignals: AsyncStream<SeekingSignal>
     let diagnostics: AsyncStream<BLEDiagnostics>
     private nonisolated let peerContinuation: AsyncStream<PeerPresence>.Continuation
     private nonisolated let rssiContinuation: AsyncStream<RSSIReading>.Continuation
+    private nonisolated let nearbyTokenContinuation: AsyncStream<NearbyTokenUpdate>.Continuation
     private nonisolated let joinResponseContinuation: AsyncStream<JoinResponse>.Continuation
     private nonisolated let incomingJoinRequestContinuation: AsyncStream<JoinRequest>.Continuation
     private nonisolated let incomingSeekingSignalContinuation: AsyncStream<SeekingSignal>.Continuation
@@ -213,6 +249,10 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     private var joinRequestCharacteristic: CBMutableCharacteristic?
     private var joinResponseCharacteristic: CBMutableCharacteristic?
     private var seekingSignalCharacteristic: CBMutableCharacteristic?
+    private var nearbyTokenCharacteristic: CBMutableCharacteristic?
+    /// Our local UWB token (raw archived bytes) served on the nearby-token
+    /// characteristic. Set via `updateNearbyToken`.
+    private var lastNearbyTokenData: Data?
 
     /// Recent JoinResponses we've emitted, kept so we can replay them
     /// to centrals that subscribe AFTER we already responded.
@@ -269,10 +309,35 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     /// Strong reference holds them so iOS doesn't drop the link.
     private var connectedPeers: [UUID: CBPeripheral] = [:]
 
-    /// Maps CB peripheral identifier → group member UUID. Populated once
-    /// we've successfully read a peer's presence characteristic, which
-    /// tells us who they are. Lets us tag subsequent RSSI scan callbacks.
+    /// Maps CB peripheral identifier → group member UUID. Populated two
+    /// ways: (a) connectionless, from the advertised LocalName token the
+    /// instant we hear a sought peer (fast path for RSSI), and (b) from a
+    /// successfully-read presence characteristic. Because (a) fills this
+    /// BEFORE the GATT read, the presence-read retry must NOT key off this
+    /// map — see `presenceReceivedPeripherals`.
     private var peripheralToMember: [UUID: UUID] = [:]
+
+    /// Peripherals from which we've actually decoded a FULL presence packet
+    /// over GATT (capabilities + nearbyToken + coords, not just the RSSI
+    /// token). This — not `peripheralToMember` — gates the presence-read
+    /// retry: the connectionless RSSI mapping fills `peripheralToMember`
+    /// immediately, which previously made the retry think the read was
+    /// done and skip it, so capability negotiation + the UWB token never
+    /// arrived when the initial read failed.
+    private var presenceReceivedPeripherals: Set<UUID> = []
+
+    /// Peripherals from which we've received a non-empty UWB token over
+    /// the dedicated token characteristic. Gates the token re-read retry
+    /// (the initial read can fire before the peer published its token or
+    /// before the peripheral→member mapping exists).
+    private var nearbyTokenReceivedPeripherals: Set<UUID> = []
+
+    /// Frozen copy of a dynamic characteristic's buffer for the duration
+    /// of a multi-PDU Read Blob sequence, keyed by
+    /// "centralUUID:characteristicUUID". Captured at offset 0; served for
+    /// every later blob so a long read can't splice together two
+    /// different versions of a mutating value.
+    private var readSnapshots: [String: Data] = [:]
 
     /// Every CBPeripheral identifier we've ever seen via a scan callback
     /// this session. Distinct from `connectedPeers` (subset that
@@ -315,18 +380,21 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     override init() {
         let (peerStream, peerCont) = AsyncStream.makeStream(of: PeerPresence.self)
         let (rssiStream, rssiCont) = AsyncStream.makeStream(of: RSSIReading.self)
+        let (tokenStream, tokenCont) = AsyncStream.makeStream(of: NearbyTokenUpdate.self)
         let (joinStream, joinCont) = AsyncStream.makeStream(of: JoinResponse.self)
         let (joinReqStream, joinReqCont) = AsyncStream.makeStream(of: JoinRequest.self)
         let (seekStream, seekCont) = AsyncStream.makeStream(of: SeekingSignal.self)
         let (diagStream, diagCont) = AsyncStream.makeStream(of: BLEDiagnostics.self)
         self.peerUpdates = peerStream
         self.rssiUpdates = rssiStream
+        self.nearbyTokenUpdates = tokenStream
         self.joinResponses = joinStream
         self.incomingJoinRequests = joinReqStream
         self.incomingSeekingSignals = seekStream
         self.diagnostics = diagStream
         self.peerContinuation = peerCont
         self.rssiContinuation = rssiCont
+        self.nearbyTokenContinuation = tokenCont
         self.joinResponseContinuation = joinCont
         self.incomingJoinRequestContinuation = joinReqCont
         self.incomingSeekingSignalContinuation = seekCont
@@ -424,6 +492,8 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         presenceCharacteristic = nil
         joinRequestCharacteristic = nil
         joinResponseCharacteristic = nil
+        seekingSignalCharacteristic = nil
+        nearbyTokenCharacteristic = nil
         pendingJoinRequest = nil
         beginScanIfReady()
         beginAdvertisingIfReady()
@@ -432,6 +502,7 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     func update(localPresence: PeerPresence) {
         guard let data = localPresence.encoded() else { return }
         lastPresenceData = data
+        currentDiagnostics.presenceSentBytes = data.count
         guard let char = presenceCharacteristic,
               peripheralManager.state == .poweredOn else { return }
         // Push to all subscribed centrals via BLE notify — fast path
@@ -441,6 +512,20 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             for: char,
             onSubscribedCentrals: nil
         )
+    }
+
+    func updateNearbyToken(_ data: Data?) {
+        // No-op on an unchanged token — this is called on every presence
+        // broadcast (so the token gets published the moment the NISession
+        // makes it available, even if it was nil at `start`), and the
+        // token is stable, so we must not spam notifies.
+        guard data != lastNearbyTokenData else { return }
+        lastNearbyTokenData = data
+        guard let data, let char = nearbyTokenCharacteristic,
+              peripheralManager.state == .poweredOn else { return }
+        // Best-effort notify to any subscribed central. Subscribers also
+        // read it explicitly on discovery, so a dropped notify is fine.
+        peripheralManager.updateValue(data, for: char, onSubscribedCentrals: nil)
     }
 
     func stop() {
@@ -458,6 +543,9 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         connectedPeers.removeAll()
         connectingPeers.removeAll()
         peripheralToMember.removeAll()
+        presenceReceivedPeripherals.removeAll()
+        nearbyTokenReceivedPeripherals.removeAll()
+        readSnapshots.removeAll()
         connectTimestamps.removeAll()
         presenceRetryTask?.cancel()
         presenceRetryTask = nil
@@ -564,9 +652,37 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
     }
 
     private func advertiseAsService() {
-        peripheralManager.startAdvertising([
+        var advertisement: [String: Any] = [
             CBAdvertisementDataServiceUUIDsKey: [Self.serviceUUID]
-        ])
+        ]
+        // Stamp our member token into the LocalName so a scanning peer
+        // can attribute every scan-callback RSSI to *this* member WITHOUT
+        // first completing a GATT connect + presence read. This is the
+        // dense, connectionless RSSI source the indoor compass gradient
+        // relies on; the GATT path (presence/identity/seeking-signal)
+        // still runs, it's just no longer a prerequisite for ranging.
+        // 4 hex chars (16-bit truncated member ID, same token as the
+        // iBeacon minor) fits comfortably alongside the 128-bit service
+        // UUID in the 31-byte advert. iOS honors LocalName in the
+        // foreground advertisement, which is exactly when seeking runs.
+        if let id = localMemberID {
+            advertisement[CBAdvertisementDataLocalNameKey] =
+                Self.localNameToken(for: id)
+        }
+        peripheralManager.startAdvertising(advertisement)
+    }
+
+    /// Render a member ID into the 4-hex-char advertisement LocalName
+    /// token (its 16-bit truncation). Symmetric with
+    /// `memberID(forLocalNameToken:)` on the scanning side.
+    static func localNameToken(for memberID: UUID) -> String {
+        String(format: "%04X", memberID.truncated16)
+    }
+
+    /// Parse an advertisement LocalName back into the 16-bit member
+    /// token, or nil if it isn't one of ours.
+    static func token(fromLocalName name: String) -> UInt16? {
+        UInt16(name, radix: 16)
     }
 
     private func advertiseAsBeacon() {
@@ -639,13 +755,24 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
             value: nil,
             permissions: [.writeable]
         )
+        // UWB discovery token — read+notify, dynamic value (served from
+        // `lastNearbyTokenData` in `didReceiveRead`). Separate from
+        // presence so the large, stable token doesn't bloat the
+        // size-capped presence packet.
+        let tokenChar = CBMutableCharacteristic(
+            type: Self.nearbyTokenCharacteristicUUID,
+            properties: [.read, .notify],
+            value: nil,
+            permissions: [.readable]
+        )
         let svc = CBMutableService(type: Self.serviceUUID, primary: true)
-        svc.characteristics = [presence, joinReqChar, joinRespChar, seekChar]
+        svc.characteristics = [presence, joinReqChar, joinRespChar, seekChar, tokenChar]
         peripheralManager.add(svc)
         presenceCharacteristic = presence
         joinRequestCharacteristic = joinReqChar
         joinResponseCharacteristic = joinRespChar
         seekingSignalCharacteristic = seekChar
+        nearbyTokenCharacteristic = tokenChar
         advertisedService = svc
         serviceAdded = true
     }
@@ -743,9 +870,32 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         // Hold a strong reference to the peripheral while connect()
         // is in flight — iOS otherwise drops the connection.
         connectingPeers[id] = peripheral
+        connectTimestamps[id] = Date()
         peripheral.delegate = self
         centralManager.connect(peripheral, options: nil)
+
+        // Connect-watchdog. CoreBluetooth's `connect()` has no
+        // built-in timeout — if iOS never resolves the request
+        // (peer briefly out of range, peripheral's CBPeripheralManager
+        // in a bad state, system connection-queue backed up), neither
+        // `didConnect` nor `didFailToConnect` ever fires. The slot
+        // in `connectingPeers` stays forever, every subsequent scan
+        // callback's `considerConnect` bails on the "already
+        // connecting" check, and we end up `seen: 1, conn: 0` for
+        // the rest of the session. After 10 s, cancel the request
+        // and clear our state so the next scan callback can retry.
+        Task { @MainActor [weak self, id] in
+            try? await Task.sleep(for: .seconds(Self.connectWatchdogSeconds))
+            guard let self else { return }
+            guard self.connectingPeers[id] != nil,
+                  self.connectedPeers[id] == nil else { return }
+            self.centralManager.cancelPeripheralConnection(peripheral)
+            self.connectingPeers.removeValue(forKey: id)
+            self.connectTimestamps.removeValue(forKey: id)
+        }
     }
+
+    private static let connectWatchdogSeconds: TimeInterval = 10
 
     private func cleanupPeer(_ peripheral: CBPeripheral) {
         let id = peripheral.identifier
@@ -757,13 +907,21 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         }
         currentDiagnostics.connectedPeripheralCount = connectedPeers.count
         emitDiagnostics()
+        // A reconnect must re-read presence + token from scratch, so
+        // forget that we'd received them from this peripheral.
+        presenceReceivedPeripherals.remove(id)
+        nearbyTokenReceivedPeripherals.remove(id)
         // Don't remove the peripheral→member mapping here; we want to
         // keep emitting RSSI for that member if their iBeacon advert is
         // still detectable while we wait for a fresh GATT reconnect.
     }
 
     private func handlePresenceData(_ data: Data, from peripheral: CBPeripheral) {
-        guard let presence = PeerPresence.decoded(from: data) else { return }
+        guard let presence = PeerPresence.decoded(from: data) else {
+            currentDiagnostics.presenceDecodeFailures += 1
+            emitDiagnostics()
+            return
+        }
         // Active-group filter: drop connections to peers from other
         // groups. Skipped during join-discovery — we don't have an
         // activeGroupHash but we need to stay connected long enough
@@ -773,6 +931,7 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         guard isDiscoveryMode || presence.groupHash == activeGroupHash else {
             // Different group — drop the connection so we don't keep a
             // pointless link open.
+            currentDiagnostics.presenceGroupHashMismatches += 1
             centralManager.cancelPeripheralConnection(peripheral)
             peripheralToMember.removeValue(forKey: peripheral.identifier)
             currentDiagnostics.mappedMemberCount = peripheralToMember.count
@@ -787,7 +946,9 @@ final class BLEAdvertisementService: NSObject, BLEPresenceServicing {
         // Now that we know which member this peripheral is, tag future
         // scan callbacks with their member ID for the RSSI stream.
         peripheralToMember[peripheral.identifier] = presence.memberID
+        presenceReceivedPeripherals.insert(peripheral.identifier)
         currentDiagnostics.mappedMemberCount = peripheralToMember.count
+        currentDiagnostics.presenceDelivered += 1
         emitDiagnostics()
         peerContinuation.yield(presence)
     }
@@ -860,6 +1021,19 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
             if inserted {
                 self.currentDiagnostics.discoveredPeripheralCount =
                     self.discoveredPeripherals.count
+                self.emitDiagnostics()
+            }
+            // Connectionless member attribution: if this peripheral
+            // isn't mapped yet, try to resolve it from the advertised
+            // LocalName token against the members we're actively seeking.
+            // This is what lets RSSI flow the instant we hear a peer,
+            // with no GATT connect required — the fix for "mapped=0 →
+            // zero RSSI → indoor compass never works."
+            if self.peripheralToMember[peripheral.identifier] == nil,
+               let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+               let memberID = self.engagedMember(forLocalName: localName) {
+                self.peripheralToMember[peripheral.identifier] = memberID
+                self.currentDiagnostics.mappedMemberCount = self.peripheralToMember.count
                 self.emitDiagnostics()
             }
             // Emit an RSSI sample if we already know which member this
@@ -955,18 +1129,29 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
         activeRSSITasks.removeValue(forKey: memberID)
     }
 
+    /// Resolve an advertised LocalName token to one of the members we're
+    /// actively seeking. Scoped to the engaged (actively-polled) set
+    /// because that's exactly who we want gradient RSSI for, and it keeps
+    /// the 16-bit-token collision space tiny (one or two peers, not the
+    /// whole group). Returns nil for our own token or any unknown peer.
+    private func engagedMember(forLocalName name: String) -> UUID? {
+        guard let token = Self.token(fromLocalName: name) else { return nil }
+        return activeRSSITasks.keys.first { $0.truncated16 == token }
+    }
+
     private func pollActiveRSSI(for memberID: UUID) {
-        // Find the peripheral mapped to this memberID. If we don't
-        // have a live connection yet, the next scan-callback path
-        // will keep trying — nothing to do here.
-        guard let peripheralID = peripheralToMember.first(where: {
-            $0.value == memberID
-        })?.key,
-              let peripheral = connectedPeers[peripheralID] else { return }
-        // `readRSSI()` is an active GATT request — result lands in
-        // `peripheral(_:didReadRSSI:error:)`. Works while the peer is
-        // backgrounded; only requires the connection to be alive.
-        peripheral.readRSSI()
+        // Read RSSI on EVERY connected peripheral mapped to this member,
+        // not just the first. iOS rotates a peer's BLE address, so we can
+        // hold several CBPeripheral handles for the same member and only
+        // the live one(s) answer `readRSSI`. Targeting just the first
+        // (often a stale/dead handle) was why RSSI dried up the moment we
+        // GATT-connected — iOS throttles advert/scan callbacks for a
+        // connected peripheral, so the active poll is the ONLY RSSI source
+        // while connected, and it was aiming at the wrong handle. Each
+        // result is attributed back to the member in `didReadRSSI`.
+        for (peripheralID, mapped) in peripheralToMember where mapped == memberID {
+            connectedPeers[peripheralID]?.readRSSI()
+        }
     }
 
     private func schedulePresenceReadRetry() {
@@ -985,34 +1170,40 @@ extension BLEAdvertisementService: CBCentralManagerDelegate {
     private func retryPresenceReadIfStuck() {
         let now = Date()
         for (id, peripheral) in connectedPeers {
-            guard peripheralToMember[id] == nil else { continue }
+            let needPresence = !presenceReceivedPeripherals.contains(id)
+            let needToken = !nearbyTokenReceivedPeripherals.contains(id)
+            // Nothing left to fetch from this peer.
+            guard needPresence || needToken else { continue }
             guard let since = connectTimestamps[id],
                   now.timeIntervalSince(since) >= Self.presenceReadRetryDelay
             else { continue }
             // Reset the timestamp so we only retry once per window.
             connectTimestamps[id] = now
 
-            // Two possible failure modes, both recoverable:
-            //
-            // 1. Service discovery never completed (didDiscoverServices
-            //    silently stalled — happens with stale GATT cache, or
-            //    when the link was up before encryption finished).
-            //    Symptom: peripheral.services is nil/empty.
-            //    Recovery: re-issue discoverServices.
-            //
-            // 2. Discovery completed but the initial read returned no
-            //    data or decode failed. Symptom: we have the
-            //    characteristic but no member mapping.
-            //    Recovery: re-issue readValue.
             let service = peripheral.services?.first { $0.uuid == Self.serviceUUID }
-            let char = service?.characteristics?.first {
-                $0.uuid == Self.presenceCharacteristicUUID
-            }
-            if let char {
-                peripheral.readValue(for: char)
-            } else {
+            // If service discovery never completed (stale GATT cache, or
+            // the link came up before encryption finished), re-discover.
+            guard let service else {
                 peripheral.delegate = self
                 peripheral.discoverServices([Self.serviceUUID])
+                continue
+            }
+            // Re-read whichever value we're still missing. The initial
+            // read in `didDiscoverCharacteristicsFor` can fire before the
+            // peer published its token / before the peripheral→member map
+            // is set; without this retry the token (and thus UWB) would
+            // never arrive.
+            if needPresence,
+               let char = service.characteristics?.first(where: {
+                   $0.uuid == Self.presenceCharacteristicUUID
+               }) {
+                peripheral.readValue(for: char)
+            }
+            if needToken,
+               let char = service.characteristics?.first(where: {
+                   $0.uuid == Self.nearbyTokenCharacteristicUUID
+               }) {
+                peripheral.readValue(for: char)
             }
         }
     }
@@ -1062,7 +1253,8 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                     [Self.presenceCharacteristicUUID,
                      Self.joinRequestCharacteristicUUID,
                      Self.joinResponseCharacteristicUUID,
-                     Self.seekingSignalCharacteristicUUID],
+                     Self.seekingSignalCharacteristicUUID,
+                     Self.nearbyTokenCharacteristicUUID],
                     for: service
                 )
             }
@@ -1090,6 +1282,12 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
                     // Initial read so we get the peer's current state right away.
                     peripheral.readValue(for: char)
                     // Subscribe for ongoing live updates pushed via notify.
+                    peripheral.setNotifyValue(true, for: char)
+                case Self.nearbyTokenCharacteristicUUID:
+                    // Read the peer's UWB token + subscribe in case it
+                    // arrives/changes after we connect (peer started its
+                    // NISession a beat later).
+                    peripheral.readValue(for: char)
                     peripheral.setNotifyValue(true, for: char)
                 case Self.joinResponseCharacteristicUUID:
                     // Subscribe before any write goes out so we don't
@@ -1138,19 +1336,49 @@ extension BLEAdvertisementService: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral,
                                 didUpdateValueFor characteristic: CBCharacteristic,
                                 error: Error?) {
-        guard error == nil, let data = characteristic.value else { return }
         let charUUID = characteristic.uuid
+        let hadError = error != nil
+        let data = characteristic.value
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Count every presence read/notify callback BEFORE the data
+            // guard, so a read that errors or returns nil still shows up
+            // — that's exactly the failure we're hunting.
+            if charUUID == Self.presenceCharacteristicUUID {
+                self.currentDiagnostics.presenceReadCallbacks += 1
+                self.currentDiagnostics.presenceReadBytes = data?.count ?? -1
+                if hadError {
+                    self.currentDiagnostics.presenceDecodeFailures += 1
+                }
+                self.emitDiagnostics()
+            }
+            guard !hadError, let data else { return }
             switch charUUID {
             case Self.presenceCharacteristicUUID:
                 self.handlePresenceData(data, from: peripheral)
+            case Self.nearbyTokenCharacteristicUUID:
+                self.handleNearbyTokenData(data, from: peripheral)
             case Self.joinResponseCharacteristicUUID:
                 self.handleJoinResponseData(data)
             default:
                 break
             }
         }
+    }
+
+    /// A peer's raw UWB token arrived on its dedicated characteristic.
+    /// Attribute it to the member this peripheral maps to (via presence
+    /// or the connectionless LocalName path) and forward upward so
+    /// AppState can open a NISession against them. If we don't yet know
+    /// who this peripheral is, drop it — the periodic re-read / notify
+    /// will redeliver once the mapping lands.
+    private func handleNearbyTokenData(_ data: Data, from peripheral: CBPeripheral) {
+        guard !data.isEmpty,
+              let memberID = peripheralToMember[peripheral.identifier] else { return }
+        nearbyTokenReceivedPeripherals.insert(peripheral.identifier)
+        nearbyTokenContinuation.yield(
+            NearbyTokenUpdate(memberID: memberID, tokenData: data)
+        )
     }
 }
 
@@ -1188,6 +1416,10 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
                         self.joinRequestCharacteristic = mutable
                     case Self.joinResponseCharacteristicUUID:
                         self.joinResponseCharacteristic = mutable
+                    case Self.seekingSignalCharacteristicUUID:
+                        self.seekingSignalCharacteristic = mutable
+                    case Self.nearbyTokenCharacteristicUUID:
+                        self.nearbyTokenCharacteristic = mutable
                     default:
                         break
                     }
@@ -1285,19 +1517,48 @@ extension BLEAdvertisementService: CBPeripheralManagerDelegate {
             guard let self else { return }
             switch charUUID {
             case Self.presenceCharacteristicUUID:
-                // Always respond with success — `attributeNotFound`
-                // leaves the central in a strange state where the
-                // characteristic exists but is "unreadable", and
-                // CoreBluetooth doesn't surface that cleanly to our
-                // delegate. An empty `Data()` decodes to nil presence
-                // on the central, which the retry watchdog handles
-                // by re-issuing the read once we have fresh data.
-                request.value = self.lastPresenceData ?? Data()
-                peripheral.respond(to: request, withResult: .success)
+                self.serveBlobRead(request, on: peripheral, source: self.lastPresenceData)
+            case Self.nearbyTokenCharacteristicUUID:
+                self.serveBlobRead(request, on: peripheral, source: self.lastNearbyTokenData)
             default:
                 peripheral.respond(to: request, withResult: .attributeNotFound)
             }
         }
+    }
+
+    /// Serve a (possibly large) dynamic characteristic value across a
+    /// multi-PDU Read Blob sequence. TWO things are required for a value
+    /// bigger than the ATT MTU:
+    ///   1. Slice from `request.offset`, not the whole buffer.
+    ///   2. Keep the buffer byte-for-byte STABLE for the whole sequence.
+    ///      Presence is re-broadcast constantly (heartbeat + 10 Hz seek
+    ///      ramp); serving the live buffer per-blob let the central splice
+    ///      chunks from DIFFERENT versions → corrupt reassembly → decode
+    ///      failed every time (the bug that starved capability + UWB
+    ///      token). So we freeze a per-central snapshot at offset 0 and
+    ///      serve later blobs from it.
+    /// Note: a characteristic value still can't exceed the 512-byte ATT
+    /// ceiling — values larger than that simply can't be read, which is
+    /// why the big UWB token has its own characteristic and presence was
+    /// slimmed below 512.
+    private func serveBlobRead(_ request: CBATTRequest,
+                               on peripheral: CBPeripheralManager,
+                               source: Data?) {
+        let key = request.central.identifier.uuidString + ":"
+            + request.characteristic.uuid.uuidString
+        let snapshot: Data
+        if request.offset == 0 {
+            snapshot = source ?? Data()
+            readSnapshots[key] = snapshot
+        } else {
+            snapshot = readSnapshots[key] ?? source ?? Data()
+        }
+        guard request.offset <= snapshot.count else {
+            peripheral.respond(to: request, withResult: .invalidOffset)
+            return
+        }
+        request.value = snapshot.subdata(in: request.offset ..< snapshot.count)
+        peripheral.respond(to: request, withResult: .success)
     }
 
     nonisolated func peripheralManager(_ peripheral: CBPeripheralManager,

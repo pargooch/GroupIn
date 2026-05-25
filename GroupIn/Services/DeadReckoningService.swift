@@ -32,12 +32,17 @@ protocol DeadReckoningServicing: AnyObject {
     /// GPS is stale.
     var positionUpdates: AsyncStream<PositionEstimate> { get }
 
-    /// Stream of step deltas from CMPedometer — yields the number of
-    /// *new* steps since the last yield. Fires whether or not there's
-    /// a GPS anchor (position estimates need an anchor, step deltas
-    /// don't), so this is the signal the compass engine uses to
-    /// integrate synthetic position spread for indoor finding.
-    var stepUpdates: AsyncStream<Int> { get }
+    /// Stream of step batches from CMPedometer — each batch carries the
+    /// number of *new* steps since the last yield, plus the time window
+    /// they happened in. Fires whether or not there's a GPS anchor
+    /// (position estimates need an anchor, step deltas don't), so this
+    /// is the signal the compass engine uses to integrate synthetic
+    /// position spread for indoor finding. The compass consumer spreads
+    /// the batch's steps across `[startDate, endDate]` so each step
+    /// projects in the heading the device was actually pointing at
+    /// *that* instant — not a single stale heading sampled when the
+    /// batch landed.
+    var stepUpdates: AsyncStream<StepBatch> { get }
 
     /// Start CMPedometer step counting unconditionally — independent
     /// of the GPS anchor that `reanchor(to:)` sets up. Used by
@@ -70,8 +75,15 @@ final class DeadReckoningService: DeadReckoningServicing {
 
     let positionUpdates: AsyncStream<PositionEstimate>
     private nonisolated let positionContinuation: AsyncStream<PositionEstimate>.Continuation
-    let stepUpdates: AsyncStream<Int>
-    private nonisolated let stepContinuation: AsyncStream<Int>.Continuation
+    let stepUpdates: AsyncStream<StepBatch>
+    private nonisolated let stepContinuation: AsyncStream<StepBatch>.Continuation
+
+    /// `endDate` of the previous yielded batch. Used as the next
+    /// batch's `startDate` so spread-over-window interpolation lines
+    /// up step-to-step instead of restarting from `data.startDate`
+    /// every callback (which would double-count the dead time
+    /// between batches).
+    private var lastYieldedEndDate: Date?
 
     /// Total CMPedometer step count observed since `startStepObservation`
     /// first kicked off. Used to compute the delta each batch yields.
@@ -151,7 +163,7 @@ final class DeadReckoningService: DeadReckoningServicing {
         let (stream, cont) = AsyncStream.makeStream(of: PositionEstimate.self)
         self.positionUpdates = stream
         self.positionContinuation = cont
-        let (stepStream, stepCont) = AsyncStream.makeStream(of: Int.self)
+        let (stepStream, stepCont) = AsyncStream.makeStream(of: StepBatch.self)
         self.stepUpdates = stepStream
         self.stepContinuation = stepCont
         self.defaults = defaults
@@ -223,6 +235,7 @@ final class DeadReckoningService: DeadReckoningServicing {
         calibrationWindowStart = nil
         stepObservationRunning = false
         lastObservedStepCount = 0
+        lastYieldedEndDate = nil
     }
 
     // MARK: - Pedometer integration
@@ -236,7 +249,19 @@ final class DeadReckoningService: DeadReckoningServicing {
         let delta = max(0, totalSteps - lastObservedStepCount)
         if delta > 0 {
             lastObservedStepCount = totalSteps
-            stepContinuation.yield(delta)
+            // `data.startDate` is the absolute window start for the
+            // whole query (often "now-ish" at startStepObservation
+            // time), not the start of just *this* delta. Use the
+            // previous yield's `endDate` as a tighter lower bound;
+            // fall back to `data.startDate` on the first batch.
+            let batchStart = lastYieldedEndDate ?? data.startDate
+            let batch = StepBatch(
+                delta: delta,
+                startDate: batchStart,
+                endDate: data.endDate
+            )
+            lastYieldedEndDate = data.endDate
+            stepContinuation.yield(batch)
         }
 
         guard let anchor else { return }
@@ -340,6 +365,18 @@ final class DeadReckoningService: DeadReckoningServicing {
         let c = 2 * atan2(sqrt(h), sqrt(1 - h))
         return earthRadius * c
     }
+}
+
+// MARK: - Public types
+
+/// One pedometer batch: `delta` new steps that landed in the window
+/// `[startDate, endDate]`. The compass consumer interpolates each
+/// step's individual timestamp across that window so the orientation
+/// service can be queried at the moment each step was taken.
+struct StepBatch: Sendable {
+    let delta: Int
+    let startDate: Date
+    let endDate: Date
 }
 
 // MARK: - Internal types

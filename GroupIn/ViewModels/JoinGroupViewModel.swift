@@ -134,7 +134,10 @@ final class JoinGroupViewModel {
         if let cached = sessionJoiner {
             joiner = cached
         } else {
-            let fresh = appState.makeMembership()
+            // Stable, deterministic membership ID for this group — re-
+            // joining the same invite code reuses the same id instead of
+            // minting a new one that lingers as a ghost in peers' lists.
+            let fresh = appState.makeMembership(forInviteCode: inviteCode)
             sessionJoiner = fresh
             joiner = fresh
         }

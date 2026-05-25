@@ -41,6 +41,22 @@ struct CompassView: View {
     @State private var announcedAligned: Bool = false
     @State private var seekerMode: SeekerMode = .auto
 
+    /// Most recent non-nil arrow reading. We replay this with a
+    /// "stale" badge for up to `staleReadingWindow` seconds when
+    /// `arrowReading()` returns nil — far less jarring than flashing
+    /// back to the "Locking on" wait state every time GPS or BLE
+    /// drops a sample. The cache is reset (by virtue of being
+    /// overwritten) the moment a fresh reading lands.
+    @State private var cachedReading: ArrowReading?
+    @State private var cachedReadingAt: Date?
+
+    /// How long we'll keep showing a cached reading after the live
+    /// pipeline goes silent. Tuned to ride out the typical 5–15 s
+    /// dropouts that happen when the peer's GPS pauses or BLE
+    /// scanning misses a window, without lying to the user about a
+    /// reading that's actually been gone for half a minute.
+    private static let staleReadingWindow: TimeInterval = 30
+
     /// Cyan-blue tone used for the orb ring + diamond gem. Fixed
     /// across all members — it's the "GroupIn brand" element of the
     /// compass. Per-member color is used for the dot ring and the
@@ -53,7 +69,14 @@ struct CompassView: View {
     var body: some View {
         let member = currentMember
         let memberColor = Color.memberColor(for: memberID)
-        let reading = arrowReading()
+        // Live reading first; if absent, fall back to the cached
+        // reading inside the 30 s stale window. `cachedReading` is
+        // refreshed every time a live reading lands (see
+        // `.onChange(of:)` further down) so this lookup is cheap.
+        let liveReading = arrowReading()
+        let resolvedReading: ArrowReading? = liveReading
+            ?? (isCacheUsable ? cachedReading : nil)
+        let isStale = liveReading == nil && resolvedReading != nil
 
         ZStack {
             backdrop(color: memberColor)
@@ -70,24 +93,44 @@ struct CompassView: View {
                         .accessibilityHidden(true)
                 }
 
-                Spacer(minLength: 12)
-
-                if let reading {
-                    compassDial(reading: reading, memberColor: memberColor)
-                        .frame(width: 320, height: 320)
+                if seekerMode == .debug {
+                    // Full telemetry read-out replaces the dial. Lets
+                    // us see every channel, motion, step, and gradient
+                    // signal at once for field diagnosis.
+                    DebugTelemetryView(memberID: memberID)
                         .accessibilityHidden(true)
                 } else {
-                    waitingState(member: member)
-                        .frame(width: 320, height: 320)
-                        .accessibilityHidden(true)
-                }
+                    Spacer(minLength: 12)
 
-                Spacer(minLength: 8)
+                    if let reading = resolvedReading {
+                        compassDial(reading: reading, memberColor: memberColor)
+                            .frame(width: 320, height: 320)
+                            // Knock the dial back when we're showing a
+                            // cached/stale reading so the user
+                            // perceives it as "last known" rather than
+                            // a fresh fix. The cached bearing is the
+                            // best guess we have but the radio isn't
+                            // currently confirming it.
+                            .opacity(isStale ? 0.55 : 1.0)
+                            .accessibilityHidden(true)
+                    } else {
+                        waitingState(member: member)
+                            .frame(width: 320, height: 320)
+                            .accessibilityHidden(true)
+                    }
 
-                if let reading {
-                    distanceBlock(reading: reading, color: memberColor, member: member)
-                        .padding(.bottom, 8)
-                        .accessibilityHidden(true)
+                    Spacer(minLength: 8)
+
+                    if let reading = resolvedReading {
+                        distanceBlock(reading: reading, color: memberColor, member: member)
+                            .padding(.bottom, 8)
+                            .accessibilityHidden(true)
+                        if isStale {
+                            staleAgeLine(memberColor: memberColor)
+                                .padding(.bottom, 4)
+                                .accessibilityHidden(true)
+                        }
+                    }
                 }
 
                 doneButton(color: memberColor)
@@ -102,21 +145,21 @@ struct CompassView: View {
             // the rotor surfaces.
             Color.clear
                 .accessibilityElement()
-                .accessibilityLabel(compassAccessibilityLabel(reading: reading,
+                .accessibilityLabel(compassAccessibilityLabel(reading: resolvedReading,
                                                               member: member))
-                .accessibilityValue(compassAccessibilityValue(reading: reading))
+                .accessibilityValue(compassAccessibilityValue(reading: resolvedReading))
                 .accessibilityAddTraits(.updatesFrequently)
                 .accessibilityAction(named: "Speak distance") {
-                    if let m = reading?.metres {
+                    if let m = resolvedReading?.metres {
                         announce("\(member?.displayName ?? "Friend") is \(SpatialFormatter.distance(meters: m)) away.")
                     } else {
                         announce("Distance is not available right now.")
                     }
                 }
                 .accessibilityAction(named: "Speak direction") {
-                    if let r = reading {
+                    if let r = resolvedReading {
                         let phrase = SpatialFormatter.relativeDirection(
-                            bearing: r.phoneFrameBearing, heading: 0
+                            bearing: displayBearing(r), heading: 0
                         )
                         announce("\(member?.displayName ?? "Friend") is \(phrase).")
                     } else {
@@ -124,6 +167,30 @@ struct CompassView: View {
                     }
                 }
                 .allowsHitTesting(false)
+        }
+        .onChange(of: liveReading.map { $0.worldBearing ?? $0.phoneFrameBearing }, initial: true) { _, _ in
+            // Cache the freshest reading when genuinely-new bearing DATA
+            // arrives. We key on the WORLD bearing (raw source bearing,
+            // which only changes when the source updates) — NOT the
+            // phone-frame bearing, which changes on every heading tick.
+            // Otherwise the stale-badge timestamp would refresh on mere
+            // rotation and the badge would never show. (UWB device-frame
+            // readings have no world bearing, so they key on their
+            // phone-frame bearing, which only changes on new readings.)
+            if let live = liveReading {
+                cachedReading = live
+                cachedReadingAt = Date()
+            }
+        }
+        .onChange(of: liveReading?.metres) { _, _ in
+            // Metres can change while bearing stays bit-identical
+            // (peer walks toward us along the same ray). Refresh
+            // the cache timestamp on either axis so the stale badge
+            // doesn't pop up while the radio is still talking.
+            if let live = liveReading {
+                cachedReading = live
+                cachedReadingAt = Date()
+            }
         }
         .onAppear {
             appState.startBLEPresence()
@@ -133,9 +200,17 @@ struct CompassView: View {
             // so the compass dial tracks their movement smoothly
             // instead of GPS-fix cadence.
             appState.startActiveSeeking(targetMemberID: memberID)
+            // Start the VIO camera only if indoor positioning is the
+            // active strategy right now (off for a good GPS fix).
+            appState.setIndoorPositioningActive(indoorPositioningActive)
             // First reading should speak immediately rather than wait
             // out the throttle window.
             VoiceGuidance.shared.resetCompassThrottle()
+        }
+        .onChange(of: indoorPositioningActive) { _, active in
+            // Toggle the VIO camera as the mode flips between indoor and
+            // GPS (manual switch, or auto crossing the GPS-quality line).
+            appState.setIndoorPositioningActive(active)
         }
         .onDisappear {
             appState.stopActiveSeeking()
@@ -163,7 +238,7 @@ struct CompassView: View {
         // facing north (heading = 0) so the cardinal helper produces
         // body-relative phrasing like "ahead and to your right".
         let phrase = SpatialFormatter.relativeDirection(
-            bearing: reading.phoneFrameBearing, heading: 0
+            bearing: displayBearing(reading), heading: 0
         )
         parts.append(phrase)
         return parts.joined(separator: ", ")
@@ -171,7 +246,7 @@ struct CompassView: View {
 
     private func compassAccessibilityValue(reading: ArrowReading?) -> String {
         guard let reading else { return "" }
-        let err = abs(reading.phoneFrameBearing.truncatingRemainder(dividingBy: 360))
+        let err = abs(displayBearing(reading).truncatingRemainder(dividingBy: 360))
         let absErr = min(err, 360 - err)
         if absErr < 5 { return "Aligned" }
         if absErr < 20 { return "Almost aligned" }
@@ -211,15 +286,16 @@ struct CompassView: View {
                     // interval (5s), and is a no-op when VoiceOver is
                     // off or the user has disabled spoken guidance.
                     let phrase = SpatialFormatter.relativeDirection(
-                        bearing: reading.phoneFrameBearing, heading: 0
+                        bearing: displayBearing(reading), heading: 0
                     )
                     let name = currentMember?.displayName ?? "Friend"
                     VoiceGuidance.shared.compassUpdate(
                         "\(name), \(SpatialFormatter.distance(meters: m)), \(phrase)."
                     )
                 }
-                let err = min(abs(reading.phoneFrameBearing.truncatingRemainder(dividingBy: 360)),
-                              360 - abs(reading.phoneFrameBearing.truncatingRemainder(dividingBy: 360)))
+                let db = displayBearing(reading)
+                let err = min(abs(db.truncatingRemainder(dividingBy: 360)),
+                              360 - abs(db.truncatingRemainder(dividingBy: 360)))
                 for zone in zones where lastBearingError > zone && err <= zone {
                     HapticEngine.shared.compassAligned(bearingErrorDegrees: err)
                     break
@@ -349,6 +425,7 @@ struct CompassView: View {
             case .none: return "—"
             }
         }()
+        let status = appState.compassEngine.gradientStatus(toMember: memberID)
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 diagnosticChip(label: "seen", value: "\(diag.discoveredPeripheralCount)")
@@ -362,9 +439,82 @@ struct CompassView: View {
                 diagnosticChip(label: "pos", value: "\(posCount)")
                 diagnosticChip(label: "spread", value: String(format: "%.1fm", spread))
             }
+            // Single-line summary of why (or whether) the gradient
+            // regression is producing a bearing. Drives a "what's
+            // missing" hint the user can act on — "need 1 more
+            // sample" / "need 0.4m more". Surfaced under the chip
+            // rows so it sits visually with the rest of the BLE
+            // pipeline numbers.
+            Text("status: \(Self.statusLabel(for: status))")
         }
         .font(.caption2.monospaced())
         .foregroundStyle(.secondary)
+    }
+
+    /// Map `GradientStatus` onto the short prose the diagnostic
+    /// strip surfaces. Kept here (not in the engine) because the
+    /// engine's status is purely descriptive — the *language* the
+    /// UI uses to explain it lives with the UI.
+    private static func statusLabel(for status: CompassEngine.GradientStatus) -> String {
+        switch status {
+        case .ready:
+            return "ready"
+        case .needSamples(let have):
+            let missing = max(3 - have, 1)
+            return "need \(missing) more sample\(missing == 1 ? "" : "s")"
+        case .needPositions:
+            return "need positions"
+        case .needMovement(let metres):
+            // Target spread is 1 m — surface how much further the
+            // user needs to walk to clear the gate.
+            let missing = max(1 - metres, 0)
+            return String(format: "need %.1fm more", missing)
+        case .singular:
+            return "collinear"
+        case .degenerate:
+            return "degenerate"
+        case .multipathHeavy:
+            return "multipath heavy"
+        }
+    }
+
+    /// Whether our cached reading is still inside the stale-display
+    /// window. Pure read of two `@State` values — no time-rounding
+    /// or persistence, so the check is dirt-cheap. We re-evaluate
+    /// this every body pass; the TimelineView around the stale-age
+    /// line keeps the *display* updating without forcing the rest
+    /// of the view to redraw at 30 Hz.
+    private var isCacheUsable: Bool {
+        guard let at = cachedReadingAt, cachedReading != nil else {
+            return false
+        }
+        return Date().timeIntervalSince(at) <= Self.staleReadingWindow
+    }
+
+    /// "Stale · Xs" — a small unobtrusive line under the distance
+    /// block that ticks up as the cached reading ages. Wrapped in a
+    /// TimelineView at 2 Hz so the label updates without the whole
+    /// compass redrawing every frame.
+    @ViewBuilder
+    private func staleAgeLine(memberColor: Color) -> some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { context in
+            let secondsOld = cachedReadingAt
+                .map { Int(context.date.timeIntervalSince($0).rounded()) }
+                ?? 0
+            HStack(spacing: 4) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.caption2.weight(.semibold))
+                Text("Stale · \(max(secondsOld, 0))s")
+                    .font(.caption.weight(.medium))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .strokeBorder(memberColor.opacity(0.35), lineWidth: 0.5)
+            )
+        }
     }
 
     @ViewBuilder
@@ -391,7 +541,7 @@ struct CompassView: View {
             //    rotated so the gradient's brightest point sits at
             //    the bearing.
             DirectionRing(
-                bearing: reading.phoneFrameBearing,
+                bearing: displayBearing(reading),
                 color: memberColor,
                 proximity: proximity(for: reading.distanceBand),
                 reduceMotion: reduceMotion
@@ -405,7 +555,7 @@ struct CompassView: View {
                 reduceMotion: reduceMotion
             )
         }
-        .animation(.smooth(duration: 0.4), value: reading.phoneFrameBearing)
+        .animation(.smooth(duration: 0.12), value: displayBearing(reading))
     }
 
     /// Maps the textual `distanceBand` ("Close" / "Nearby" / etc.) onto
@@ -456,6 +606,7 @@ struct CompassView: View {
         let (icon, label): (String, String) = {
             switch reading.mode {
             case .uwb:       return ("dot.radiowaves.up.forward", "UWB")
+            case .fused:     return ("scope", "Fused")
             case .gps:       return ("location.fill", "GPS")
             case .bluetooth: return ("antenna.radiowaves.left.and.right", "Bluetooth")
             }
@@ -526,6 +677,7 @@ struct CompassView: View {
 
     private enum CompassMode {
         case uwb         // NearbyInteraction — centimeter-accurate bearing + distance
+        case fused       // EKF fusing UWB + BLE bearing + RSSI range + our motion
         case gps         // both phones have a fresh GPS fix; bearing from haversine
         case bluetooth   // RSSI gradient over our walking path; offline-capable
     }
@@ -534,6 +686,7 @@ struct CompassView: View {
         case auto
         case gps
         case indoor
+        case debug
 
         var id: String { rawValue }
 
@@ -542,12 +695,21 @@ struct CompassView: View {
             case .auto: return "Auto"
             case .gps: return "GPS"
             case .indoor: return "Indoor"
+            case .debug: return "Debug"
             }
         }
     }
 
     private struct ArrowReading {
         let phoneFrameBearing: Double  // degrees clockwise; 0 = up on screen
+        /// World-frame bearing (degrees clockwise from true north) for
+        /// sources that produce one (GPS / gradient / fused). The
+        /// displayed arrow is recomputed as `worldBearing − liveHeading`
+        /// EVERY frame, so rotating the phone rotates the arrow in real
+        /// time even when the (slow) bearing source hasn't updated — and
+        /// even on a cached reading. nil for device-frame sources (UWB
+        /// direction), whose `phoneFrameBearing` is already phone-relative.
+        let worldBearing: Double?
         let distanceBand: String
         /// Best-effort numeric distance in metres. Available for UWB
         /// and GPS modes; nil when only gradient-based mode is up.
@@ -556,6 +718,15 @@ struct CompassView: View {
         let isFresh: Bool
         let mode: CompassMode
         let confidence: Double         // 0–1; full opacity for GPS, R² for gradient
+    }
+
+    /// The bearing to actually draw: for world-frame sources, recompute
+    /// against the live heading so the arrow tracks phone rotation in real
+    /// time; for device-frame (UWB) just use the phone-frame bearing.
+    private func displayBearing(_ reading: ArrowReading) -> Double {
+        guard let world = reading.worldBearing else { return reading.phoneFrameBearing }
+        let heading = appState.currentUser.heading ?? 0
+        return (world - heading).truncatingRemainder(dividingBy: 360)
     }
 
     private struct GPSQuality {
@@ -584,6 +755,27 @@ struct CompassView: View {
         appState.currentGroup?.members.first { $0.id == memberID }
     }
 
+    /// Whether indoor positioning is the active compass strategy — the
+    /// gate for running the VIO camera. True in indoor mode (manual), or
+    /// in auto/debug when GPS isn't a reliable fix for both sides (so the
+    /// compass falls to the indoor / fused path). False in GPS mode or
+    /// when auto has a solid GPS fix, so the camera stays off outdoors.
+    private var indoorPositioningActive: Bool {
+        switch seekerMode {
+        case .gps:
+            return false
+        case .indoor:
+            return true
+        case .auto, .debug:
+            let now = Date()
+            let mine = gpsQuality(for: appState.currentUser, now: now)
+            let theirs = gpsQuality(for: currentMember, now: now)
+            // GPS "good" only if both have a fresh, accurate, real fix.
+            let gpsGood = mine.isReliableForCompass && theirs.isReliableForCompass
+            return !gpsGood
+        }
+    }
+
     private func gpsQuality(for user: User?, now: Date) -> GPSQuality {
         let source = user?.positionSource ?? .gps
         let accuracy = user?.accuracy ?? .infinity
@@ -607,12 +799,22 @@ struct CompassView: View {
             let bearingDeg = bearingRad * 180 / .pi
             return ArrowReading(
                 phoneFrameBearing: bearingDeg,
+                worldBearing: nil,   // device-frame; already phone-relative
                 distanceBand: Self.uwbDistanceBand(metres: uwb.distance),
                 metres: uwb.distance.map(Double.init),
                 isFresh: true,
                 mode: .uwb,
                 confidence: 1.0
             )
+        }
+
+        // UWB distance even without a direction vector. The U1/U2 chips
+        // range continuously and precisely, but only surface a direction
+        // with camera assistance / favorable geometry. Use the accurate
+        // range as the distance readout for whatever direction source we
+        // fall back to, so the measured UWB distance is never wasted.
+        let uwbDistance: Double? = appState.uwbReadings[memberID].flatMap {
+            now.timeIntervalSince($0.timestamp) < 5 ? $0.distance.map(Double.init) : nil
         }
 
         let myQuality = gpsQuality(for: appState.currentUser, now: now)
@@ -640,10 +842,13 @@ struct CompassView: View {
         func gpsReading(_ gps: (worldBearing: Double, metres: Double)) -> ArrowReading {
             let phoneFrame = (gps.worldBearing - myHeading)
                 .truncatingRemainder(dividingBy: 360)
+            // Prefer the precise UWB range over the haversine distance.
+            let metres = uwbDistance ?? gps.metres
             return ArrowReading(
                 phoneFrameBearing: phoneFrame,
-                distanceBand: CompassMath.distanceBand(metres: gps.metres),
-                metres: gps.metres,
+                worldBearing: gps.worldBearing,
+                distanceBand: CompassMath.distanceBand(metres: metres),
+                metres: metres,
                 isFresh: true,
                 mode: .gps,
                 confidence: 1.0
@@ -654,17 +859,48 @@ struct CompassView: View {
                            isFresh: Bool) -> ArrowReading {
             let phoneFrame = (gradient.bearing - myHeading)
                 .truncatingRemainder(dividingBy: 360)
-            let band = appState.compassEngine.latestRSSI(for: memberID)
-                .map(CompassEngine.distanceBand(rssi:))
+            // Precise UWB range first; fall back to RSSI band, then GPS.
+            let band = uwbDistance.map { CompassMath.distanceBand(metres: $0) }
+                ?? appState.compassEngine.latestRSSI(for: memberID)
+                    .map(CompassEngine.distanceBand(rssi:))
                 ?? gpsCandidate.map { CompassMath.distanceBand(metres: $0.metres) }
                 ?? "Nearby"
             return ArrowReading(
                 phoneFrameBearing: phoneFrame,
+                worldBearing: gradient.bearing,
                 distanceBand: band,
-                metres: gpsCandidate?.metres,
+                metres: uwbDistance ?? gpsCandidate?.metres,
                 isFresh: isFresh,
                 mode: .bluetooth,
                 confidence: gradient.confidence
+            )
+        }
+
+        // Fused EKF estimate — the channel *fuser*. Supersedes the
+        // raw single-channel readings below whenever the filter has
+        // converged for the actively-sought peer, because it folds in
+        // UWB range+bearing, the BLE gradient bearing, RSSI path-loss
+        // range, AND our own dead-reckoning motion. Returns nil
+        // until convergence so an unsettled filter doesn't show a wild
+        // arrow — we fall back to GPS / gradient in that window.
+        func fusedReading() -> ArrowReading? {
+            guard let est = appState.relativePoseFilter.estimate,
+                  est.isConverged else { return nil }
+            let phoneFrame = (est.bearingDegrees - myHeading)
+                .truncatingRemainder(dividingBy: 360)
+            // Tighter position covariance → higher dial confidence.
+            let conf = max(0.25, min(1.0, 1.0 - est.positionStdDevMetres / 12.0))
+            // The fused position already folds in UWB range, but prefer
+            // the raw UWB distance for the readout when it's fresh.
+            let metres = uwbDistance ?? est.distanceMetres
+            return ArrowReading(
+                phoneFrameBearing: phoneFrame,
+                worldBearing: est.bearingDegrees,
+                distanceBand: CompassMath.distanceBand(metres: metres),
+                metres: metres,
+                isFresh: true,
+                mode: .fused,
+                confidence: conf
             )
         }
 
@@ -679,7 +915,18 @@ struct CompassView: View {
                 return indoorReading(gradient, isFresh: true)
             }
             return nil
+        case .debug:
+            // Debug mode renders the telemetry panel, not the dial,
+            // so the arrow reading is irrelevant. Behave like .auto
+            // for any code paths (haptics, VoiceOver) that still call
+            // through here.
+            fallthrough
         case .auto:
+            // Fused estimate first — it's strictly more informed than
+            // any single channel once converged.
+            if let fused = fusedReading() {
+                return fused
+            }
             if let gradient {
                 let prefersIndoor = myQuality.likelyIndoorOrUnreliable
                     || !myQuality.isReliableForCompass
@@ -791,7 +1038,7 @@ private struct DirectionRing: View {
                     .shadow(color: color.opacity(0.5), radius: 32)
             }
         }
-        .animation(.smooth(duration: 0.45), value: bearing)
+        .animation(.smooth(duration: 0.12), value: bearing)
         .animation(.smooth(duration: 0.6), value: proximity)
     }
 }

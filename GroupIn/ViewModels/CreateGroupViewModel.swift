@@ -97,8 +97,13 @@ final class CreateGroupViewModel {
             return
         }
 
-        var me = appState.makeMembership()
         let expiresAt = resolvedExpiry
+
+        // Generate the invite code first so the membership ID can be
+        // derived deterministically from it (stable across rejoins —
+        // prevents duplicate "ghost" members).
+        let inviteCode = GroupSession.generateInviteCode()
+        var me = appState.makeMembership(forInviteCode: inviteCode)
 
         // Build the GroupSession entirely in-process. No service call,
         // no awaiting — local creation is synchronous and always
@@ -108,7 +113,7 @@ final class CreateGroupViewModel {
         let group = GroupSession(
             id: UUID(),
             name: trimmedName,
-            inviteCode: GroupSession.generateInviteCode(),
+            inviteCode: inviteCode,
             category: category,
             ownerID: me.id,
             expiresAt: expiresAt,

@@ -39,6 +39,23 @@ nonisolated enum SeekingChannelKind: String, Sendable, Equatable, Codable {
     case bleRanging
 }
 
+/// Per-channel telemetry for the debug panel: the most recent sample
+/// each channel produced, broken out so we can show UWB / Wi-Fi Aware /
+/// BLE side by side with their own distance, direction, RSSI
+/// ("temperature"), and freshness.
+nonisolated struct ChannelTelemetry: Sendable, Equatable {
+    var rssi: Double?
+    var distance: Float?
+    var hasDirection: Bool
+    var sampleCount: Int
+    var lastSample: Date?
+
+    static let empty = ChannelTelemetry(
+        rssi: nil, distance: nil, hasDirection: false,
+        sampleCount: 0, lastSample: nil
+    )
+}
+
 /// Diagnostics for a seeking channel — surfaced in the indoor strip so
 /// the user can see which channel is driving the compass and how
 /// healthy it looks.
@@ -46,11 +63,16 @@ nonisolated struct SeekingDiagnostics: Sendable, Equatable {
     var activeChannel: SeekingChannelKind?
     var sampleCountByMember: [UUID: Int]
     var lastSampleByMember: [UUID: Date]
+    /// Latest telemetry per channel for the targeted member. Debug
+    /// panel reads this to show all channels concurrently with their
+    /// individual temperature / range.
+    var telemetryByChannel: [SeekingChannelKind: ChannelTelemetry]
 
     static let empty = SeekingDiagnostics(
         activeChannel: nil,
         sampleCountByMember: [:],
-        lastSampleByMember: [:]
+        lastSampleByMember: [:],
+        telemetryByChannel: [:]
     )
 }
 

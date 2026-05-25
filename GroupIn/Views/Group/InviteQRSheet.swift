@@ -46,7 +46,22 @@ struct InviteQRSheet: View {
                     .accessibilityLabel("Invite code \(inviteCode), tap to copy")
                 }
 
-                Text("Hold up to a friend's camera or share the code.")
+                // System share sheet — the "from anywhere" path
+                // (Messages, AirDrop, copy link). The QR above stays
+                // the in-person path; both now live behind this one
+                // sheet instead of two separate dashboard controls.
+                ShareLink(item: shareMessage) {
+                    Label("Share invite…", systemImage: "square.and.arrow.up")
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(.white)
+                }
+                .padding(.horizontal, 32)
+                .accessibilityHint("Opens the share sheet to send the invite code via Messages, AirDrop, or other apps")
+
+                Text("Scan the code in person, or tap Share to invite from anywhere.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -90,6 +105,15 @@ struct InviteQRSheet: View {
                         .foregroundStyle(.secondary)
                 )
         }
+    }
+
+    /// Human-readable invite text for the system share sheet. We have
+    /// no universal-link scheme yet, so the recipient enters the code
+    /// manually in Join — the same string the QR encodes and the
+    /// manual field accepts, so every path lands on identical
+    /// validation.
+    private var shareMessage: String {
+        "Join my GroupIn group \"\(groupName)\" — open GroupIn and enter invite code \(inviteCode)"
     }
 
     private func copy() {

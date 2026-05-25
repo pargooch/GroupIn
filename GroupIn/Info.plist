@@ -14,5 +14,21 @@
 		<string>_groupin-v1._tcp</string>
 		<string>_groupin-v1._udp</string>
 	</array>
+	<!-- Visual-inertial odometry (ARKit) for the compass: measures the
+	     seeker's own motion so the relative-pose filter can triangulate a
+	     friend's direction from UWB range. The camera runs only while the
+	     compass is open. -->
+	<key>NSCameraUsageDescription</key>
+	<string>GroupIn uses the camera while the compass is open to track your movement, so it can point you toward the friend you're finding.</string>
+	<!-- Permits plain-HTTP connections to private/local LAN addresses
+	     only (never the public internet). Consumed solely by the
+	     #if DEBUG telemetry uploader posting to a Mac collector; inert
+	     in release builds where that code is compiled out. Safe to
+	     remove for a maximally-minimal App Store plist. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

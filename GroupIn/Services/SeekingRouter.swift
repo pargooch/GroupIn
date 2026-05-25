@@ -141,7 +141,14 @@ final class SeekingRouter {
     private func engageAllSupported(for memberID: UUID) {
         let peerCap = peerCapabilities[memberID] ?? .none
 
-        if localCapability.uwb && peerCap.uwb {
+        // Engage UWB whenever WE support it — do NOT wait for the peer's
+        // capability to arrive over BLE first. That gate used to keep UWB
+        // from even starting until presence was decoded (often never), so
+        // the compass sat on Bluetooth. If the peer genuinely lacks UWB,
+        // no discovery token ever crosses, so no NISession opens — engaging
+        // optimistically is harmless and means UWB ALWAYS starts the moment
+        // the compass opens.
+        if localCapability.uwb {
             uwb.engage(targetMemberID: memberID)
         } else {
             uwb.disengage(targetMemberID: memberID)
@@ -208,6 +215,17 @@ final class SeekingRouter {
         lastSampleByChannel[sample.channel] = sample.timestamp
         currentDiagnostics.sampleCountByMember[sample.memberID, default: 0] += 1
         currentDiagnostics.lastSampleByMember[sample.memberID] = sample.timestamp
+
+        // Per-channel telemetry for the debug panel. Keep a running
+        // sample count per channel and the latest range/temperature.
+        var t = currentDiagnostics.telemetryByChannel[sample.channel] ?? .empty
+        t.sampleCount += 1
+        t.lastSample = sample.timestamp
+        if let rssi = sample.rssi { t.rssi = rssi }
+        if let dist = sample.distance { t.distance = dist }
+        t.hasDirection = sample.direction != nil
+        currentDiagnostics.telemetryByChannel[sample.channel] = t
+
         recomputeActiveChannel()
         maybeYieldDiagnostics()
     }
