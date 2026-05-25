@@ -170,15 +170,23 @@ struct HomeView: View {
             Button {
                 appState.path.append(.profileEditor)
             } label: {
-                HStack(spacing: 12) {
+                HStack(spacing: 14) {
                     AvatarView(data: appState.localProfile.avatarData,
                                name: appState.localProfile.displayName,
                                size: 48)
-                    VStack(alignment: .leading, spacing: 2) {
+                        // A thin cyan ring is enough of a brand cue on
+                        // glass — no glow, keeping the 2026 restraint.
+                        .overlay(
+                            Circle().strokeBorder(Color.accentColor.opacity(0.4),
+                                                  lineWidth: 1)
+                        )
+
+                    VStack(alignment: .leading, spacing: 3) {
                         Text(needsProfileSetup
                              ? "Set up your profile"
                              : appState.localProfile.displayName)
                             .font(.headline)
+                            .foregroundStyle(.primary)
                         Text(needsProfileSetup
                              ? "Add a name and photo to get started"
                              : "Edit profile")
@@ -187,15 +195,17 @@ struct HomeView: View {
                                              ? AnyShapeStyle(Color.accentColor)
                                              : AnyShapeStyle(HierarchicalShapeStyle.secondary))
                     }
-                    Spacer()
+                    Spacer(minLength: 8)
                     Image(systemName: "chevron.right")
-                        .font(.footnote)
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
                         .accessibilityHidden(true)
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.neonCard)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
             .accessibilityHint(needsProfileSetup
                                ? "Opens the profile editor to set your name and photo"
                                : "Opens your profile to edit name and photo")
@@ -218,7 +228,10 @@ struct HomeView: View {
                 } label: {
                     groupRow(group)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.neonCard)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
                 .accessibilityHint("Opens group \(group.name)")
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
@@ -261,6 +274,10 @@ struct HomeView: View {
             } label: {
                 Label("Create a Group", systemImage: "plus.circle.fill")
             }
+            .buttonStyle(.neon)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
             .accessibilityHint(needsProfileSetup
                                ? "Opens profile setup first"
                                : "Starts a new group you can invite others to")
@@ -270,6 +287,10 @@ struct HomeView: View {
             } label: {
                 Label("Join a Group", systemImage: "person.badge.plus")
             }
+            .buttonStyle(.neonSecondary)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
             .accessibilityHint(needsProfileSetup
                                ? "Opens profile setup first"
                                : "Join an existing group with an invite code")
@@ -414,19 +435,16 @@ struct HomeView: View {
         .accessibilityHidden(true)
     }
 
-    /// Invite code + expiry on one muted line. Expiry turns orange when
-    /// the group is within 30 minutes of ending (or has a pending
-    /// extension); the code stays secondary regardless.
+    /// Expiry on one muted line. Turns orange when the group is within
+    /// 30 minutes of ending (or has a pending extension). The invite
+    /// code is intentionally not shown here — it lives behind Share
+    /// Invite inside the group, not on the Home list.
     @ViewBuilder
     private func metaLine(group: GroupSession) -> some View {
         let urgent = group.expiresAt.timeIntervalSinceNow < 30 * 60
         let expiryTint: Color = urgent ? .orange : .secondary
 
         HStack(spacing: 4) {
-            Text("Code \(group.inviteCode)")
-                .foregroundStyle(.secondary)
-            Text("·")
-                .foregroundStyle(.tertiary)
             Image(systemName: group.hasPendingExtension ? "clock.arrow.circlepath" : "clock")
                 .foregroundStyle(expiryTint)
             Text("Expires \(group.expiresAt, style: .relative)")

@@ -120,21 +120,9 @@ struct JoinGroupView: View {
         Button {
             showsScanner = true
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "qrcode.viewfinder")
-                    .font(.body.weight(.semibold))
-                Text("Scan QR code")
-                    .font(.body.weight(.semibold))
-                Spacer()
-            }
-            .padding(.vertical, 14)
-            .padding(.horizontal, 16)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
-            )
+            Label("Scan QR code", systemImage: "qrcode.viewfinder")
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.neonSecondary)
         .accessibilityHint("Opens the camera to scan a group's invite QR code")
         .disabled(viewModel.isSubmitting)
     }
@@ -181,34 +169,16 @@ struct JoinGroupView: View {
                     viewModel.cancel()
                 } label: {
                     Text("Cancel")
-                        .font(.body.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(Color(uiColor: .secondarySystemGroupedBackground))
-                        )
-                        .foregroundStyle(.primary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.neonSecondary)
             }
         } else {
             Button {
                 Task { await viewModel.joinGroup() }
             } label: {
                 Text("Join Group")
-                    .font(.body.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(viewModel.canSubmit
-                                  ? Color.accentColor
-                                  : Color.gray.opacity(0.3))
-                    )
-                    .foregroundStyle(.white)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.neon)
             .disabled(!viewModel.canSubmit)
         }
     }

@@ -52,12 +52,8 @@ struct InviteQRSheet: View {
                 // sheet instead of two separate dashboard controls.
                 ShareLink(item: shareMessage) {
                     Label("Share invite…", systemImage: "square.and.arrow.up")
-                        .font(.body.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 14))
-                        .foregroundStyle(.white)
                 }
+                .buttonStyle(.neon)
                 .padding(.horizontal, 32)
                 .accessibilityHint("Opens the share sheet to send the invite code via Messages, AirDrop, or other apps")
 

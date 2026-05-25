@@ -659,18 +659,10 @@ struct CompassView: View {
 
     @ViewBuilder
     private func doneButton(color: Color) -> some View {
-        Button { dismiss() } label: {
-            Text("Done")
-                .font(.body.weight(.semibold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14)
-                        .strokeBorder(color, lineWidth: 1.5)
-                )
-                .foregroundStyle(color)
-        }
+        // Tinted to the member's color so the finding screen stays
+        // "theirs," via the shared neon button kit.
+        Button("Done") { dismiss() }
+            .buttonStyle(.neon(tint: color))
     }
 
     // MARK: - Math (unchanged from prior version)

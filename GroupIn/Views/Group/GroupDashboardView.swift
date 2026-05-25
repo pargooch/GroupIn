@@ -348,14 +348,9 @@ struct GroupDashboardView: View {
                     .frame(width: 28)
                     .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Share Invite")
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(.primary)
-                    Text("QR code, link, or copy the code")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Text("Share Invite")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
 
                 Spacer(minLength: 8)
 
@@ -602,14 +597,11 @@ struct GroupDashboardView: View {
                 Button(role: .destructive) {
                     confirmingLeaveGroup = true
                 } label: {
-                    HStack {
-                        Spacer()
-                        Label("Leave Group", systemImage: "rectangle.portrait.and.arrow.right")
-                            .labelStyle(.titleAndIcon)
-                        Spacer()
-                    }
-                    .contentShape(Rectangle())
+                    Label("Leave Group", systemImage: "rectangle.portrait.and.arrow.right")
                 }
+                .buttonStyle(.neonDestructive)
+                .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
+                .listRowSeparator(.hidden)
                 .accessibilityHint("Removes you from this group and stops sharing your location with its members")
             }
         }
@@ -782,10 +774,8 @@ struct GroupDashboardView: View {
                     Task { await viewModel.acceptExtension() }
                 } label: {
                     Text("Accept extension")
-                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
+                .buttonStyle(.neon)
                 .padding(.top, 4)
             } else if !viewModel.isOwner {
                 Label("You've accepted", systemImage: "checkmark.circle.fill")

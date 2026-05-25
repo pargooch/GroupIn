@@ -70,15 +70,17 @@ struct CreateGroupView: View {
                 Button {
                     Task { await viewModel.createGroup() }
                 } label: {
-                    HStack {
+                    HStack(spacing: 8) {
                         if viewModel.isSubmitting {
                             ProgressView()
                         }
                         Text("Create Group")
-                            .frame(maxWidth: .infinity)
                     }
                 }
+                .buttonStyle(.neon)
                 .disabled(!viewModel.canSubmit)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 8, leading: 20, bottom: 8, trailing: 20))
             }
         }
         .navigationTitle("New Group")
