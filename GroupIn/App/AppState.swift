@@ -677,10 +677,22 @@ final class AppState {
             startPresenceHeartbeat()
             startBLEPresence()
         } else if !wasEmpty, isEmpty {
-            stopLocationTracking()
-            stopBeaconMonitoring()
-            stopPresenceHeartbeat()
-            stopBLEPresence()
+            // Defer the teardown briefly. Leaving / deleting the last
+            // group empties `myGroups` the instant we emit `.memberLeft`
+            // / `.groupDeleted`, and stopping the transport immediately
+            // cuts that broadcast off before it transmits — so peers only
+            // learn via (slow) CloudKit. Keeping the session alive ~0.8 s
+            // lets the reliable P2P send complete, so nearby members see
+            // the leave/delete instantly. UI state already updated.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(800))
+                // Bail if a re-join repopulated groups in the meantime.
+                guard let self, self.myGroups.isEmpty else { return }
+                self.stopLocationTracking()
+                self.stopBeaconMonitoring()
+                self.stopPresenceHeartbeat()
+                self.stopBLEPresence()
+            }
         }
 
         // Per-group subscription deltas — independent of the whole-
@@ -2120,17 +2132,13 @@ final class AppState {
         payloadIncomingTask = Task { [weak self] in
             guard let self else { return }
             for await packet in self.payloadTransport.incoming {
-                // Try to decrypt with the active group key; fall back to
-                // the raw bytes for an older peer still sending plaintext
-                // frames (open() fails closed on non-ciphertext).
-                let payload: Data = {
-                    if let gid = self.activeTransportGroupID,
-                       let opened = GroupCrypto.open(packet.data, groupID: gid) {
-                        return opened
-                    }
-                    return packet.data
-                }()
-                guard let frame = PayloadFrame.decode(from: payload) else { continue }
+                // In-person frames are sent in the clear over the
+                // proximity transport (MPC / Wi-Fi Aware). The sensitive
+                // wide-area copy in CloudKit is still E2E-encrypted; we
+                // don't double-encrypt the local link because a key edge
+                // would silently drop frames (avatars / chat / leave /
+                // delete stop propagating even when peers are connected).
+                guard let frame = PayloadFrame.decode(from: packet.data) else { continue }
                 switch frame {
                 case .event(let event):
                     self.handleGossipedEvent(event)
@@ -3542,18 +3550,14 @@ final class AppState {
         broadcastFrame(.event(event))
     }
 
-    /// Encode + (E2E) seal a frame with the active group's key, then
-    /// broadcast. Sealing the whole frame keeps in-person MPC / Wi-Fi
-    /// Aware traffic (chat, joins, profiles) ciphertext on the wire too,
-    /// matching the CloudKit path.
+    /// Encode + broadcast a frame over the proximity transport in the
+    /// clear. We intentionally do NOT seal the local link: the durable
+    /// wide-area copy in CloudKit is E2E-encrypted, and double-encrypting
+    /// here risks silently dropping frames on any key edge (which broke
+    /// in-person avatar / chat / leave / delete propagation).
     private func broadcastFrame(_ frame: PayloadFrame) {
         guard let data = frame.encoded() else { return }
-        if let gid = activeTransportGroupID,
-           let sealed = GroupCrypto.seal(data, groupID: gid) {
-            payloadTransport.broadcast(sealed)
-        } else {
-            payloadTransport.broadcast(data)
-        }
+        payloadTransport.broadcast(data)
     }
 
     // MARK: - Profile (avatar) exchange over the payload transport
