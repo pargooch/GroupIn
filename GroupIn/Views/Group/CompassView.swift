@@ -89,50 +89,32 @@ struct CompassView: View {
                 header(member: member, color: memberColor)
                     .padding(.top, 32)
 
-                if seekerMode == .indoor {
-                    indoorDiagnosticStrip(memberID: memberID)
-                        .padding(.horizontal, 24)
-                        .padding(.top, 8)
+                Spacer(minLength: 12)
+
+                if let reading = resolvedReading {
+                    compassDial(reading: reading, memberColor: memberColor)
+                        .frame(width: 320, height: 320)
+                        // Knock the dial back when we're showing a
+                        // cached/stale reading so the user perceives it
+                        // as "last known" rather than a fresh fix.
+                        .opacity(isStale ? 0.55 : 1.0)
+                        .accessibilityHidden(true)
+                } else {
+                    waitingState(member: member)
+                        .frame(width: 320, height: 320)
                         .accessibilityHidden(true)
                 }
 
-                if seekerMode == .debug {
-                    // Full telemetry read-out replaces the dial. Lets
-                    // us see every channel, motion, step, and gradient
-                    // signal at once for field diagnosis.
-                    DebugTelemetryView(memberID: memberID)
+                Spacer(minLength: 8)
+
+                if let reading = resolvedReading {
+                    distanceBlock(reading: reading, color: memberColor, member: member)
+                        .padding(.bottom, 8)
                         .accessibilityHidden(true)
-                } else {
-                    Spacer(minLength: 12)
-
-                    if let reading = resolvedReading {
-                        compassDial(reading: reading, memberColor: memberColor)
-                            .frame(width: 320, height: 320)
-                            // Knock the dial back when we're showing a
-                            // cached/stale reading so the user
-                            // perceives it as "last known" rather than
-                            // a fresh fix. The cached bearing is the
-                            // best guess we have but the radio isn't
-                            // currently confirming it.
-                            .opacity(isStale ? 0.55 : 1.0)
+                    if isStale {
+                        staleAgeLine(memberColor: memberColor)
+                            .padding(.bottom, 4)
                             .accessibilityHidden(true)
-                    } else {
-                        waitingState(member: member)
-                            .frame(width: 320, height: 320)
-                            .accessibilityHidden(true)
-                    }
-
-                    Spacer(minLength: 8)
-
-                    if let reading = resolvedReading {
-                        distanceBlock(reading: reading, color: memberColor, member: member)
-                            .padding(.bottom, 8)
-                            .accessibilityHidden(true)
-                        if isStale {
-                            staleAgeLine(memberColor: memberColor)
-                                .padding(.bottom, 4)
-                                .accessibilityHidden(true)
-                        }
                     }
                 }
 
@@ -383,13 +365,11 @@ struct CompassView: View {
                 .shadow(color: color.opacity(colorScheme == .dark ? 0.4 : 0.0),
                         radius: 8)
 
-            Picker("Seeker mode", selection: $seekerMode) {
-                ForEach(SeekerMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 260)
+            // Seeker mode is resolved automatically (`.auto` cascades
+            // UWB → Fused → GPS → Bluetooth) — the active source is
+            // surfaced by `modeBadge`, so no user-facing picker is
+            // needed. Diagnostic modes (.indoor / .debug) stay in the
+            // enum for in-code field testing.
         }
     }
 
