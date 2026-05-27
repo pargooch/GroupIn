@@ -40,6 +40,8 @@ struct MemberListSheet: View {
                             MemberRow(row: row,
                                       focused: focusedMemberID == row.member.id,
                                       color: color(for: row.member.id))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .listRowBackground(

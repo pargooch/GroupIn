@@ -263,6 +263,7 @@ struct ProfileEditorView: View {
                             Circle()
                                 .stroke(Color(.systemBackground), lineWidth: 3)
                         )
+                        .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Change profile picture")

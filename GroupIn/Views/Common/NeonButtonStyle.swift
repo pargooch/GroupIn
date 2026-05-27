@@ -65,12 +65,23 @@ struct NeonButtonStyle: ButtonStyle {
         @Environment(\.isEnabled) private var isEnabled
 
         var body: some View {
+            // `.contentShape` declares the hit-test region. Without it,
+            // SwiftUI only routes taps that land on the actual label
+            // glyphs — the padded capsule surrounding the text is
+            // visually a button but isn't touch-active, so users have
+            // to hit the text precisely. Declaring the capsule as the
+            // hit shape matches the painted background exactly, gives
+            // the full button surface a tap target (Apple HIG: 44pt
+            // minimum, easily met by the padded capsule), and is the
+            // 2026 best-practice pairing with `.glassEffect`/`Capsule`
+            // backgrounds. Purely a hit-test change — no pixel moves.
             let base = configuration.label
                 .font(.body.weight(.semibold))
                 .frame(maxWidth: fullWidth ? .infinity : nil)
                 .padding(.vertical, NeonButtonMetrics.verticalPadding)
                 .padding(.horizontal, NeonButtonMetrics.horizontalPadding)
                 .foregroundStyle(foreground)
+                .contentShape(Capsule())
 
             if #available(iOS 26.0, *) {
                 // Every button is the SAME clear interactive glass — no
@@ -134,6 +145,14 @@ struct NeonCardButtonStyle: ButtonStyle {
                 .padding(.vertical, NeonButtonMetrics.cardVerticalPadding)
                 .padding(.horizontal, NeonButtonMetrics.cardHorizontalPadding)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Use the SAME rounded-rect shape that paints the card
+                // background as the hit region. Without this, tapping
+                // the empty gutter between an avatar and the chevron
+                // (the dominant gesture target on the Home group rows)
+                // fails silently because only the avatar/text/chevron
+                // glyphs are hit-tested. Matches the visible card
+                // exactly; no appearance change.
+                .contentShape(shape)
 
             if #available(iOS 26.0, *) {
                 base
@@ -171,6 +190,12 @@ struct NeonIconButtonStyle: ButtonStyle {
             let base = configuration.label
                 .font(.body.weight(.semibold))
                 .frame(width: diameter, height: diameter)
+                // SF Symbols are smaller than the surrounding 44pt
+                // frame, so without a circular hit shape the user can
+                // only tap the glyph pixels — the dead ring around the
+                // icon (visually part of the glass disc) ignores taps.
+                // Matches the painted Circle background exactly.
+                .contentShape(Circle())
 
             if #available(iOS 26.0, *) {
                 base

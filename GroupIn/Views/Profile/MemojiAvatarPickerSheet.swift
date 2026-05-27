@@ -52,6 +52,10 @@ struct MemojiAvatarPickerSheet: View {
                     .background(Color.secondary.opacity(0.1),
                                 in: RoundedRectangle(cornerRadius: 14))
                     .padding(.horizontal)
+                    // Without an explicit hit shape, only the inner
+                    // MemojiCaptureField is tappable — the padded
+                    // tinted card around it ignores taps.
+                    .contentShape(Rectangle())
                     .onTapGesture {
                         // Tap on the field itself re-opens the keyboard.
                         isFirstResponder = true

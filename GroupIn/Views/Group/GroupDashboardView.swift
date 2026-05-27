@@ -465,9 +465,11 @@ struct GroupDashboardView: View {
         .accessibilityLabel(text)
 
         if tappable {
-            Button { showsLocationHelp = true } label: { label }
-                .buttonStyle(.plain)
-                .accessibilityHint("Tap to learn why")
+            Button { showsLocationHelp = true } label: {
+                label.contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Tap to learn why")
         } else {
             label
         }
@@ -519,6 +521,10 @@ struct GroupDashboardView: View {
                         .frame(width: 36, height: 36)
                         .background(color.opacity(0.25), in: Circle())
                         .overlay(Circle().strokeBorder(color, lineWidth: 1.5))
+                        // Glyph-only hit-test would leave the ring
+                        // around the icon tap-dead; circular hit shape
+                        // matches the painted disc.
+                        .contentShape(Circle())
                 }
                 .accessibilityLabel("Find \(member.displayName)")
             }
@@ -579,6 +585,7 @@ struct GroupDashboardView: View {
                 .frame(width: 40, height: 40)
                 .background(.black.opacity(0.55), in: Circle())
                 .overlay(Circle().strokeBorder(.white.opacity(0.2), lineWidth: 1))
+                .contentShape(Circle())
         }
         .accessibilityLabel("Fit all members on map")
     }
@@ -679,6 +686,7 @@ struct GroupDashboardView: View {
                     .padding(.vertical, 6)
                     .background(Color.accentColor.opacity(0.15), in: Capsule())
                     .foregroundStyle(.tint)
+                    .contentShape(Capsule())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Unban \(entry.displayName)")
@@ -946,6 +954,7 @@ struct GroupDashboardView: View {
                         .frame(width: 36, height: 36)
                         .foregroundStyle(memberColor)
                         .background(memberColor.opacity(0.14), in: Circle())
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.borderless)
                 .accessibilityHidden(true)

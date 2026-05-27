@@ -44,6 +44,12 @@ struct InviteQRSheet: View {
                                 .foregroundStyle(didCopy ? Color.green : Color.accentColor)
                         }
                         .padding(.horizontal, 24)
+                        // `.plain` style does no hit-area expansion, so
+                        // the gap between the code and the copy icon
+                        // ignores taps. Declaring the padded HStack as
+                        // the hit region restores tap-anywhere behavior
+                        // without altering any pixel.
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Invite code \(inviteCode), tap to copy")
