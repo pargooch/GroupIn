@@ -179,32 +179,6 @@ struct GroupDashboardView: View {
     /// part of the scrollable List, the sheet can be dragged between
     /// detents by grabbing anywhere on it — a far bigger target than
     /// the thin drag indicator alone.
-    /// Live device-to-device link status. Green "N nearby" means the
-    /// peer-to-peer transport (MultipeerConnectivity) is connected, so
-    /// avatars / chat / group changes propagate instantly in person.
-    /// "Searching…" means we're advertising/browsing but no peer has
-    /// connected yet — if that persists with another member right next
-    /// to you, the local-network link isn't forming (Local Network
-    /// permission, same Wi-Fi, both foregrounded).
-    @ViewBuilder
-    private var linkStatusBadge: some View {
-        let diag = appState.transportDiagnostics
-        let connected = diag.connectedPeers
-        HStack(spacing: 3) {
-            Image(systemName: connected > 0
-                  ? "antenna.radiowaves.left.and.right"
-                  : "antenna.radiowaves.left.and.right.slash")
-            Text(connected > 0
-                 ? "\(connected) nearby"
-                 : (diag.isBrowsing || diag.isAdvertising ? "searching…" : "offline"))
-        }
-        .font(.caption2.weight(.medium))
-        .foregroundStyle(connected > 0 ? Color.green : Color.secondary)
-        .accessibilityLabel(connected > 0
-                            ? "\(connected) members connected nearby"
-                            : "No nearby members connected")
-    }
-
     @ViewBuilder
     private func drawerHeader(group: GroupSession) -> some View {
         HStack(spacing: 12) {
@@ -225,12 +199,9 @@ struct GroupDashboardView: View {
                         .font(.title3.weight(.semibold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
-                    HStack(spacing: 8) {
-                        Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        linkStatusBadge
-                    }
+                    Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .accessibilityElement(children: .combine)
