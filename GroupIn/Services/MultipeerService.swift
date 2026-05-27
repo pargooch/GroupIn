@@ -72,6 +72,20 @@ final class MultipeerService: NSObject, PayloadTransport {
     /// invitation refusals show up.
     private var invitedDisplayNames: Set<String> = []
 
+    /// Discovered MCPeerID references keyed by displayName, so the
+    /// retry loop can re-invite without waiting for `foundPeer` to
+    /// fire again (which on some AWDL setups can take minutes).
+    private var discoveredPeers: [String: MCPeerID] = [:]
+
+    /// How many times we've invited a given peer this start-cycle.
+    /// Capped to avoid an indefinite invite storm on a peer that
+    /// keeps refusing or is genuinely unreachable.
+    private var inviteAttempts: [String: Int] = [:]
+
+    private static let maxInviteAttempts = 4
+    private static let invitationTimeout: TimeInterval = 30
+    private static let retryDelay: TimeInterval = 12
+
     private var currentDiagnostics = TransportDiagnostics(
         connectedPeers: 0,
         isActive: false,
@@ -103,13 +117,19 @@ final class MultipeerService: NSObject, PayloadTransport {
         activeRendezvousToken = rendezvousToken
 
         let peer = MCPeerID(displayName: displayName)
-        // .required uses MPC-generated ephemeral certs and gives us
-        // transport-level TLS for free — meaningful even before app-
-        // level encryption (v2) lands.
+        // .optional, not .required. We learned the hard way that
+        // requiring DTLS over AWDL/Bluetooth pegs the session in
+        // "connecting" past the invitation timeout on cellular-only
+        // phones and on flaky Wi-Fi peer-to-peer setups — peers stay
+        // stuck on "Seen" forever. The wide-area copy of every payload
+        // is already E2E-encrypted in CloudKit (ChaChaPoly + HKDF from
+        // the invite code), so the proximity link doesn't need its own
+        // TLS to be safe. `.optional` still negotiates encryption when
+        // both ends are ready; it just won't BLOCK the handshake.
         let mcSession = MCSession(
             peer: peer,
             securityIdentity: nil,
-            encryptionPreference: .required
+            encryptionPreference: .optional
         )
         mcSession.delegate = self
 
@@ -161,6 +181,8 @@ final class MultipeerService: NSObject, PayloadTransport {
         connectedByDisplayName.removeAll()
         discoveredDisplayNames.removeAll()
         invitedDisplayNames.removeAll()
+        discoveredPeers.removeAll()
+        inviteAttempts.removeAll()
 
         currentDiagnostics = TransportDiagnostics(
             connectedPeers: 0,
@@ -348,10 +370,10 @@ extension MultipeerService: MCNearbyServiceBrowserDelegate {
             if self.discoveredDisplayNames.insert(displayName).inserted {
                 self.updateDiscoveryCounts()
             }
+            self.discoveredPeers[displayName] = peerID
 
             guard let token = self.activeRendezvousToken,
                   peerToken == token,
-                  let session = self.session,
                   let local = self.localPeerID else {
                 return
             }
@@ -361,16 +383,45 @@ extension MultipeerService: MCNearbyServiceBrowserDelegate {
             // sends the invite. The other side accepts.
             guard local.displayName < peerID.displayName else { return }
 
-            let context = token.data(using: .utf8)
-            browser.invitePeer(
-                peerID,
-                to: session,
-                withContext: context,
-                timeout: 10
-            )
-            if self.invitedDisplayNames.insert(displayName).inserted {
-                self.updateDiscoveryCounts()
-            }
+            self.attemptInvite(peerID: peerID, token: token)
+        }
+    }
+
+    /// Send an MPC invitation to `peerID` and schedule a retry. AWDL
+    /// can take 10–20 s to bring up on cellular-only phones, and the
+    /// invitation timeout would otherwise expire silently and leave
+    /// the session stuck on "Seen" with no second attempt. We retry
+    /// up to `maxInviteAttempts` times on a `retryDelay` cadence —
+    /// the retry is a no-op if the peer is already connected.
+    @MainActor
+    private func attemptInvite(peerID: MCPeerID, token: String) {
+        guard let session = self.session,
+              let browser = self.browser else { return }
+        let displayName = peerID.displayName
+        guard self.connectedByDisplayName[displayName] == nil else { return }
+
+        let attempt = (self.inviteAttempts[displayName] ?? 0) + 1
+        guard attempt <= Self.maxInviteAttempts else { return }
+        self.inviteAttempts[displayName] = attempt
+
+        let context = token.data(using: .utf8)
+        browser.invitePeer(
+            peerID,
+            to: session,
+            withContext: context,
+            timeout: Self.invitationTimeout
+        )
+        if self.invitedDisplayNames.insert(displayName).inserted {
+            self.updateDiscoveryCounts()
+        }
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.retryDelay))
+            guard let self,
+                  self.connectedByDisplayName[displayName] == nil,
+                  let stillDiscovered = self.discoveredPeers[displayName],
+                  let activeToken = self.activeRendezvousToken else { return }
+            self.attemptInvite(peerID: stillDiscovered, token: activeToken)
         }
     }
 
@@ -378,10 +429,18 @@ extension MultipeerService: MCNearbyServiceBrowserDelegate {
         _ browser: MCNearbyServiceBrowser,
         lostPeer peerID: MCPeerID
     ) {
-        // Loss handled through MCSession state transitions; nothing
-        // to do here. Browser sees "lost" before the session reports
-        // disconnect; relying on the session event keeps connected/
-        // disconnected counts honest.
+        let displayName = peerID.displayName
+        Task { @MainActor in
+            // Drop from the discovery set so the indicator stops
+            // showing "Seen N" for peers that have actually gone away.
+            // Connection state still flows through MCSession (which
+            // reports disconnect after the link goes down); this only
+            // updates the "discovered but never connected" view.
+            if self.discoveredDisplayNames.remove(displayName) != nil {
+                self.updateDiscoveryCounts()
+            }
+            self.discoveredPeers.removeValue(forKey: displayName)
+        }
     }
 
     nonisolated func browser(

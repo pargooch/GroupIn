@@ -203,7 +203,7 @@ struct GroupDashboardView: View {
                         Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        PeerLinkIndicator(transport: appState.payloadTransport)
+                        PeerLinkIndicator(transport: appState.payloadTransport(for: group.id))
                     }
                 }
             }

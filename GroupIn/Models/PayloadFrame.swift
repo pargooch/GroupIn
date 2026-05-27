@@ -34,17 +34,29 @@ nonisolated enum PayloadFrame: Codable, Sendable {
     /// apply it to the member record and emit nothing.
     case profile(MemberProfile)
 
+    /// Cursor advertisement — sent by a peer right after the MPC session
+    /// comes up, telling us "for this group, this is the most recent
+    /// event I have." We compare to our local timeline and stream back
+    /// every event newer than `cursor` in chronological order. This is
+    /// the targeted handshake that fixes the "join a group, chat doesn't
+    /// sync until app restart" symptom: the cold-start sync used to
+    /// happen via CloudKit only and could lag minutes; this is a direct
+    /// peer-to-peer catch-up that completes the moment the link is up.
+    case cursorAdvert(CursorAdvert)
+
     // MARK: Codable
 
     private enum CodingKeys: String, CodingKey {
         case type
         case event
         case profile
+        case cursorAdvert
     }
 
     private enum Kind: String, Codable {
         case event
         case profile
+        case cursorAdvert
     }
 
     init(from decoder: Decoder) throws {
@@ -57,6 +69,9 @@ nonisolated enum PayloadFrame: Codable, Sendable {
         case .profile:
             let profile = try container.decode(MemberProfile.self, forKey: .profile)
             self = .profile(profile)
+        case .cursorAdvert:
+            let advert = try container.decode(CursorAdvert.self, forKey: .cursorAdvert)
+            self = .cursorAdvert(advert)
         }
     }
 
@@ -69,6 +84,9 @@ nonisolated enum PayloadFrame: Codable, Sendable {
         case .profile(let profile):
             try container.encode(Kind.profile, forKey: .type)
             try container.encode(profile, forKey: .profile)
+        case .cursorAdvert(let advert):
+            try container.encode(Kind.cursorAdvert, forKey: .type)
+            try container.encode(advert, forKey: .cursorAdvert)
         }
     }
 
@@ -91,4 +109,14 @@ nonisolated struct MemberProfile: Codable, Sendable, Equatable {
     let memberID: UUID
     let displayName: String?
     let avatarData: Data?
+}
+
+/// Payload for `.cursorAdvert`: the sender's most recent known event
+/// cursor for `groupID`. `cursor == nil` means "I have no events for
+/// this group yet" — receivers should treat that as "stream me
+/// everything." Sent once per group right after the MPC session for
+/// that group transitions to `.connected`.
+nonisolated struct CursorAdvert: Codable, Sendable {
+    let groupID: UUID
+    let cursor: EventCursor?
 }

@@ -17,12 +17,15 @@ import SwiftUI
 struct PeerLinkIndicator: View {
     /// Captured once at init so the view does NOT observe AppState. The
     /// transport itself is not @Observable, so reading a snapshot from
-    /// it inside `body` is free of side-effects on the observation graph.
-    let transport: PayloadTransport
+    /// it inside `body` is free of side-effects on the observation
+    /// graph. Optional because per-group transports come and go with
+    /// scene phase / membership; nil renders as "Link off."
+    let transport: PayloadTransport?
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 2)) { _ in
-            let diag = transport.currentDiagnosticsSnapshot
+            let diag = transport?.currentDiagnosticsSnapshot
+                ?? TransportDiagnostics.inactive
             chip(for: diag)
         }
     }

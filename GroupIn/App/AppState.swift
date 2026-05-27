@@ -270,11 +270,25 @@ final class AppState {
     /// → BLE) per peer based on shared capability bits, and forwards
     /// ranging samples upward under one stable stream.
     let seekingRouter: SeekingRouter
-    /// Payload-tier transport — carries chat + event-log gossip + (Phase 4)
-    /// capability and anchor messages. BLE remains the signal tier
+    /// Payload-tier transports — one per group the user is a member of.
+    /// Each group runs its own MPC session under its own rendezvous
+    /// token so peers in different groups never collide, and the
+    /// "active focused group" doesn't have to be re-pointed when the
+    /// user switches between groups. BLE remains the signal tier
     /// (presence heartbeat, join handshake, wake-on-proximity); anything
     /// substantive flows through here on MPC or Wi-Fi Aware.
-    let payloadTransport: PayloadTransport
+    private var payloadTransports: [UUID: PayloadTransport] = [:]
+
+    /// Factory used to build a new per-group transport on demand. Held
+    /// as a closure so tests can inject a stub transport per group.
+    private let payloadTransportFactory: () -> PayloadTransport
+
+    /// Returns the live transport for `groupID`, if one is currently
+    /// running. Used by the link-status indicator and any view that
+    /// wants to read a per-group snapshot.
+    func payloadTransport(for groupID: UUID) -> PayloadTransport? {
+        payloadTransports[groupID]
+    }
 
     private let defaults: UserDefaults
     private var networkMonitor: NetworkMonitor?
@@ -392,14 +406,10 @@ final class AppState {
     private var deadReckoningTask: Task<Void, Never>?
     private var compassStepTask: Task<Void, Never>?
 
-    /// Payload-transport consumer task — decodes incoming `PayloadFrame`s
-    /// and routes events into the same `handleGossipedEvent` pipeline
-    /// that BLE used to feed.
-    private var payloadIncomingTask: Task<Void, Never>?
-    /// Group ID of the rendezvous currently active on the transport.
-    /// `nil` when the transport isn't running. Used to decide whether
-    /// a presence start needs to restart the transport too.
-    private var activeTransportGroupID: UUID?
+    /// Per-group payload-transport consumer tasks. Three tasks per
+    /// group: incoming frames, peer connect/disconnect events,
+    /// diagnostics. Cancelled together on `stopPayloadTransport(for:)`.
+    private var payloadTransportTasks: [UUID: [Task<Void, Never>]] = [:]
 
     /// Asymmetric activity role:
     ///
@@ -470,7 +480,7 @@ final class AppState {
          locationService: LocationServicing? = nil,
          notificationService: NotificationServicing? = nil,
          blePresenceService: BLEPresenceServicing? = nil,
-         payloadTransport: PayloadTransport? = nil,
+         payloadTransportFactory: (() -> PayloadTransport)? = nil,
          motionService: MotionActivityServicing? = nil,
          uwbSessionService: UWBSessionServicing? = nil,
          deadReckoningService: DeadReckoningServicing? = nil,
@@ -490,11 +500,12 @@ final class AppState {
 
         self.notificationService = notificationService ?? NotificationService()
         self.blePresenceService = blePresenceService ?? BLEAdvertisementService()
-        self.payloadTransport = payloadTransport
-            ?? PayloadTransportRouter(
+        self.payloadTransportFactory = payloadTransportFactory ?? {
+            PayloadTransportRouter(
                 multipeer: MultipeerService(),
                 wifiAware: WiFiAwareService()
             )
+        }
         self.beaconMonitor = BeaconMonitorService()
         self.motionService = motionService ?? MotionActivityService()
         self.uwbSessionService = uwbSessionService ?? UWBSessionService()
@@ -713,6 +724,15 @@ final class AppState {
             Task { [weak self, groupID] in
                 await self?.syncEvents(for: groupID)
             }
+            // Spin up a payload transport for the newly-added group so
+            // chat / avatar gossip works in-person from the moment the
+            // join completes — not only after the next cold launch.
+            // The wasEmpty→!isEmpty whole-stack branch above handles
+            // the FIRST group; this loop covers every subsequent group
+            // added while the stack is already up.
+            if !wasEmpty, let group = current.first(where: { $0.id == groupID }) {
+                startPayloadTransport(for: group)
+            }
         }
         for groupID in removed {
             Task { [groupService = self.groupService, groupID] in
@@ -723,6 +743,9 @@ final class AppState {
             // want a fresh sync rather than picking up from where we
             // left off (which could be wildly out of date).
             eventCursors.removeValue(forKey: groupID)
+            // Tear down this group's payload transport so we stop
+            // advertising on its rendezvous token immediately.
+            stopPayloadTransport(for: groupID)
         }
     }
 
@@ -2079,7 +2102,14 @@ final class AppState {
             }
         }
 
-        startPayloadTransport(for: group)
+        // Spin up a payload transport for EVERY group the user is in,
+        // not just the currently-focused one. With per-group MPC
+        // sessions, peers in any group are reachable as soon as we
+        // start advertising on their rendezvous — there's no need to
+        // wait for the user to open that group's dashboard.
+        for joined in myGroups {
+            startPayloadTransport(for: joined)
+        }
     }
 
     /// Dispatch a ranging sample from the seeking router into the
@@ -2106,55 +2136,94 @@ final class AppState {
         }
     }
 
-    /// Bring up the payload transport for `group` and start consuming
-    /// incoming frames. Idempotent: a no-op if already running for the
-    /// same group; a clean restart if the group changed.
+    /// Bring up a payload transport dedicated to `group` and start
+    /// consuming its incoming frames, peer events, and diagnostics.
+    /// Idempotent — if a transport is already running for this group,
+    /// no-op. Each group gets its own isolated MPC session so peers
+    /// in Group A and Group B never collide on the same rendezvous.
     ///
-    /// Sought role doesn't spin the transport up — a backgrounded user
-    /// only needs to be *findable* over BLE; the transport comes alive
+    /// Sought role doesn't spin transports up — a backgrounded user
+    /// only needs to be *findable* over BLE; transports come alive
     /// when they foreground (and the role flips to seeker) or when an
     /// in-range seeker wakes them via state restoration.
     private func startPayloadTransport(for group: GroupSession) {
         guard role == .seeker else { return }
-        if activeTransportGroupID == group.id { return }
+        if payloadTransports[group.id] != nil { return }
 
         let displayName = (membershipByGroupID[group.id] ?? currentUser.id)
             .uuidString
         let rendezvous = Self.rendezvousToken(forInviteCode: group.inviteCode)
 
-        payloadTransport.stop()
-        payloadIncomingTask?.cancel()
-        payloadIncomingTask = nil
+        let transport = payloadTransportFactory()
+        payloadTransports[group.id] = transport
+        transport.start(displayName: displayName, rendezvousToken: rendezvous)
 
-        payloadTransport.start(displayName: displayName, rendezvousToken: rendezvous)
-        activeTransportGroupID = group.id
-
-        payloadIncomingTask = Task { [weak self] in
+        let groupID = group.id
+        let incoming = Task { [weak self, transport] in
             guard let self else { return }
-            for await packet in self.payloadTransport.incoming {
-                // In-person frames are sent in the clear over the
-                // proximity transport (MPC / Wi-Fi Aware). The sensitive
-                // wide-area copy in CloudKit is still E2E-encrypted; we
-                // don't double-encrypt the local link because a key edge
-                // would silently drop frames (avatars / chat / leave /
-                // delete stop propagating even when peers are connected).
+            // In-person frames are sent in the clear over the proximity
+            // transport (MPC / Wi-Fi Aware). The sensitive wide-area
+            // copy in CloudKit is still E2E-encrypted; we don't double-
+            // encrypt the local link because a key edge would silently
+            // drop frames (avatars / chat / leave / delete stop
+            // propagating even when peers are connected).
+            for await packet in transport.incoming {
                 guard let frame = PayloadFrame.decode(from: packet.data) else { continue }
                 switch frame {
                 case .event(let event):
                     self.handleGossipedEvent(event)
                 case .profile(let profile):
                     self.handleGossipedProfile(profile)
+                case .cursorAdvert(let advert):
+                    self.handleCursorAdvert(advert, from: packet.peer, in: groupID)
                 }
             }
         }
+
+        let peers = Task { [weak self, transport] in
+            guard let self else { return }
+            for await event in transport.peerEvents {
+                switch event {
+                case .connected(let peerID):
+                    self.handlePeerConnected(peerID, in: groupID)
+                case .disconnected(let peerID):
+                    self.handlePeerDisconnected(peerID, in: groupID)
+                }
+            }
+        }
+
+        let diag = Task { [weak self, transport] in
+            guard let self else { return }
+            for await snapshot in transport.diagnostics {
+                // Keep the legacy single-group diagnostic field updated
+                // with whichever transport last published — only the
+                // dashboard for that group surfaces it, and the per-
+                // group indicator now uses `currentDiagnosticsSnapshot`
+                // on its own transport so cross-group writes don't
+                // matter visually.
+                self.transportDiagnostics = snapshot
+            }
+        }
+
+        payloadTransportTasks[group.id] = [incoming, peers, diag]
     }
 
-    /// Tear down the payload transport. Safe to call when not running.
-    private func stopPayloadTransport() {
-        payloadTransport.stop()
-        payloadIncomingTask?.cancel()
-        payloadIncomingTask = nil
-        activeTransportGroupID = nil
+    /// Tear down the transport for one group. Safe to call if not running.
+    private func stopPayloadTransport(for groupID: UUID) {
+        if let tasks = payloadTransportTasks.removeValue(forKey: groupID) {
+            for task in tasks { task.cancel() }
+        }
+        if let transport = payloadTransports.removeValue(forKey: groupID) {
+            transport.stop()
+        }
+    }
+
+    /// Tear down every per-group transport. Used on backgrounding and
+    /// on full sign-out / last-group-left.
+    private func stopAllPayloadTransports() {
+        for groupID in Array(payloadTransports.keys) {
+            stopPayloadTransport(for: groupID)
+        }
     }
 
     /// Derive a short, stable rendezvous token from an invite code.
@@ -2189,25 +2258,37 @@ final class AppState {
         role = newRole
         switch newRole {
         case .seeker:
-            if let group = currentGroup {
-                startPayloadTransport(for: group)
+            // Re-spin transports for every group on foreground, not
+            // just the focused one — the user may have switched groups
+            // in the background and we still want to be reachable on
+            // all of them.
+            for joined in myGroups {
+                startPayloadTransport(for: joined)
             }
         case .sought:
-            stopPayloadTransport()
+            stopAllPayloadTransports()
         }
     }
 
-    /// Recompute the group-min transport across the active group's
-    /// known peer capabilities + our own, and ask the router to
-    /// switch if the answer changed. Called whenever a peer's
-    /// advertised capability shifts.
+    /// Recompute the group-min transport tier across every active
+    /// group's known peer capabilities + our own, asking each router
+    /// to switch if the answer changed. Called whenever a peer's
+    /// advertised capability shifts. With one transport per group, the
+    /// capability inputs are still global (all peers we've seen on BLE)
+    /// — refining that to per-group capability sets would require
+    /// memberID→groupID attribution that BLE presence doesn't carry.
+    /// The conservative behaviour today (apply the same selection
+    /// across all groups) matches pre-B1 semantics.
     private func recomputeGroupTransport() {
-        guard activeTransportGroupID != nil else { return }
+        guard !payloadTransports.isEmpty else { return }
         var all: [TransportCapability] = [Self.localTransportCapability()]
         all.append(contentsOf: peerCapabilities.values)
-        if let selection = TransportCapability.groupMinimum(across: all),
-           selection != payloadTransport.selection {
-            payloadTransport.select(selection)
+        guard let selection = TransportCapability.groupMinimum(across: all)
+        else { return }
+        for transport in payloadTransports.values {
+            if selection != transport.selection {
+                transport.select(selection)
+            }
         }
     }
 
@@ -2263,7 +2344,7 @@ final class AppState {
         uwbSessionService.stop()
         blePresenceService.updateNearbyToken(nil)
         blePresenceService.stop()
-        stopPayloadTransport()
+        stopAllPayloadTransports()
         orientationService.stop()
         #if DEBUG
         stopDebugTelemetry()
@@ -2493,23 +2574,13 @@ final class AppState {
                 }
             }
         }
-        if transportDiagnosticsTask == nil {
-            transportDiagnosticsTask = Task { [weak self] in
-                guard let self else { return }
-                var lastConnected = 0
-                for await diag in self.payloadTransport.diagnostics {
-                    let previous = lastConnected
-                    lastConnected = diag.connectedPeers
-                    self.transportDiagnostics = diag
-                    // A peer just joined the session — push our profile
-                    // (name + avatar) so they see our picture immediately,
-                    // not after the next CloudKit fetch.
-                    if diag.connectedPeers > previous {
-                        self.broadcastSelfProfile()
-                    }
-                }
-            }
-        }
+        // The transport diagnostics + on-connect profile push used to
+        // live here, observing a single shared `payloadTransport`. With
+        // per-group transports, both jobs moved into
+        // `startPayloadTransport(for:)`: each group's diagnostics task
+        // writes the legacy `transportDiagnostics` field, and the
+        // peer-events task handles connect → profile push + cursor
+        // advert per peer rather than per aggregate count.
     }
 
     // MARK: - Offline chat
@@ -3517,17 +3588,23 @@ final class AppState {
         }
     }
 
-    /// Broadcast an event over the payload transport if at least one
-    /// in-range peer's cursor is older than the event. Skips the send
-    /// if every tracked peer is already caught up.
+    /// Broadcast an event over the group's payload transport if at
+    /// least one in-range peer's cursor is older than the event. Skips
+    /// the send if every tracked peer is already caught up.
     ///
     /// **First-sync flooding caveat:** when we receive a large batch
     /// from CloudKit (e.g. after a cold launch sync), each event runs
     /// through this filter so we don't re-broadcast events nearby
-    /// peers already have.
+    /// peers already have. Scoped per group so a peer in Group B
+    /// being behind doesn't trigger a broadcast for Group A.
     private func broadcastEventIfPeersBehind(_ event: Event) {
-        guard !peerCursors.isEmpty else { return }
-        let anyBehind = peerCursors.values.contains { peerCursor in
+        let memberIDs: Set<UUID> = Set(
+            myGroups.first(where: { $0.id == event.groupID })?
+                .members.map(\.id) ?? []
+        )
+        let scoped = peerCursors.filter { memberIDs.contains($0.key) }
+        guard !scoped.isEmpty else { return }
+        let anyBehind = scoped.values.contains { peerCursor in
             event.cursor > peerCursor
         }
         guard anyBehind else { return }
@@ -3544,38 +3621,143 @@ final class AppState {
     }
 
     /// Wrap `event` in a `PayloadFrame.event` and broadcast over the
-    /// transport. Full event flows (no `strippedForBLE()` shrinkage)
-    /// because MPC / Wi-Fi Aware can carry the avatar payload.
+    /// group's transport. Full event flows (no `strippedForBLE()`
+    /// shrinkage) because MPC / Wi-Fi Aware can carry the avatar
+    /// payload.
     private func sendEventToPayloadTransport(_ event: Event) {
-        broadcastFrame(.event(event))
+        broadcastFrame(.event(event), in: event.groupID)
     }
 
-    /// Encode + broadcast a frame over the proximity transport in the
-    /// clear. We intentionally do NOT seal the local link: the durable
-    /// wide-area copy in CloudKit is E2E-encrypted, and double-encrypting
-    /// here risks silently dropping frames on any key edge (which broke
-    /// in-person avatar / chat / leave / delete propagation).
-    private func broadcastFrame(_ frame: PayloadFrame) {
-        guard let data = frame.encoded() else { return }
-        payloadTransport.broadcast(data)
+    /// Encode + broadcast a frame over the proximity transport for one
+    /// group, in the clear. We intentionally do NOT seal the local
+    /// link: the durable wide-area copy in CloudKit is E2E-encrypted,
+    /// and double-encrypting here risks silently dropping frames on any
+    /// key edge (which broke in-person avatar / chat / leave / delete
+    /// propagation).
+    private func broadcastFrame(_ frame: PayloadFrame, in groupID: UUID) {
+        guard let transport = payloadTransports[groupID],
+              let data = frame.encoded() else { return }
+        transport.broadcast(data)
+    }
+
+    /// Targeted send to one peer on one group's transport. Used by the
+    /// on-connect handshake (profile + cursor advert) and by the
+    /// cursor-delta replay so a freshly-connected peer gets only the
+    /// events they're missing, not the whole timeline rebroadcast.
+    private func sendFrame(_ frame: PayloadFrame,
+                           to peer: TransportPeerID,
+                           in groupID: UUID) {
+        guard let transport = payloadTransports[groupID],
+              let data = frame.encoded() else { return }
+        try? transport.send(data, to: peer)
     }
 
     // MARK: - Profile (avatar) exchange over the payload transport
 
-    /// Broadcast our identity (name + avatar) to connected peers so they
-    /// render our profile picture immediately. Called when a peer
-    /// connects and whenever our profile changes. Sent over MPC / Wi-Fi
-    /// Aware, which has room for the avatar blob (BLE presence does not).
+    /// Broadcast our identity (name + avatar) to every group we have a
+    /// live payload transport for. Identity is per-group by design
+    /// (different memberID per group for privacy), so each group needs
+    /// its own profile frame with the correct per-group memberID — a
+    /// single global broadcast can't satisfy that. Called when our
+    /// profile changes; the on-connect targeted push handles freshly-
+    /// connected peers without waiting for the next change.
     func broadcastSelfProfile() {
-        guard let groupID = activeTransportGroupID,
-              let memberID = membershipByGroupID[groupID] else { return }
-        let profile = MemberProfile(
+        for groupID in payloadTransports.keys {
+            guard let profile = makeSelfProfile(for: groupID) else { continue }
+            broadcastFrame(.profile(profile), in: groupID)
+        }
+    }
+
+    /// Build a per-group `MemberProfile` for the local user, or nil if
+    /// we don't have a membership for that group yet.
+    private func makeSelfProfile(for groupID: UUID) -> MemberProfile? {
+        guard let memberID = membershipByGroupID[groupID] else { return nil }
+        return MemberProfile(
             groupID: groupID,
             memberID: memberID,
             displayName: localProfile.displayName,
             avatarData: localProfile.avatarData
         )
-        broadcastFrame(.profile(profile))
+    }
+
+    /// Handle an MPC `.connected` peer event for one group's transport.
+    /// Pushes our profile and a cursor advert directly to the new peer
+    /// so they (a) render our avatar immediately and (b) tell us where
+    /// they are in the event log so we can stream them missing events.
+    /// This is the live-join hook that fixes "avatar / chat doesn't
+    /// arrive until app restart": the cold-start path used to wait on
+    /// CloudKit for both of these; now it happens P2P the instant the
+    /// session is up.
+    private func handlePeerConnected(_ peerID: TransportPeerID, in groupID: UUID) {
+        if let profile = makeSelfProfile(for: groupID) {
+            sendFrame(.profile(profile), to: peerID, in: groupID)
+        }
+        let advert = CursorAdvert(
+            groupID: groupID,
+            cursor: eventCursors[groupID]
+        )
+        sendFrame(.cursorAdvert(advert), to: peerID, in: groupID)
+    }
+
+    /// Handle an MPC `.disconnected` peer event. Drop the peer's
+    /// cached cursor — they're gone, so we shouldn't gate future
+    /// broadcasts on whether they're caught up.
+    private func handlePeerDisconnected(_ peerID: TransportPeerID, in groupID: UUID) {
+        guard let memberID = UUID(uuidString: peerID.raw) else { return }
+        peerCursors.removeValue(forKey: memberID)
+    }
+
+    /// Handle an inbound `cursorAdvert` from `peer`. Records the peer's
+    /// cursor under their memberID (so `broadcastEventIfPeersBehind`
+    /// can use it going forward) and streams the delta of events newer
+    /// than that cursor directly to them — targeted, not broadcast, so
+    /// we don't re-flood peers that are already caught up.
+    private func handleCursorAdvert(_ advert: CursorAdvert,
+                                    from peer: TransportPeerID,
+                                    in groupID: UUID) {
+        guard advert.groupID == groupID else { return }
+        if let memberID = UUID(uuidString: peer.raw), let cursor = advert.cursor {
+            peerCursors[memberID] = cursor
+        }
+        Task { [weak self, groupID, peer, cursor = advert.cursor] in
+            await self?.streamEventsNewer(
+                than: cursor, in: groupID, to: peer
+            )
+        }
+    }
+
+    /// Targeted catch-up: send every event newer than `cursor` for
+    /// `groupID` directly to one peer, in chronological order. Mirrors
+    /// `pushEventsNewer` but sends to a single connected peer instead
+    /// of broadcasting — used on the cursor-advert handshake so a peer
+    /// that just connected gets only what they're missing.
+    private func streamEventsNewer(than cursor: EventCursor?,
+                                   in groupID: UUID,
+                                   to peer: TransportPeerID) async {
+        let events: [Event]
+        do {
+            if let cursor {
+                events = try await groupService.fetchEvents(
+                    forGroupID: groupID, since: cursor
+                )
+            } else {
+                // No cursor at all → peer has nothing for this group.
+                // Send everything we have. The reducer dedups on event
+                // ID, so re-arrival is harmless.
+                events = eventsByGroup[groupID] ?? []
+            }
+        } catch {
+            return
+        }
+        let sorted = events.sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt < rhs.createdAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        for event in sorted {
+            sendFrame(.event(event), to: peer, in: groupID)
+        }
     }
 
     /// Apply a peer's `.profile` frame: cache the avatar (so a member who
