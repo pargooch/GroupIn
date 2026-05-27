@@ -23,6 +23,7 @@ struct ChatSheet: View {
     @State private var draft: String = ""
     @State private var isLoadingOlder = false
     @State private var didInitialFetch = false
+    @State private var infoEvent: Event?
     @FocusState private var inputFocused: Bool
 
     private static let maxLength = 240
@@ -53,6 +54,10 @@ struct ChatSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+        .sheet(item: $infoEvent) { event in
+            ChatMessageInfoSheet(event: event)
+                .environment(appState)
+        }
         .task {
             // On first appearance, if our local log for this group
             // is empty, fetch the most recent page. Subsequent opens
@@ -287,6 +292,31 @@ struct ChatSheet: View {
                         in: RoundedRectangle(cornerRadius: 19, style: .continuous)
                     )
                     .foregroundStyle(isMe ? Color.white : Color.primary)
+                    // 500ms visibility debounce → broadcast read
+                    // receipt. WhatsApp definition: a message is
+                    // "read" once it's been on the receiver's screen
+                    // for ≥500ms. `.task(id:)` is scoped to row
+                    // presence — when the row scrolls offscreen the
+                    // task is cancelled before it can fire. Only
+                    // marks events not authored by us; the AppState
+                    // method early-returns on our own messages.
+                    .task(id: event.id) {
+                        try? await Task.sleep(for: .milliseconds(500))
+                        if !Task.isCancelled {
+                            appState.markEventRead(event)
+                        }
+                    }
+                    // Long-press → context menu → "Info." Only ours
+                    // get the menu (only ours have receipts to show).
+                    .contextMenu {
+                        if isMe {
+                            Button {
+                                infoEvent = event
+                            } label: {
+                                Label("Message Info", systemImage: "info.circle")
+                            }
+                        }
+                    }
                 // Time + delivery dot only on the last bubble of a run,
                 // so a burst of messages isn't repeated under each line.
                 if isLastInRun {
@@ -307,9 +337,14 @@ struct ChatSheet: View {
         .frame(maxWidth: .infinity, alignment: isMe ? .trailing : .leading)
     }
 
-    /// Three-state WhatsApp-style delivery indicator. The single
-    /// check matches "sent to the cloud, durable now"; the double
-    /// check matches "every other member has acknowledged it."
+    /// Four-state WhatsApp-style delivery indicator.
+    ///   • Sent (✓ themed) — durable in CloudKit.
+    ///   • Delivered (✓✓ themed) — every other member's device has
+    ///     received and ingested the event. Themed = `.primary`,
+    ///     which adapts to light/dark mode (black on light, white on
+    ///     dark) per Apple HIG.
+    ///   • Read (✓✓ blue) — every other member's device has actually
+    ///     rendered the message on screen for ≥500ms.
     @ViewBuilder
     private func deliveryDot(for status: EventDeliveryStatus) -> some View {
         switch status {
@@ -321,21 +356,28 @@ struct ChatSheet: View {
         case .cloud:
             Image(systemName: "checkmark")
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.primary)
                 .accessibilityLabel("Sent")
         case .delivered:
-            // Two overlapping checkmarks for the "delivered" state.
-            // Apple's SF Symbols doesn't ship a double-check glyph,
-            // so we compose one from two single checks slightly
-            // offset — same trick WhatsApp uses on iOS where the
-            // glyph isn't in the system font.
+            // Two overlapping checkmarks. Apple's SF Symbols doesn't
+            // ship a double-check glyph, so we compose one from two
+            // single checks slightly offset — same trick WhatsApp
+            // uses on iOS where the glyph isn't in the system font.
             HStack(spacing: -4) {
                 Image(systemName: "checkmark")
                 Image(systemName: "checkmark")
             }
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(Color.accentColor)
+            .foregroundStyle(.primary)
             .accessibilityLabel("Delivered")
+        case .read:
+            HStack(spacing: -4) {
+                Image(systemName: "checkmark")
+                Image(systemName: "checkmark")
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(Color.blue)
+            .accessibilityLabel("Read")
         }
     }
 

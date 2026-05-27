@@ -38,6 +38,10 @@ final class PayloadTransportRouter: PayloadTransport {
         return snap
     }
 
+    var connectedPeerIDsSnapshot: Set<String> {
+        activeChild()?.connectedPeerIDsSnapshot ?? []
+    }
+
     // MARK: Children
 
     private let multipeer: PayloadTransport

@@ -866,6 +866,7 @@ struct GroupDashboardView: View {
         let status = PresenceStatus(
             lastSeen: member.lastSeen,
             hasFix: member.coordinate != nil,
+            isLinked: appState.isLinked(memberID: member.id),
             now: now
         )
         let hasLocation = member.coordinate != nil

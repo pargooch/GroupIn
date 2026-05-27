@@ -166,6 +166,22 @@ final class AppState {
         didSet { persistEventDelivery() }
     }
 
+    /// Per-event-per-peer "delivered at" timestamps. Keyed by event
+    /// ID then by the receiver's per-group memberID. Source: explicit
+    /// `DeliveryReceipt` frames sent back by the receiver the moment
+    /// they ingest one of our events. Persisted so the long-press
+    /// info sheet survives launches.
+    private var peerDeliveryByEvent: [UUID: [UUID: Date]] = [:] {
+        didSet { persistPeerDelivery() }
+    }
+
+    /// Per-event-per-peer "read at" timestamps. Same shape as
+    /// `peerDeliveryByEvent`. Source: `ReadReceipt` frames sent when
+    /// a chat row is visible for ≥500ms on the receiver's screen.
+    private var peerReadByEvent: [UUID: [UUID: Date]] = [:] {
+        didSet { persistPeerRead() }
+    }
+
     /// Persisted retry queue for events whose CloudKit append failed.
     /// Drained by `retryEmitTask` on an exponential-backoff schedule;
     /// also retried opportunistically on every successful sync (since
@@ -289,6 +305,20 @@ final class AppState {
     /// wants to read a per-group snapshot.
     func payloadTransport(for groupID: UUID) -> PayloadTransport? {
         payloadTransports[groupID]
+    }
+
+    /// Live set of memberIDs we currently have a MPC payload-transport
+    /// session open to, across all groups. Maintained by
+    /// `handlePeerConnected` / `handlePeerDisconnected`. SwiftUI views
+    /// observe this directly so the Live chip flips reactively (no
+    /// timer polling needed). The only honest definition of "Live" is
+    /// "I have a real channel open to them right now"; anything based
+    /// on recent heartbeats reads as Live whenever a peer is in BLE
+    /// range, which was the source of the "always Live" bug.
+    private(set) var linkedMemberIDs: Set<UUID> = []
+
+    func isLinked(memberID: UUID) -> Bool {
+        linkedMemberIDs.contains(memberID)
     }
 
     private let defaults: UserDefaults
@@ -488,6 +518,8 @@ final class AppState {
     private static let oldestEventCursorsKey = "GroupIn.AppState.oldestEventCursors"
     private static let eventsByGroupKey = "GroupIn.AppState.eventsByGroup"
     private static let eventDeliveryKey = "GroupIn.AppState.eventDelivery"
+    private static let peerDeliveryKey  = "GroupIn.AppState.peerDelivery"
+    private static let peerReadKey      = "GroupIn.AppState.peerRead"
     private static let pendingEmitsKey = "GroupIn.AppState.pendingEmits"
     private static let pendingGroupSavesKey = "GroupIn.AppState.pendingGroupSaves"
     private static let pendingMemberPublishesKey = "GroupIn.AppState.pendingMemberPublishes"
@@ -547,6 +579,10 @@ final class AppState {
         self.oldestEventCursors = Self.loadOldestEventCursors(defaults: defaults)
         self.eventsByGroup = Self.loadEventsByGroup(defaults: defaults)
         self.eventDeliveryByID = Self.loadEventDelivery(defaults: defaults)
+        self.peerDeliveryByEvent = Self.loadPeerReceipts(defaults: defaults,
+                                                         key: Self.peerDeliveryKey)
+        self.peerReadByEvent = Self.loadPeerReceipts(defaults: defaults,
+                                                     key: Self.peerReadKey)
         self.pendingEmits = Self.loadPendingEmits(defaults: defaults)
         self.pendingGroupSaves = Self.loadPendingGroupSaves(defaults: defaults)
         self.pendingMemberPublishes = Self.loadPendingMemberPublishes(defaults: defaults)
@@ -2196,6 +2232,10 @@ final class AppState {
                     self.handleGossipedProfile(profile)
                 case .cursorAdvert(let advert):
                     self.handleCursorAdvert(advert, from: packet.peer, in: groupID)
+                case .deliveryReceipt(let receipt):
+                    self.handleDeliveryReceipt(receipt)
+                case .readReceipt(let receipt):
+                    self.handleReadReceipt(receipt)
                 }
             }
         }
@@ -2237,6 +2277,18 @@ final class AppState {
             transport.stop()
         }
         payloadTransportStartedAt.removeValue(forKey: groupID)
+        // After tearing down, anyone who was linked solely via this
+        // transport should disappear from the Live set. Recompute
+        // from the surviving transports.
+        var alive: Set<UUID> = []
+        for transport in payloadTransports.values {
+            for raw in transport.connectedPeerIDsSnapshot {
+                if let id = UUID(uuidString: raw) {
+                    alive.insert(id)
+                }
+            }
+        }
+        linkedMemberIDs = alive
     }
 
     /// Force a stop+restart of one group's transport. Used by the
@@ -2469,6 +2521,23 @@ final class AppState {
            let myCursor = eventCursors[event.groupID] {
             let advert = CursorAdvert(groupID: event.groupID, cursor: myCursor)
             broadcastFrame(.cursorAdvert(advert), in: event.groupID)
+        }
+
+        // Explicit per-event delivery receipt: gives the author an
+        // exact timestamp ("delivered at 10:42:13") for the message
+        // info sheet, rather than just "delivered at some point."
+        // Only chat-message events get receipts — structural events
+        // like memberJoined don't need a read/delivered indicator.
+        if event.authorID != myID,
+           let receiverID = myID,
+           case .chatMessage = event.payload {
+            let receipt = DeliveryReceipt(
+                groupID: event.groupID,
+                eventID: event.id,
+                receiverID: receiverID,
+                at: .now
+            )
+            broadcastFrame(.deliveryReceipt(receipt), in: event.groupID)
         }
 
         // Mirror to CloudKit so the event has a durable home too —
@@ -3845,6 +3914,9 @@ final class AppState {
     /// CloudKit for both of these; now it happens P2P the instant the
     /// session is up.
     private func handlePeerConnected(_ peerID: TransportPeerID, in groupID: UUID) {
+        if let memberID = UUID(uuidString: peerID.raw) {
+            linkedMemberIDs.insert(memberID)
+        }
         if let profile = makeSelfProfile(for: groupID) {
             sendFrame(.profile(profile), to: peerID, in: groupID)
         }
@@ -3857,10 +3929,18 @@ final class AppState {
 
     /// Handle an MPC `.disconnected` peer event. Drop the peer's
     /// cached cursor — they're gone, so we shouldn't gate future
-    /// broadcasts on whether they're caught up.
+    /// broadcasts on whether they're caught up. Also drop them from
+    /// the "Live" set — but only if they aren't still connected on
+    /// some OTHER group's transport.
     private func handlePeerDisconnected(_ peerID: TransportPeerID, in groupID: UUID) {
         guard let memberID = UUID(uuidString: peerID.raw) else { return }
         peerCursors.removeValue(forKey: memberID)
+        let stillLinked = payloadTransports.values.contains { other in
+            other.connectedPeerIDsSnapshot.contains(peerID.raw)
+        }
+        if !stillLinked {
+            linkedMemberIDs.remove(memberID)
+        }
     }
 
     /// Handle an inbound `cursorAdvert` from `peer`. Records the peer's
@@ -4540,6 +4620,26 @@ final class AppState {
         return decoded
     }
 
+    private func persistPeerDelivery() {
+        if let data = try? JSONEncoder().encode(peerDeliveryByEvent) {
+            defaults.set(data, forKey: Self.peerDeliveryKey)
+        }
+    }
+
+    private func persistPeerRead() {
+        if let data = try? JSONEncoder().encode(peerReadByEvent) {
+            defaults.set(data, forKey: Self.peerReadKey)
+        }
+    }
+
+    private static func loadPeerReceipts(defaults: UserDefaults,
+                                         key: String) -> [UUID: [UUID: Date]] {
+        guard let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([UUID: [UUID: Date]].self, from: data)
+        else { return [:] }
+        return decoded
+    }
+
     private func persistPendingEmits() {
         if let data = try? JSONEncoder().encode(pendingEmits) {
             defaults.set(data, forKey: Self.pendingEmitsKey)
@@ -4731,16 +4831,19 @@ final class AppState {
         return candidate > existing
     }
 
-    /// Walk every event we authored in this group; for any whose
-    /// status is below `.delivered`, promote to `.delivered` if every
-    /// *other* member's published cursor is at or past it. Members
-    /// without a cursor are treated as "not yet acknowledged" so a
-    /// group with even one offline member keeps showing ✓ instead
-    /// of ✓✓ — which is what users expect from chat-app delivery
-    /// indicators.
-    ///
-    /// Solo groups (only the local member) skip the upgrade entirely:
-    /// there's no one to deliver to, so the status caps at `.cloud`.
+    /// Walk every event we authored in this group; promote each one
+    /// as far along the `.pending → .cloud → .delivered → .read`
+    /// ladder as the evidence allows. Three signals feed it:
+    ///   • Per-peer `peerDeliveryByEvent[event.id]` — explicit
+    ///     deliveryReceipt frames sent by the receiver on ingest.
+    ///   • Per-peer cursor progress — `member.eventCursor` past the
+    ///     event's cursor (covers offline peers who later sync via
+    ///     CloudKit and never sent a real-time receipt).
+    ///   • Per-peer `peerReadByEvent[event.id]` — readReceipt frames
+    ///     sent after ≥500ms of visibility on the receiver's screen.
+    /// `.delivered` requires every other member to be acknowledged by
+    /// any of the first two signals; `.read` requires every other
+    /// member to have a read receipt. Solo groups cap at `.cloud`.
     private func reevaluateDeliveryStatus(for groupID: UUID) {
         guard let group = currentGroup?.id == groupID
               ? currentGroup
@@ -4755,24 +4858,128 @@ final class AppState {
         let log = eventsByGroup[groupID] ?? []
         for event in log where event.authorID == myID {
             let status = eventDeliveryByID[event.id] ?? .pending
-            guard status.rank < EventDeliveryStatus.delivered.rank else { continue }
+            guard status.rank < EventDeliveryStatus.read.rank else { continue }
 
-            // All other members must have a cursor at or past this
-            // event's cursor. Members with no cursor data → bail out
-            // for this event; we can't confirm delivery to them.
-            let allAcknowledged = otherMembers.allSatisfy { member in
+            let perEventDelivery = peerDeliveryByEvent[event.id] ?? [:]
+            let perEventRead = peerReadByEvent[event.id] ?? [:]
+
+            let allDelivered = otherMembers.allSatisfy { member in
+                if perEventDelivery[member.id] != nil { return true }
                 guard let cursor = member.eventCursor else { return false }
-                // "cursor >= event.cursor" is equivalent to
-                // "not (event.cursor > cursor)" — the EventCursor
-                // ordering already provides strict-greater-than.
                 return !(event.cursor > cursor)
             }
-            if allAcknowledged {
+            if allDelivered {
                 advanceDelivery(event.id, to: .delivered)
+            }
+
+            // Read needs an explicit receipt from every other member —
+            // a cursor advance doesn't imply the receiver actually
+            // looked at the message, so we don't infer .read from
+            // cursors.
+            let allRead = otherMembers.allSatisfy { member in
+                perEventRead[member.id] != nil
+            }
+            if allRead {
+                advanceDelivery(event.id, to: .read)
             }
         }
     }
 
+    /// Handle a `DeliveryReceipt` frame. Records the per-event-per-
+    /// peer timestamp (the data shown in the long-press info sheet)
+    /// and re-evaluates whether the aggregate `.delivered` flag can
+    /// now be set for any of our authored events. Dropped if it's
+    /// not for an event we authored (other members get the same
+    /// broadcast and ignore it).
+    private func handleDeliveryReceipt(_ receipt: DeliveryReceipt) {
+        guard let event = eventsByGroup[receipt.groupID]?
+                .first(where: { $0.id == receipt.eventID }) else { return }
+        let myID = membershipByGroupID[receipt.groupID]
+        guard event.authorID == myID else { return }
+
+        var perEvent = peerDeliveryByEvent[receipt.eventID] ?? [:]
+        // Keep the EARLIEST timestamp — a duplicate receipt arriving
+        // later (e.g., via store-and-forward) shouldn't push the
+        // "delivered at" forward into the future.
+        if let existing = perEvent[receipt.receiverID], existing <= receipt.at {
+            return
+        }
+        perEvent[receipt.receiverID] = receipt.at
+        peerDeliveryByEvent[receipt.eventID] = perEvent
+        reevaluateDeliveryStatus(for: receipt.groupID)
+    }
+
+    /// Handle a `ReadReceipt`. Same shape as delivery: record the
+    /// timestamp, re-evaluate, drop if not ours.
+    private func handleReadReceipt(_ receipt: ReadReceipt) {
+        guard let event = eventsByGroup[receipt.groupID]?
+                .first(where: { $0.id == receipt.eventID }) else { return }
+        let myID = membershipByGroupID[receipt.groupID]
+        guard event.authorID == myID else { return }
+
+        var perEvent = peerReadByEvent[receipt.eventID] ?? [:]
+        if let existing = perEvent[receipt.readerID], existing <= receipt.at {
+            return
+        }
+        perEvent[receipt.readerID] = receipt.at
+        peerReadByEvent[receipt.eventID] = perEvent
+        reevaluateDeliveryStatus(for: receipt.groupID)
+    }
+
+    /// Public read API for the long-press info sheet. Returns the
+    /// per-peer delivered/read timestamps for an event WE authored;
+    /// returns nil for others' events (no info to show).
+    func receiptInfo(for event: Event) -> EventReceiptInfo? {
+        let myID = membershipByGroupID[event.groupID] ?? currentUser.id
+        guard event.authorID == myID else { return nil }
+        return EventReceiptInfo(
+            sentAt: event.createdAt,
+            cloudAcknowledged: eventDeliveryByID[event.id].map { $0.rank >= EventDeliveryStatus.cloud.rank } ?? false,
+            perPeerDelivered: peerDeliveryByEvent[event.id] ?? [:],
+            perPeerRead: peerReadByEvent[event.id] ?? [:]
+        )
+    }
+
+    /// Called from the ChatSheet row when a message has been visible
+    /// on screen for ≥500ms (WhatsApp's "read" definition). Broadcasts
+    /// a `ReadReceipt` to the group's payload transport so the author
+    /// can flip their ✓✓ to blue. Idempotent at the receiver-author
+    /// side: duplicate receipts are dropped by `handleReadReceipt`.
+    func markEventRead(_ event: Event) {
+        let myID = membershipByGroupID[event.groupID]
+        // Don't send read receipts for our own messages or non-chat
+        // events (structural events have no indicator).
+        guard event.authorID != myID,
+              let readerID = myID,
+              case .chatMessage = event.payload else { return }
+        // Local dedup: if we've already locally recorded a read for
+        // this event from us, don't re-broadcast.
+        if peerReadByEvent[event.id]?[readerID] != nil { return }
+
+        let now = Date.now
+        var perEvent = peerReadByEvent[event.id] ?? [:]
+        perEvent[readerID] = now
+        peerReadByEvent[event.id] = perEvent
+
+        let receipt = ReadReceipt(
+            groupID: event.groupID,
+            eventID: event.id,
+            readerID: readerID,
+            at: now
+        )
+        broadcastFrame(.readReceipt(receipt), in: event.groupID)
+    }
+}
+
+/// Per-event receipt rollup used by the long-press info sheet.
+struct EventReceiptInfo {
+    let sentAt: Date
+    let cloudAcknowledged: Bool
+    let perPeerDelivered: [UUID: Date]
+    let perPeerRead: [UUID: Date]
+}
+
+extension AppState {
     private static func persistLocalProfile(_ profile: LocalProfile, defaults: UserDefaults) {
         if let data = try? JSONEncoder().encode(profile) {
             defaults.set(data, forKey: localProfileKey)

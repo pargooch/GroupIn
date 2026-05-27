@@ -15,15 +15,28 @@ enum PresenceStatus {
     case stale(Date)    // < 30 min
     case offline(Date?) // >= 30 min, or no fix at all
 
-    init(lastSeen: Date, hasFix: Bool, now: Date = .now) {
+    /// Live is *only* "we have a live signal path to this peer right
+    /// now" — concretely: an MPC payload-transport session in the
+    /// connected state, or a fresh-enough sensor fix to call them
+    /// real-time. The old heuristic ("lastSeen < 30 s") triggered on
+    /// every BLE heartbeat (~20 s cadence) and so was permanently
+    /// "Live" for anyone in range — exactly the bug users complained
+    /// about. Now the chip says "Live" when there's evidence of a
+    /// live channel; otherwise it tiers down by age.
+    init(lastSeen: Date,
+         hasFix: Bool,
+         isLinked: Bool,
+         now: Date = .now) {
+        if isLinked {
+            self = .live
+            return
+        }
         guard hasFix else {
             self = .offline(lastSeen)
             return
         }
         let delta = now.timeIntervalSince(lastSeen)
-        if delta < 30 {
-            self = .live
-        } else if delta < 5 * 60 {
+        if delta < 5 * 60 {
             self = .recent(lastSeen)
         } else if delta < 30 * 60 {
             self = .stale(lastSeen)

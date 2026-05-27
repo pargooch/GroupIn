@@ -44,6 +44,19 @@ nonisolated enum PayloadFrame: Codable, Sendable {
     /// peer-to-peer catch-up that completes the moment the link is up.
     case cursorAdvert(CursorAdvert)
 
+    /// Delivery receipt — broadcast back to the author the moment we
+    /// ingest one of their events. Carries an explicit timestamp so
+    /// the author can show "delivered at HH:MM" in the message-info
+    /// sheet, not just "delivered." Sent to the WHOLE group (the
+    /// author doesn't know who has a session with whom); peers other
+    /// than the author drop it on receive.
+    case deliveryReceipt(DeliveryReceipt)
+
+    /// Read receipt — broadcast back to the author when their event
+    /// has been visible on our chat row for ≥500ms. WhatsApp's blue
+    /// double-check semantics. Same broadcast pattern as delivery.
+    case readReceipt(ReadReceipt)
+
     // MARK: Codable
 
     private enum CodingKeys: String, CodingKey {
@@ -51,12 +64,16 @@ nonisolated enum PayloadFrame: Codable, Sendable {
         case event
         case profile
         case cursorAdvert
+        case deliveryReceipt
+        case readReceipt
     }
 
     private enum Kind: String, Codable {
         case event
         case profile
         case cursorAdvert
+        case deliveryReceipt
+        case readReceipt
     }
 
     init(from decoder: Decoder) throws {
@@ -72,6 +89,12 @@ nonisolated enum PayloadFrame: Codable, Sendable {
         case .cursorAdvert:
             let advert = try container.decode(CursorAdvert.self, forKey: .cursorAdvert)
             self = .cursorAdvert(advert)
+        case .deliveryReceipt:
+            let r = try container.decode(DeliveryReceipt.self, forKey: .deliveryReceipt)
+            self = .deliveryReceipt(r)
+        case .readReceipt:
+            let r = try container.decode(ReadReceipt.self, forKey: .readReceipt)
+            self = .readReceipt(r)
         }
     }
 
@@ -87,6 +110,12 @@ nonisolated enum PayloadFrame: Codable, Sendable {
         case .cursorAdvert(let advert):
             try container.encode(Kind.cursorAdvert, forKey: .type)
             try container.encode(advert, forKey: .cursorAdvert)
+        case .deliveryReceipt(let r):
+            try container.encode(Kind.deliveryReceipt, forKey: .type)
+            try container.encode(r, forKey: .deliveryReceipt)
+        case .readReceipt(let r):
+            try container.encode(Kind.readReceipt, forKey: .type)
+            try container.encode(r, forKey: .readReceipt)
         }
     }
 
@@ -119,4 +148,25 @@ nonisolated struct MemberProfile: Codable, Sendable, Equatable {
 nonisolated struct CursorAdvert: Codable, Sendable {
     let groupID: UUID
     let cursor: EventCursor?
+}
+
+/// Payload for `.deliveryReceipt`: who received which event, when.
+/// Sent by the receiver back to the group the moment they ingest a
+/// gossiped event. Only the author (`event.authorID`) consumes it;
+/// other peers drop on receive.
+nonisolated struct DeliveryReceipt: Codable, Sendable {
+    let groupID: UUID
+    let eventID: UUID
+    let receiverID: UUID
+    let at: Date
+}
+
+/// Payload for `.readReceipt`: who actually displayed which event on
+/// their screen for ≥500ms. Authored by the receiver; consumed by
+/// the author to upgrade their indicator to blue ✓✓.
+nonisolated struct ReadReceipt: Codable, Sendable {
+    let groupID: UUID
+    let eventID: UUID
+    let readerID: UUID
+    let at: Date
 }

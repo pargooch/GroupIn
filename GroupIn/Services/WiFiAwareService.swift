@@ -53,6 +53,8 @@ final class WiFiAwareService: PayloadTransport {
 
     var currentDiagnosticsSnapshot: TransportDiagnostics { currentDiagnostics }
 
+    var connectedPeerIDsSnapshot: Set<String> { [] }
+
     // MARK: Init
 
     init() {

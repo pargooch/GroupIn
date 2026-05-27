@@ -103,6 +103,12 @@ protocol PayloadTransport: AnyObject {
     /// to do that caused a CPU storm through cascading view updates.
     var currentDiagnosticsSnapshot: TransportDiagnostics { get }
 
+    /// Snapshot of the currently-connected peers as `TransportPeerID`
+    /// raw strings. Used by `AppState.isLinked(memberID:)` to drive
+    /// the "Live" chip — true liveness ≠ "we got a BLE heartbeat
+    /// recently"; it means we have an actual data-path session open.
+    var connectedPeerIDsSnapshot: Set<String> { get }
+
     /// Which transport this instance represents. For the router, the
     /// currently selected child; for a concrete transport, its own
     /// flavor.

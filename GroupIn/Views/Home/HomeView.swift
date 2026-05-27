@@ -372,6 +372,7 @@ struct HomeView: View {
         let statuses = group.members.map {
             PresenceStatus(lastSeen: $0.lastSeen,
                            hasFix: $0.coordinate != nil,
+                           isLinked: appState.isLinked(memberID: $0.id),
                            now: now)
         }
         let activeCount = statuses.filter(\.isActivelySharing).count
@@ -411,6 +412,7 @@ struct HomeView: View {
                 let color = palette[member.id] ?? Color.memberColor(for: member.id)
                 let status = PresenceStatus(lastSeen: member.lastSeen,
                                             hasFix: member.coordinate != nil,
+                                            isLinked: appState.isLinked(memberID: member.id),
                                             now: now)
                 Circle()
                     .fill(color.opacity(status.isActivelySharing ? 1.0 : 0.4))
@@ -462,7 +464,8 @@ struct HomeView: View {
         let count = group.members.count
         let activeCount = group.members.filter {
             PresenceStatus(lastSeen: $0.lastSeen,
-                           hasFix: $0.coordinate != nil).isActivelySharing
+                           hasFix: $0.coordinate != nil,
+                           isLinked: appState.isLinked(memberID: $0.id)).isActivelySharing
         }.count
 
         var parts = ["\(group.category.label) group \(group.name)"]

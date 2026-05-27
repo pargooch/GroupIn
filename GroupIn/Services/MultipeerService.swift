@@ -112,6 +112,10 @@ final class MultipeerService: NSObject, PayloadTransport {
 
     var currentDiagnosticsSnapshot: TransportDiagnostics { currentDiagnostics }
 
+    var connectedPeerIDsSnapshot: Set<String> {
+        Set(connectedByDisplayName.keys)
+    }
+
     // MARK: Init
 
     override init() {
