@@ -2447,6 +2447,30 @@ final class AppState {
         // `ingestEvent` to update the local log and cursors).
         applyEvents([event], to: event.groupID)
 
+        // The author provably advanced past their own event's cursor —
+        // they couldn't have authored it otherwise. Recording that
+        // here (instead of waiting for the next BLE presence heartbeat
+        // ~20 s later) is what makes a friend's reply cause our
+        // original message to flip from ✓ to ✓✓ immediately, instead
+        // of "reply arrives, receipt for original message lags by 20s."
+        recordPeerCursor(event.cursor,
+                         for: event.authorID,
+                         in: event.groupID)
+
+        // Snappy outbound receipt: we just ingested someone else's
+        // event, so OUR cursor has advanced past it. Tell the group's
+        // transport so the author can flip their own ✓ → ✓✓ right
+        // now instead of on their next heartbeat. Skip when WE are
+        // the author (a CloudKit echo of our own message): the
+        // cursorAdvert would be redundant and the broadcast goes to
+        // no useful destination.
+        let myID = membershipByGroupID[event.groupID]
+        if event.authorID != myID,
+           let myCursor = eventCursors[event.groupID] {
+            let advert = CursorAdvert(groupID: event.groupID, cursor: myCursor)
+            broadcastFrame(.cursorAdvert(advert), in: event.groupID)
+        }
+
         // Mirror to CloudKit so the event has a durable home too —
         // safe to call even if it landed there originally (the
         // appendEvent path is idempotent on event ID).
@@ -3840,16 +3864,18 @@ final class AppState {
     }
 
     /// Handle an inbound `cursorAdvert` from `peer`. Records the peer's
-    /// cursor under their memberID (so `broadcastEventIfPeersBehind`
-    /// can use it going forward) and streams the delta of events newer
-    /// than that cursor directly to them — targeted, not broadcast, so
-    /// we don't re-flood peers that are already caught up.
+    /// cursor (both in the flat dict AND on the member record, so the
+    /// delivery-status pipeline picks it up — the helper handles both
+    /// stores monotonically and triggers `reevaluateDeliveryStatus`)
+    /// and streams the delta of events newer than that cursor directly
+    /// to them — targeted, not broadcast, so we don't re-flood peers
+    /// that are already caught up.
     private func handleCursorAdvert(_ advert: CursorAdvert,
                                     from peer: TransportPeerID,
                                     in groupID: UUID) {
         guard advert.groupID == groupID else { return }
         if let memberID = UUID(uuidString: peer.raw), let cursor = advert.cursor {
-            peerCursors[memberID] = cursor
+            recordPeerCursor(cursor, for: memberID, in: groupID)
         }
         Task { [weak self, groupID, peer, cursor = advert.cursor] in
             await self?.streamEventsNewer(
@@ -4639,6 +4665,70 @@ final class AppState {
         let current = eventDeliveryByID[eventID]
         if let current, status.rank <= current.rank { return }
         eventDeliveryByID[eventID] = status
+    }
+
+    /// Single source of truth for "this peer's cursor just advanced."
+    /// Updates BOTH the flat `peerCursors` dict (used by
+    /// `broadcastEventIfPeersBehind` to gate outgoing relays) AND the
+    /// per-member `eventCursorCreatedAt/ID` fields (used by
+    /// `reevaluateDeliveryStatus` to upgrade ✓ → ✓✓). Without the
+    /// second update, receipts could only advance via the ~20 s BLE
+    /// presence heartbeat — which is the exact bug that made replies
+    /// arrive before their own delivery confirmations.
+    ///
+    /// Monotonic in both stores: never regresses a peer's known cursor.
+    /// Returns whether anything actually changed, so callers can skip
+    /// the downstream `reevaluateDeliveryStatus` when nothing moved.
+    @discardableResult
+    private func recordPeerCursor(_ cursor: EventCursor,
+                                  for memberID: UUID,
+                                  in groupID: UUID) -> Bool {
+        var changed = false
+
+        // 1. Flat cursor dict — gates outgoing relay broadcasts.
+        if let existing = peerCursors[memberID] {
+            if cursor > existing {
+                peerCursors[memberID] = cursor
+                changed = true
+            }
+        } else {
+            peerCursors[memberID] = cursor
+            changed = true
+        }
+
+        // 2. Per-member record in `currentGroup` (if focused) and in
+        //    `myGroups` — drives the ✓/✓✓ indicator. Two separate
+        //    structures by design (the focused-group view is a
+        //    snapshot the dashboard binds against); we update both.
+        if currentGroup?.id == groupID,
+           var g = currentGroup,
+           let idx = g.members.firstIndex(where: { $0.id == memberID }) {
+            if Self.cursorIsNewer(cursor, than: g.members[idx].eventCursor) {
+                g.members[idx].eventCursorCreatedAt = cursor.createdAt
+                g.members[idx].eventCursorID = cursor.id
+                currentGroup = g
+                changed = true
+            }
+        }
+        if let gIdx = myGroups.firstIndex(where: { $0.id == groupID }),
+           let idx = myGroups[gIdx].members.firstIndex(where: { $0.id == memberID }) {
+            if Self.cursorIsNewer(cursor, than: myGroups[gIdx].members[idx].eventCursor) {
+                myGroups[gIdx].members[idx].eventCursorCreatedAt = cursor.createdAt
+                myGroups[gIdx].members[idx].eventCursorID = cursor.id
+                changed = true
+            }
+        }
+
+        if changed {
+            reevaluateDeliveryStatus(for: groupID)
+        }
+        return changed
+    }
+
+    private static func cursorIsNewer(_ candidate: EventCursor,
+                                      than existing: EventCursor?) -> Bool {
+        guard let existing else { return true }
+        return candidate > existing
     }
 
     /// Walk every event we authored in this group; for any whose
