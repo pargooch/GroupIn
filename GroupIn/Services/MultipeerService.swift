@@ -24,6 +24,24 @@ final class MultipeerService: NSObject, PayloadTransport {
     /// v1 without cross-talk.
     nonisolated static let serviceType = "groupin-v1"
 
+    /// Process-level `MCPeerID` cache. MPC is documented as expecting
+    /// one MCPeerID per (process, displayName) pair: the framework
+    /// keys daemon-side resources to that object's identity. Creating
+    /// fresh instances per `start()` strands those resources and the
+    /// next session silently fails to advertise. Keyed by displayName
+    /// so per-group memberIDs each get their own stable peer.
+    nonisolated(unsafe) private static var peerIDCache: [String: MCPeerID] = [:]
+    nonisolated private static let peerIDCacheLock = NSLock()
+
+    nonisolated static func cachedPeerID(forDisplayName displayName: String) -> MCPeerID {
+        peerIDCacheLock.lock()
+        defer { peerIDCacheLock.unlock() }
+        if let existing = peerIDCache[displayName] { return existing }
+        let fresh = MCPeerID(displayName: displayName)
+        peerIDCache[displayName] = fresh
+        return fresh
+    }
+
     /// Key in the advertiser's discovery-info dict carrying the
     /// rendezvous token. Browsers inspect this before inviting; an
     /// out-of-group peer is skipped silently. Total discovery-info
@@ -116,7 +134,15 @@ final class MultipeerService: NSObject, PayloadTransport {
 
         activeRendezvousToken = rendezvousToken
 
-        let peer = MCPeerID(displayName: displayName)
+        // Reuse the same MCPeerID instance for this displayName across
+        // every start/stop cycle in this process. Apple's MPC framework
+        // expects one MCPeerID per (process, displayName) — making a
+        // fresh one each call leaves daemon-side state attached to the
+        // *previous* MCPeerID, which is the root cause of "foreground
+        // after a long background no longer handshakes; only cold
+        // launch fixes it." Cold launch wipes the cache too; in-process
+        // cycles must reuse to avoid that wedge.
+        let peer = Self.cachedPeerID(forDisplayName: displayName)
         // .optional, not .required. We learned the hard way that
         // requiring DTLS over AWDL/Bluetooth pegs the session in
         // "connecting" past the invitation timeout on cellular-only

@@ -16,6 +16,7 @@ import Foundation
 import CoreLocation
 import CryptoKit
 import Observation
+import UIKit
 
 enum AppRoute: Hashable {
     case createGroup
@@ -410,6 +411,24 @@ final class AppState {
     /// group: incoming frames, peer connect/disconnect events,
     /// diagnostics. Cancelled together on `stopPayloadTransport(for:)`.
     private var payloadTransportTasks: [UUID: [Task<Void, Never>]] = [:]
+
+    /// When each per-group transport was last (re)started. Used by the
+    /// health check to decide whether enough time has passed to judge
+    /// "this is wedged" versus "still warming up."
+    private var payloadTransportStartedAt: [UUID: Date] = [:]
+
+    /// Single in-flight foreground health-check task — only one at a
+    /// time, and only while we're a seeker. Cancelled when the user
+    /// backgrounds (role flips back to .sought).
+    private var transportHealthCheckTask: Task<Void, Never>?
+
+    /// After a transport has been running this long with zero discovered
+    /// peers, we assume the underlying radio/daemon is wedged (most
+    /// often: AWDL didn't re-attach after iOS resumed us) and recycle
+    /// the per-group transport. Long enough that a healthy AWDL bring-
+    /// up + Bonjour discovery completes well inside the window.
+    private static let transportWedgedThreshold: TimeInterval = 15
+    private static let transportHealthCheckInterval: TimeInterval = 5
 
     /// Asymmetric activity role:
     ///
@@ -2156,6 +2175,7 @@ final class AppState {
 
         let transport = payloadTransportFactory()
         payloadTransports[group.id] = transport
+        payloadTransportStartedAt[group.id] = .now
         transport.start(displayName: displayName, rendezvousToken: rendezvous)
 
         let groupID = group.id
@@ -2216,11 +2236,74 @@ final class AppState {
         if let transport = payloadTransports.removeValue(forKey: groupID) {
             transport.stop()
         }
+        payloadTransportStartedAt.removeValue(forKey: groupID)
     }
 
-    /// Tear down every per-group transport. Used on backgrounding and
-    /// on full sign-out / last-group-left.
+    /// Force a stop+restart of one group's transport. Used by the
+    /// foreground health check when a transport is judged wedged
+    /// (running >`transportWedgedThreshold` seconds with no peers
+    /// discovered). Idempotent with `startPayloadTransport`.
+    private func recyclePayloadTransport(for groupID: UUID) {
+        guard let group = myGroups.first(where: { $0.id == groupID }) else {
+            stopPayloadTransport(for: groupID)
+            return
+        }
+        stopPayloadTransport(for: groupID)
+        startPayloadTransport(for: group)
+    }
+
+    /// Foreground health-check loop. Polls each per-group transport's
+    /// diagnostic snapshot once every `transportHealthCheckInterval`
+    /// seconds. If a transport has been running ≥`transportWedgedThreshold`
+    /// seconds and still has `discoveredPeerCount == 0` while we're a
+    /// seeker, we judge the radio/daemon wedged and recycle it.
+    ///
+    /// One task only — kicked from `applyScenePhase(.seeker)` so we
+    /// don't run multiple loops, and bails the moment we go back to
+    /// `.sought`.
+    private func kickTransportHealthCheck() {
+        transportHealthCheckTask?.cancel()
+        transportHealthCheckTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.transportHealthCheckInterval))
+                guard let self, self.role == .seeker else { return }
+                let now = Date.now
+                for (groupID, transport) in self.payloadTransports {
+                    let started = self.payloadTransportStartedAt[groupID] ?? now
+                    guard now.timeIntervalSince(started) >= Self.transportWedgedThreshold
+                    else { continue }
+                    let snap = transport.currentDiagnosticsSnapshot
+                    if snap.isActive,
+                       snap.connectedPeers == 0,
+                       snap.discoveredPeerCount == 0 {
+                        self.recyclePayloadTransport(for: groupID)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tear down every per-group transport. Used on full sign-out /
+    /// last-group-left. NOT used on scene-phase backgrounding (see
+    /// `applyScenePhase` header — we keep MPC up across background to
+    /// avoid the daemon-state wedge).
+    ///
+    /// Wrapped in `beginBackgroundTask` so iOS gives us a few seconds
+    /// to complete `MCSession.disconnect()`'s asynchronous IO before
+    /// suspending the process. Without this, the daemon's view of the
+    /// session can stay "live" even after we tear down the Swift-side
+    /// references — causing the next `start()` to collide with stale
+    /// daemon state. The window is short (Apple grants ~30 s max) and
+    /// we exit it immediately after the synchronous work returns, so
+    /// the cost is negligible.
     private func stopAllPayloadTransports() {
+        let app = UIApplication.shared
+        let token = app.beginBackgroundTask(withName: "groupin.mpc.teardown")
+        defer {
+            if token != .invalid {
+                app.endBackgroundTask(token)
+            }
+        }
         for groupID in Array(payloadTransports.keys) {
             stopPayloadTransport(for: groupID)
         }
@@ -2249,24 +2332,73 @@ final class AppState {
         return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Apply a SwiftUI scene-phase change. Foreground → seeker (full
-    /// stack). Background / inactive → sought (BLE peripheral keeps
-    /// advertising; transport tears down).
+    /// Apply a SwiftUI scene-phase change.
+    ///
+    /// **Foreground (.seeker):** wake the full stack — BLE presence
+    /// (re-energize the peripheral and consumers) and a payload
+    /// transport per group (idempotent — no-op if already running).
+    /// Also runs a single foreground-recovery sweep: any transport
+    /// that's been up >15 s without discovering a peer gets recycled
+    /// (see `kickTransportHealthCheck`) to defeat AWDL warm-up stalls.
+    ///
+    /// **Background (.sought):** intentionally do NOT tear down the
+    /// payload transports. iOS will throttle MPC's radios on its own,
+    /// and resuming a still-alive session avoids the daemon-state
+    /// wedge that used to require a cold launch to clear ("foreground
+    /// after a long background no longer handshakes"). The BLE
+    /// peripheral keeps advertising so other devices stay findable.
+    /// If/when a transport actually dies during suspension, the
+    /// per-group `peerEvents` stream will surface `.disconnected` on
+    /// resume and our outgoing broadcasts simply find no peers until
+    /// the health check or the next BLE re-merge restarts things.
     func applyScenePhase(active: Bool) {
         let newRole: Role = active ? .seeker : .sought
         guard newRole != role else { return }
         role = newRole
         switch newRole {
         case .seeker:
-            // Re-spin transports for every group on foreground, not
-            // just the focused one — the user may have switched groups
-            // in the background and we still want to be reachable on
-            // all of them.
+            // F: full cold-launch parity. Walk the same sequence
+            // init's `if !myGroups.isEmpty { ... }` restore branch
+            // does, so foreground-from-background behaves identically
+            // to a fresh process launch. Every call below is
+            // idempotent (guarded by `task == nil` or "no-op if
+            // already running") — so when nothing has actually
+            // drifted, this costs us nothing, and when something has,
+            // it gets re-energized without forcing the user to kill
+            // the app.
+            if !myGroups.isEmpty {
+                startLocationTracking()
+                startBeaconMonitoring()
+                startPresenceHeartbeat()
+                // E: BLE presence may have been throttled by iOS
+                // during background. `startBLEPresence` is idempotent
+                // — every expensive bring-up is guarded — so calling
+                // it here just re-energizes whatever drifted.
+                startBLEPresence()
+            }
+            // Per-group transport bring-up. With A (cached peer IDs)
+            // and B (no teardown on background), this is now a no-op
+            // when transports are already up, and a clean start when
+            // they aren't — covering the edge case where iOS killed
+            // the underlying MCSession during deep sleep.
             for joined in myGroups {
                 startPayloadTransport(for: joined)
             }
+            // C: kick the foreground health-check loop. Recycles any
+            // transport that's been up >`transportWedgedThreshold`
+            // seconds without discovering a peer — defeats the AWDL
+            // warm-up stall where MPC's API says "started" but the
+            // underlying radio hasn't actually re-attached yet.
+            kickTransportHealthCheck()
         case .sought:
-            stopAllPayloadTransports()
+            // Intentionally empty — see header comment. The BLE
+            // peripheral keeps advertising via the running BLE
+            // presence service; MPC stays subscribed. We cancel only
+            // the foreground-only health-check loop to avoid burning
+            // background CPU on a check that can't act on its
+            // results.
+            transportHealthCheckTask?.cancel()
+            transportHealthCheckTask = nil
         }
     }
 
