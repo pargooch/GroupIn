@@ -51,6 +51,8 @@ final class WiFiAwareService: PayloadTransport {
         selection: .wifiAware
     )
 
+    var currentDiagnosticsSnapshot: TransportDiagnostics { currentDiagnostics }
+
     // MARK: Init
 
     init() {

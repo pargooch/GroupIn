@@ -78,6 +78,8 @@ final class MultipeerService: NSObject, PayloadTransport {
         selection: .multipeer
     )
 
+    var currentDiagnosticsSnapshot: TransportDiagnostics { currentDiagnostics }
+
     // MARK: Init
 
     override init() {

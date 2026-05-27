@@ -199,9 +199,12 @@ struct GroupDashboardView: View {
                         .font(.title3.weight(.semibold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
-                    Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text("\(group.members.count) member\(group.members.count == 1 ? "" : "s")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        PeerLinkIndicator(transport: appState.payloadTransport)
+                    }
                 }
             }
             .accessibilityElement(children: .combine)

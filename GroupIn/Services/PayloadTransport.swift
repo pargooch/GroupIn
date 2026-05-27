@@ -97,6 +97,12 @@ protocol PayloadTransport: AnyObject {
     /// Diagnostics — peer count, active flag, current selection.
     var diagnostics: AsyncStream<TransportDiagnostics> { get }
 
+    /// Synchronous snapshot of the latest diagnostics. Polled by a
+    /// safe (timer-sampled) UI indicator that must NOT subscribe to
+    /// `diagnostics` via an @Observable property — a previous attempt
+    /// to do that caused a CPU storm through cascading view updates.
+    var currentDiagnosticsSnapshot: TransportDiagnostics { get }
+
     /// Which transport this instance represents. For the router, the
     /// currently selected child; for a concrete transport, its own
     /// flavor.

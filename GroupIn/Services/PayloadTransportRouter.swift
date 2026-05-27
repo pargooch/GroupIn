@@ -29,6 +29,15 @@ final class PayloadTransportRouter: PayloadTransport {
     private let peerEventsContinuation: AsyncStream<TransportPeerEvent>.Continuation
     private let diagnosticsContinuation: AsyncStream<TransportDiagnostics>.Continuation
 
+    var currentDiagnosticsSnapshot: TransportDiagnostics {
+        guard isActive, let child = activeChild() else {
+            return TransportDiagnostics(connectedPeers: 0, isActive: false, selection: selection)
+        }
+        var snap = child.currentDiagnosticsSnapshot
+        snap.selection = selection
+        return snap
+    }
+
     // MARK: Children
 
     private let multipeer: PayloadTransport
