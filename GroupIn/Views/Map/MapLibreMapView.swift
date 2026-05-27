@@ -126,7 +126,17 @@ struct MapLibreMapView: UIViewRepresentable {
                 guard m.coordinate != nil,
                       let est = m.renderablePosition(now: parent.now),
                       est.source != .hypothetical else { return nil }
-                return (m, est.coordinate.clLocation)
+                let coord = est.coordinate.clLocation
+                // Hard guard: NaN / infinite / out-of-range coordinates
+                // make MapLibre throw an ObjC exception from inside
+                // `addAnnotation` / the `UIView.animate` block on the
+                // display tick — which then aborts the app. Drop any
+                // bad coordinate at the source.
+                guard CLLocationCoordinate2DIsValid(coord),
+                      coord.latitude.isFinite,
+                      coord.longitude.isFinite
+                else { return nil }
+                return (m, coord)
             }
             let liveIDs = Set(renderable.map(\.0.id))
 
