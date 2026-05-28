@@ -42,7 +42,6 @@ struct GroupDashboardView: View {
 
     var body: some View {
         content
-            .toolbar { dashboardToolbar }
             .modifier(DashboardModifiers(viewModel: viewModel))
     }
 
@@ -72,6 +71,19 @@ struct GroupDashboardView: View {
                         groupName: group.name,
                         inviteCode: group.inviteCode
                     )
+                }
+            }
+            // Owner-only "Extend" sheet. Lives on the drawer rather
+            // than the root view — same reason as every other sheet
+            // here: the drawer is always topmost, so a sheet attached
+            // to the root gets trapped behind it and never appears.
+            // That was the symptom of "the Extend button doesn't do
+            // anything"; it WAS firing, the sheet was just hidden.
+            .sheet(isPresented: Bindable(viewModel).showExtendSheet) {
+                if let group = viewModel.group {
+                    ExtendGroupSheet(currentExpiresAt: group.expiresAt) { newDate in
+                        await viewModel.proposeExtension(newExpiresAt: newDate)
+                    }
                 }
             }
             .alert(
@@ -310,15 +322,22 @@ struct GroupDashboardView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
-                    if viewModel.shouldPromptOwnerToExtend {
+                    // Owner-only Extend control. Always visible to the
+                    // owner so they can push the expiry out whenever
+                    // they like (not just when it's almost up). Mini
+                    // size keeps it from competing with the expiry
+                    // text it sits beside.
+                    if viewModel.isOwner {
                         Button {
                             viewModel.showExtendSheet = true
                         } label: {
-                            Text("Extend")
+                            Label("Extend", systemImage: "clock.arrow.circlepath")
+                                .labelStyle(.titleAndIcon)
                                 .font(.caption.weight(.semibold))
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.bordered)
                         .controlSize(.mini)
+                        .tint(viewModel.shouldPromptOwnerToExtend ? .orange : .accentColor)
                     }
                 }
                 .accessibilityElement(children: .combine)
@@ -381,21 +400,21 @@ struct GroupDashboardView: View {
     /// The map pane pinned to the top half of the dashboard.
     @ViewBuilder
     private func mapPane(group: GroupSession) -> some View {
-        ZStack(alignment: .topTrailing) {
-            TimelineView(.periodic(from: .now, by: 15)) { context in
-                MapLibreMapView(
-                    members: group.members,
-                    currentMemberID: appState.currentUser.id,
-                    now: context.date,
-                    focusedMemberID: $routeTargetID,
-                    fitAllTrigger: $fitAllTrigger,
-                    colorScheme: colorScheme
-                )
-            }
-            fitAllButton
-                .padding(12)
-                .padding(.top, 44)
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            MapLibreMapView(
+                members: group.members,
+                currentMemberID: appState.currentUser.id,
+                now: context.date,
+                focusedMemberID: $routeTargetID,
+                fitAllTrigger: $fitAllTrigger,
+                colorScheme: colorScheme
+            )
         }
+        // Fit-all button removed: MapLibre's UIKit gesture recognizers
+        // were swallowing taps before SwiftUI could deliver them, and
+        // the .overlay workaround didn't catch all configurations.
+        // Fit-on-launch and fit-on-member-change still run via
+        // `fitInitialIfNeeded`; the manual recenter is gone.
         .overlay(alignment: .bottomLeading) {
             if routeTargetID == nil {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -571,25 +590,6 @@ struct GroupDashboardView: View {
         .accessibilityLabel(mode.accessibilityLabel)
     }
 
-    @ViewBuilder
-    private var fitAllButton: some View {
-        Button {
-            // Bump the trigger to ask `NeonMapView` for a fresh
-            // fit-all. Counter increment guarantees `updateUIView`
-            // sees the change even when the user taps it repeatedly.
-            fitAllTrigger += 1
-        } label: {
-            Image(systemName: "scope")
-                .font(.title3)
-                .foregroundStyle(.white)
-                .frame(width: 40, height: 40)
-                .background(.black.opacity(0.55), in: Circle())
-                .overlay(Circle().strokeBorder(.white.opacity(0.2), lineWidth: 1))
-                .contentShape(Circle())
-        }
-        .accessibilityLabel("Fit all members on map")
-    }
-
     /// Non-owner-only "Leave Group" action. Owners can't appear here
     /// because for them the right verb is "Delete group entirely,"
     /// which lives as a swipe action on Home. Keeping the button at
@@ -733,34 +733,9 @@ struct GroupDashboardView: View {
         }
     }
 
-    @ToolbarContentBuilder
-    private var dashboardToolbar: some ToolbarContent {
-        if viewModel.group != nil {
-            if viewModel.isOwner {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        viewModel.showExtendSheet = true
-                    } label: {
-                        Label("Extend", systemImage: "clock.arrow.circlepath")
-                    }
-                    .accessibilityHint("Propose a new expiry for this group")
-                }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                // "Done" — pops the dashboard back to Home without
-                // touching the tracking stack. Sharing keeps running
-                // (location, beacon, heartbeat, push subscription
-                // are all driven by myGroups now, not currentGroup).
-                // Explicit leave / delete happens via the Leave Group
-                // button below or swipe-delete on Home.
-                Button("Done") {
-                    appState.closeDashboard()
-                }
-                .fontWeight(.semibold)
-                .accessibilityHint("Closes this group view and returns home. You stay a member.")
-            }
-        }
-    }
+    // Toolbar removed: the system Back button covers navigation, and
+    // the Extend action moved inline next to the expiry row in the
+    // Group section — it belongs *with* the expiry info it acts on.
 
     // MARK: - Expiry / extension UI
 
@@ -1047,13 +1022,9 @@ private struct DashboardModifiers: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .sheet(isPresented: $viewModel.showExtendSheet) {
-                if let group = viewModel.group {
-                    ExtendGroupSheet(currentExpiresAt: group.expiresAt) { newDate in
-                        await viewModel.proposeExtension(newExpiresAt: newDate)
-                    }
-                }
-            }
+            // Extend sheet moved to `dashboardPresentations` (on the
+            // drawer) so it isn't trapped behind the always-topmost
+            // drawer overlay — see the comment in that function.
             .onAppear {
                 viewModel.start()
                 viewModel.fitInitialIfNeeded()
